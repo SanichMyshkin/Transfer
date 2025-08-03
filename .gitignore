@@ -203,7 +203,4 @@ trash/
 victoria-metrics-data/
 logs/
 
-
-metrics_py/.vscode/
-
-jenkins_home/
+volume/

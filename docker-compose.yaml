@@ -1,5 +1,4 @@
 services:
-  # HAProxy для MinIO
   haproxy:
     image: haproxy:latest
     restart: always
@@ -13,15 +12,14 @@ services:
     networks:
       - minio-net
 
-  # Nexus Repository Manager
   nexus:
     image: sonatype/nexus3:3.80.0
     restart: unless-stopped
     container_name: nexus
     volumes:
-      - ./nexus-data:/nexus-data
+      - ./volume/nexus-data:/nexus-data
     ports:
-      - "9090:8081"  # Основной порт Nexus
+      - "9090:8081"
       - "5000-5030:5000-5030"
       - "8082-8090:8082-8090"
     environment:
@@ -32,23 +30,6 @@ services:
       - postgres
       - minio-single
 
-  # Nginx proxy
-  # nginx:
-  #   image: nginx:latest
-  #   restart: always
-  #   container_name: nginx
-  #   ports:
-  #     - "80:80"
-  #     - "443:443"
-  #   volumes:
-  #     - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
-  #     - /etc/letsencrypt:/etc/letsencrypt:ro
-  #   networks:
-  #     - minio-net
-  #   depends_on:
-  #     - nexus
-
-  # PostgreSQL database
   postgres:
     image: postgres:16
     container_name: postgres
@@ -60,15 +41,14 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - ./pg_data:/var/lib/postgresql/data
+      - ./volume/pg_data:/var/lib/postgresql/data
 
-  # VictoriaMetrics вместо Prometheus
   victoriametrics:
     image: victoriametrics/victoria-metrics:latest
     restart: always
     container_name: victoriametrics
     volumes:
-      - ./victoria-metrics-data:/storage
+      - ./volume/victoria-metrics-data:/storage
     ports:
       - "9091:8428"
     networks:
@@ -79,7 +59,6 @@ services:
     depends_on:
       - nexus
 
-  # VM Agent для сбора метрик
   vmagent:
     image: victoriametrics/vmagent:latest
     restart: always
@@ -94,7 +73,6 @@ services:
     depends_on:
       - victoriametrics
 
-  # Grafana для визуализации
   grafana:
     image: grafana/grafana:latest
     restart: always
@@ -105,13 +83,12 @@ services:
       - GF_SECURITY_ADMIN_USER=admin
       - GF_SECURITY_ADMIN_PASSWORD=admin123
     volumes:
-      - grafana-data:/var/lib/grafana
+      - ./volume/grafana-data:/var/lib/grafana
     networks:
       - minio-net
     depends_on:
       - victoriametrics
 
-  # MinIO одиночный
   minio-single:
     image: quay.io/minio/minio:latest
     restart: always
@@ -123,17 +100,9 @@ services:
       - "9100:9000"
       - "9101:9001"
     volumes:
-      - minio-single-data:/data
+      - ./volume/minio-single-data:/data
     networks:
       - minio-net
-
-
-volumes:
-  minio-single-data:
-  nexus-data:
-  postgres-data:
-  grafana-data:
-  victoria-metrics-data:
 
 networks:
   minio-net:
