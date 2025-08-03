@@ -1,0 +1,139 @@
+services:
+  # HAProxy для MinIO
+  haproxy:
+    image: haproxy:latest
+    restart: always
+    volumes:
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    ports:
+      - "8200:9100"
+      - "8201:9101"
+    depends_on:
+      - minio-single
+    networks:
+      - minio-net
+
+  # Nexus Repository Manager
+  nexus:
+    image: sonatype/nexus3:3.80.0
+    restart: unless-stopped
+    container_name: nexus
+    volumes:
+      - ./nexus-data:/nexus-data
+    ports:
+      - "9090:8081"  # Основной порт Nexus
+      - "5000-5030:5000-5030"
+      - "8082-8090:8082-8090"
+    environment:
+      - INSTALL4J_ADD_VM_PARAMS=-Xms1024m -Xmx2048m -XX:MaxDirectMemorySize=2g -Djava.util.prefs.userRoot=/nexus-data
+    networks:
+      - minio-net
+    depends_on:
+      - postgres
+      - minio-single
+
+  # Nginx proxy
+  # nginx:
+  #   image: nginx:latest
+  #   restart: always
+  #   container_name: nginx
+  #   ports:
+  #     - "80:80"
+  #     - "443:443"
+  #   volumes:
+  #     - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+  #     - /etc/letsencrypt:/etc/letsencrypt:ro
+  #   networks:
+  #     - minio-net
+  #   depends_on:
+  #     - nexus
+
+  # PostgreSQL database
+  postgres:
+    image: postgres:16
+    container_name: postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./pg_data:/var/lib/postgresql/data
+
+  # VictoriaMetrics вместо Prometheus
+  victoriametrics:
+    image: victoriametrics/victoria-metrics:latest
+    restart: always
+    container_name: victoriametrics
+    volumes:
+      - ./victoria-metrics-data:/storage
+    ports:
+      - "9091:8428"
+    networks:
+      - minio-net
+    command:
+      - "-storageDataPath=/storage"
+      - "-retentionPeriod=1"
+    depends_on:
+      - nexus
+
+  # VM Agent для сбора метрик
+  vmagent:
+    image: victoriametrics/vmagent:latest
+    restart: always
+    container_name: vmagent
+    volumes:
+      - ./vmagent-config.yml:/etc/vmagent/config.yml:ro
+    command:
+      - "-remoteWrite.url=http://victoriametrics:8428/api/v1/write"
+      - "-promscrape.config=/etc/vmagent/config.yml"
+    networks:
+      - minio-net
+    depends_on:
+      - victoriametrics
+
+  # Grafana для визуализации
+  grafana:
+    image: grafana/grafana:latest
+    restart: always
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin123
+    volumes:
+      - grafana-data:/var/lib/grafana
+    networks:
+      - minio-net
+    depends_on:
+      - victoriametrics
+
+  # MinIO одиночный
+  minio-single:
+    image: quay.io/minio/minio:latest
+    restart: always
+    command: server /data --console-address ":9001"
+    environment:
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}
+    ports:
+      - "9100:9000"
+      - "9101:9001"
+    volumes:
+      - minio-single-data:/data
+    networks:
+      - minio-net
+
+
+volumes:
+  minio-single-data:
+  nexus-data:
+  postgres-data:
+  grafana-data:
+  victoria-metrics-data:
+
+networks:
+  minio-net:
