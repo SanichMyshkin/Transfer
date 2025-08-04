@@ -1,8 +1,8 @@
 repo_names:
-  - test1
+  - dckr
 
 regex_rules:
-  "dev-.*":
+  "test-.*":
     # retention_days: 7
     reserved: 2
 
