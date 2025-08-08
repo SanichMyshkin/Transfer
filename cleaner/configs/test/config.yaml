@@ -5,38 +5,38 @@ repo_names:
 
 # Общее поведение, если не сработало ни одно правило
 no_match_retention_days: 7
-no_match_reserved: 2
-no_match_min_days_since_last_download: 5
+#no_match_reserved: 2
+no_match_min_days_since_last_download: 0
 
-regex_rules:
-  "^file.*":
-    retention_days: 1
-    reserved: 0
-    min_days_since_last_download: 1
+# regex_rules:
+#   "^file.*":
+#     retention_days: 1
+#     reserved: 0
+#     min_days_since_last_download: 1
 
-  ".*\\.html$":
-    retention_days: 3
-    reserved: 2
+#   ".*\\.html$":
+#     retention_days: 3
+#     reserved: 2
 
-  ".*\\.log$":
-    retention_days: 5
-    reserved: 1
-    min_days_since_last_download: 2
+#   ".*\\.log$":
+#     retention_days: 5
+#     reserved: 1
+#     min_days_since_last_download: 2
 
-  ".*\\.yaml$":
-    retention_days: 4
-    reserved: 0
+#   ".*\\.yaml$":
+#     retention_days: 4
+#     reserved: 0
 
-  ".*\\.json$":
-    retention_days: 6
-    reserved: 1
+#   ".*\\.json$":
+#     retention_days: 6
+#     reserved: 1
 
-  ".*\\.cfg$":
-    retention_days: 10
+#   ".*\\.cfg$":
+#     retention_days: 10
 
-  ".*\\.md$":
-    retention_days: 2
+#   ".*\\.md$":
+#     retention_days: 2
 
-  ".*\\.xml$":
-    retention_days: 5
-    reserved: 1
+#   ".*\\.xml$":
+#     retention_days: 5
+#     reserved: 1

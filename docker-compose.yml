@@ -23,7 +23,7 @@ services:
       - "5000-5030:5000-5030"
       - "8082-8090:8082-8090"
     environment:
-      - INSTALL4J_ADD_VM_PARAMS=-Xms1024m -Xmx2048m -XX:MaxDirectMemorySize=2g -Djava.util.prefs.userRoot=/nexus-data
+      - INSTALL4J_ADD_VM_PARAMS=-Xms512m -Xmx1024m -XX:MaxDirectMemorySize=2g -Djava.util.prefs.userRoot=/nexus-data
     networks:
       - minio-net
     depends_on:
@@ -43,51 +43,6 @@ services:
     volumes:
       - ./volume/pg_data:/var/lib/postgresql/data
 
-  victoriametrics:
-    image: victoriametrics/victoria-metrics:latest
-    restart: always
-    container_name: victoriametrics
-    volumes:
-      - ./volume/victoria-metrics-data:/storage
-    ports:
-      - "9091:8428"
-    networks:
-      - minio-net
-    command:
-      - "-storageDataPath=/storage"
-      - "-retentionPeriod=1"
-    depends_on:
-      - nexus
-
-  vmagent:
-    image: victoriametrics/vmagent:latest
-    restart: always
-    container_name: vmagent
-    volumes:
-      - ./vmagent-config.yml:/etc/vmagent/config.yml:ro
-    command:
-      - "-remoteWrite.url=http://victoriametrics:8428/api/v1/write"
-      - "-promscrape.config=/etc/vmagent/config.yml"
-    networks:
-      - minio-net
-    depends_on:
-      - victoriametrics
-
-  grafana:
-    image: grafana/grafana:latest
-    restart: always
-    container_name: grafana
-    ports:
-      - "3000:3000"
-    environment:
-      - GF_SECURITY_ADMIN_USER=admin
-      - GF_SECURITY_ADMIN_PASSWORD=admin123
-    volumes:
-      - ./volume/grafana-data:/var/lib/grafana
-    networks:
-      - minio-net
-    depends_on:
-      - victoriametrics
 
   minio-single:
     image: quay.io/minio/minio:latest

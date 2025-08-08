@@ -156,7 +156,13 @@ def get_matching_rule(version, regex_rules, no_match_retention, no_match_reserve
     return "no-match", retention, no_match_reserved, no_match_min_days_since_last_download
 
 
-def filter_components_to_delete(components, regex_rules, no_match_retention, no_match_reserved, no_match_min_days_since_last_download):
+def filter_components_to_delete(
+    components,
+    regex_rules,
+    no_match_retention,
+    no_match_reserved,
+    no_match_min_days_since_last_download
+):
     now_utc = datetime.now(timezone.utc)
     grouped = defaultdict(list)
 
@@ -226,34 +232,33 @@ def filter_components_to_delete(components, regex_rules, no_match_retention, no_
             reserved = component.get("reserved")
             min_days_since_last_download = component.get("min_days_since_last_download")
 
+            # Обработка зарезервированных компонентов
             if reserved is not None and i < reserved:
                 logging.info(f" 📦 Зарезервирован: {full_path} | правило ({pattern}) (позиция {i + 1}/{reserved})")
                 continue
 
-            if last_download and min_days_since_last_download is not None:
-                since_download = (now_utc - last_download).days
-                if since_download <= min_days_since_last_download:
-                    logging.info(f" 📦 Использовался недавно: {full_path} | правило ({pattern}) (скачивали {since_download} дн. назад ≤ {min_days_since_last_download})")
-                    continue
-                else:
-                    logging.info(f" 🗑 Не скачивали давно: {full_path} | правило ({pattern}) (скачивали {since_download} дн. назад > {min_days_since_last_download})")
-                    to_delete.append(component)
-                    continue
+            # Проверка условий сохранения
+            passed_retention = retention is not None and age.days <= retention.days
+            passed_recent_download = (
+                last_download is not None and
+                min_days_since_last_download is not None and
+                (now_utc - last_download).days <= min_days_since_last_download
+            )
 
-            if retention is not None:
-                if age.days > retention.days:
-                    logging.info(f" 🗑 Удаление по retention: {full_path} | правило ({pattern}) (возраст {age.days} дн. > {retention.days})")
-                    to_delete.append(component)
-                    continue
-                else:
-                    logging.info(f" 📦 Сохранён по retention: {full_path} | правило ({pattern}) (возраст {age.days} дн. ≤ {retention.days})")
-                    continue
-
-            if reserved is not None and i >= reserved:
-                logging.info(f" 🗑 Удаление по правилу reserved: {full_path} | правило ({pattern}) (позиция {i + 1} > {reserved})")
-                to_delete.append(component)
+            if passed_retention or passed_recent_download:
+                logging.info(
+                    f" 📦 Сохранён: {full_path} | правило ({pattern}) "
+                    f"(retention: {age.days} дн. ≤ {retention.days if retention else '–'}, "
+                    f"скачивали {((now_utc - last_download).days if last_download else '–')} дн. назад)"
+                )
+                continue
             else:
-                logging.info(f" 📦 Сохранён: {full_path} | правило ({pattern}) — не попал под условия удаления")
+                logging.info(
+                    f" 🗑 Удаление: {full_path} | правило ({pattern}) "
+                    f"(retention: {age.days} дн. > {retention.days if retention else '–'}, "
+                    f"скачивали {(now_utc - last_download).days if last_download else 'никогда'})"
+                )
+                to_delete.append(component)
 
     logging.info(f" 🧹 Обнаружено к удалению: {len(to_delete)} компонент(ов)")
     return to_delete
@@ -265,6 +270,10 @@ def clear_repository(repo_name, cfg):
     repo_format = get_repository_format(repo_name)
     if not repo_format:
         logging.warning(f"⚠️ Пропущен репозиторий '{repo_name}' — неизвестный формат")
+        return
+
+    if repo_format not in ["raw", "docker"]:
+        logging.warning(f"⚠️ Репозиторий '{repo_name}' имеет неподдерживаемый формат '{repo_format}' и будет пропущен")
         return
 
     items = get_repository_items(repo_name, repo_format)
