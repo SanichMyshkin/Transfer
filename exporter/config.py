@@ -9,7 +9,7 @@ NEXUS_USERNAME = os.getenv("NEXUS_USERNAME")
 NEXUS_PASSWORD = os.getenv("NEXUS_PASSWORD")
 
 # 🔐 GitLab настройки
-GITLAB_URL = os.getenv("GITLAB_URL", "https://gitlab.com")  # по умолчанию — публичный GitLab
+GITLAB_URL = os.getenv("GITLAB_URL", "https://gitlab.fc.uralsibbank.ru")
 GITLAB_TOKEN = os.getenv("GITLAB_TOKEN")
 GITLAB_BRANCH = os.getenv("GITLAB_BRANCH", "main")  # ветка по умолчанию
 

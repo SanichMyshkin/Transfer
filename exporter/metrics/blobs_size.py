@@ -26,7 +26,6 @@ BLOB_QUOTA = Gauge(
 )
 
 
-
 def get_blobstores(nexus_url: str, auth: tuple) -> list | None:
     """Получает список blobstores из Nexus API."""
     session = requests.Session()
@@ -84,10 +83,8 @@ def update_metrics(blobstores: list) -> None:
         ).set(blob["availableSpaceInBytes"])
 
         if quota:
-            BLOB_QUOTA.labels(
-                blob_name=blob.get('name')
-            ).set(int(quota))
-        
+            BLOB_QUOTA.labels(blob_name=blob.get("name")).set(int(quota))
+
         logger.info(
             f"[{blob['name']}] used: {blob['totalSizeInBytes']} | "
             f"available: {blob['availableSpaceInBytes']} | "

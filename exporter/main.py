@@ -11,7 +11,7 @@ from metrics.repo_status import fetch_repositories_metrics
 from metrics.repo_size import fetch_repository_metrics
 from metrics.blobs_size import fetch_blob_metrics
 from metrics.docker_tags import fetch_docker_tags_metrics
-from metrics.tasks import fetch_task_metrics
+from metrics.tasks import fetch_task_metrics, fetch_all_blob_and_repo_metrics
 from metrics.docker_ports import fetch_docker_ports_metrics
 
 logging.basicConfig(
@@ -33,7 +33,7 @@ def main():
 
     while True:
         current_time = time.time()
-        
+
         if current_time - last_repo_metrics_time >= REPO_METRICS_INTERVAL:
             logger.info("Периодический запуск сбора статуса репозиториев типа Proxy...")
             fetch_repositories_metrics(NEXUS_API_URL, auth)
@@ -46,7 +46,10 @@ def main():
         fetch_repository_metrics()
 
         logger.info("Запуск сбора задач...")
-        fetch_task_metrics(NEXUS_API_URL, "tasks", auth)
+        fetch_task_metrics(NEXUS_API_URL, auth)
+
+        logger.info("Запуск сбора повисших задач...")
+        fetch_all_blob_and_repo_metrics(NEXUS_API_URL, auth)
 
         logger.info("Запуск сбора Docker тегов...")
         fetch_docker_tags_metrics()
@@ -60,7 +63,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    #task = get_jobs_data()
-    #for i in task:
-    #    print(i)
-    #    print('-'*40)

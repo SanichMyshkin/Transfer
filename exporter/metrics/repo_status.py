@@ -3,7 +3,7 @@ import time
 import socket
 import urllib3
 from prometheus_client import Gauge
-from metrics.utlis.api import get_from_nexus, safe_get_raw
+from metrics.utils.api import get_from_nexus, safe_get_raw
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 logging.getLogger("urllib3.connectionpool").setLevel(logging.CRITICAL)
@@ -147,7 +147,9 @@ def fetch_repositories_metrics(nexus_url: str, auth: tuple) -> list:
     raw_repos = get_from_nexus(nexus_url, "repositories", auth)
 
     if not raw_repos:
-        logger.error(f"❌ Не удалось получить список репозиториев из Nexus: {nexus_url}")
+        logger.error(
+            f"❌ Не удалось получить список репозиториев из Nexus: {nexus_url}"
+        )
         logger.error("🚫 Пропускаем сбор Status метрик.")
         return []
 

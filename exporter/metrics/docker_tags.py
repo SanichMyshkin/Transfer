@@ -1,7 +1,7 @@
 import logging
 from prometheus_client import Gauge
 
-from metrics.utlis.api import build_nexus_url
+from metrics.utils.api import build_nexus_url
 from database.tags_query import fetch_docker_tags_data
 
 

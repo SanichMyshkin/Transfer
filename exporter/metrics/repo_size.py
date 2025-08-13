@@ -3,6 +3,8 @@ import logging
 from prometheus_client import Gauge
 from database.repository_query import get_repository_sizes, get_repository_data
 from database.jobs_query import get_jobs_data
+from config import GITLAB_TOKEN, GITLAB_BRANCH, GITLAB_URL
+from metrics.utils.api_gitlab import get_external_policies
 
 # Настройка логирования
 logging.basicConfig(
@@ -21,7 +23,7 @@ REPO_STORAGE = Gauge(
         "repo_format",
         "blob_name",
         "internal_cleanup_policy",  # внутренняя политика
-        "custom_cleaner_url",       # внешняя политика
+        "custom_cleaner_url",  # внешняя политика
         "delete_temp_status",
         "compact_status",
     ],
@@ -33,13 +35,6 @@ ALLOWED_TASK_TYPES = {
     "blobstore.compact": "compact",
 }
 
-# Внешние политики (repo_name -> URL)
-def get_external_policies():
-    return {
-        "docker-habor": "https://nexus.sanich.space/#browse/browse:docker-habor",
-        "comunda-docker": "https://sanich.space",
-        "nuget.org-proxy": 'https://wikipedia.com'
-    }
 
 def fetch_repository_metrics() -> list:
     logger.info("🔄 Сбор информации о репозиториях и метриках...")
@@ -52,7 +47,9 @@ def fetch_repository_metrics() -> list:
         return []
 
     if not repo_data:
-        logger.error("❌ Не удалось получить данные о репозиториях — метрики не будут обновлены")
+        logger.error(
+            "❌ Не удалось получить данные о репозиториях — метрики не будут обновлены"
+        )
         return []
 
     for repo in repo_data:
@@ -75,8 +72,10 @@ def fetch_repository_metrics() -> list:
                 task_statuses[blob_name] = {"delete": 0, "compact": 0}
             task_statuses[blob_name][status_key] = 1
 
-    external_links = get_external_policies()
+    #external_links = get_external_policies(GITLAB_URL, GITLAB_TOKEN, GITLAB_BRANCH)
+    external_links = {'dckr': 'https://wikipedia.com'}
 
+    logger.info(f"Полученные внешние политики: {external_links}")
     REPO_STORAGE.clear()
 
     for repo in repo_data:
@@ -105,7 +104,9 @@ def fetch_repository_metrics() -> list:
         try:
             size = float(repo.get("size", 0) or 0)
         except (ValueError, TypeError):
-            logger.warning(f"⚠️ Невозможно преобразовать размер репозитория {repo_name} в число")
+            logger.warning(
+                f"⚠️ Невозможно преобразовать размер репозитория {repo_name} в число"
+            )
             size = 0.0
 
         REPO_STORAGE.labels(

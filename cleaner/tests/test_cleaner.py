@@ -506,4 +506,3 @@ def test_raw_file_without_slash_skipped():
     ]
     components = convert_raw_assets_to_components(assets)
     assert len(components) == 0
-
