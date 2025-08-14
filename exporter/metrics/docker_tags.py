@@ -1,14 +1,8 @@
-import logging
 from prometheus_client import Gauge
-
 from metrics.utils.api import build_nexus_url
-from database.tags_query import fetch_docker_tags_data
+from database.docker_tags import fetch_docker_tags_data  # новый путь
+from common.logs import logging
 
-
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(module)s - %(message)s"
-)
-logger = logging.getLogger(__name__)
 
 # Метрика Prometheus
 docker_tags_gauge = Gauge(
@@ -55,20 +49,20 @@ def fetch_docker_tags_metrics() -> None:
     try:
         result = fetch_docker_tags_data()
     except Exception as e:
-        logger.error(f"❌ Ошибка при получении данных из БД для Docker-образов: {e}")
-        logger.warning(
+        logging.error(f"❌ Ошибка при получении данных из БД для Docker-образов: {e}")
+        logging.warning(
             "⚠️ Возможно, база данных недоступна или Nexus не работает. Сбор метрик пропущен."
         )
         return
 
     if not result:
-        logger.warning(
+        logging.warning(
             "❌ База данных вернула 0 строк по Docker-образам. "
             "Возможно, Nexus не отвечает, база пуста или репозиториев нет. Метрики не обновлены."
         )
         return
 
-    logger.info(f"📥 Получено {len(result)} строк из базы данных.")
+    logging.info(f"📥 Получено {len(result)} строк из базы данных.")
     grouped = process_docker_result(result)
 
     docker_tags_gauge.clear()
@@ -83,7 +77,7 @@ def fetch_docker_tags_metrics() -> None:
         tag_str = "; ".join(tags)
         tag_count = len(tags)
 
-        logger.info(
+        logging.info(
             f"🐳 Образ: {image} | 📦 Репозиторий: {repo} | 🏷️ Теги ({tag_count}): {tag_str}"
         )
 
@@ -96,4 +90,4 @@ def fetch_docker_tags_metrics() -> None:
             nexus_url_path=build_nexus_url(repo, image, encoding=False),
         ).set(tag_count)
 
-    logger.info(f"✅ Метрики обновлены для {len(grouped)} Docker-образов.")
+    logging.info(f"✅ Метрики обновлены для {len(grouped)} Docker-образов.")

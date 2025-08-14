@@ -1,4 +1,4 @@
-import logging
+from common.logs import logging
 import time
 import socket
 import urllib3
@@ -6,12 +6,6 @@ from prometheus_client import Gauge
 from metrics.utils.api import get_from_nexus, safe_get_raw
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-logging.getLogger("urllib3.connectionpool").setLevel(logging.CRITICAL)
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
-)
-
-logger = logging.getLogger(__name__)
 
 # Метрики
 REPO_STATUS = Gauge(
@@ -36,7 +30,7 @@ def is_domain_resolvable(url: str) -> bool:
         socket.gethostbyname(domain)
         return True
     except Exception:
-        logger.warning(f"❌ Невозможно разрешить домен: {url}")
+        logging.warning(f"❌ Невозможно разрешить домен: {url}")
         return False
 
 
@@ -72,9 +66,9 @@ def check_url_status(
         for resp in response.history:
             loc = resp.headers.get("Location", "<unknown>")
             chain.append(f"{resp.status_code} → {loc}")
-        logger.info(f"🔁 {name} редиректы: {' > '.join(chain)}")
+        logging.info(f"🔁 {name} редиректы: {' > '.join(chain)}")
 
-    logger.info(
+    logging.info(
         f"🔚 {name} финальный URL: {response.url} (статус: {response.status_code})"
     )
     return format_status(response.status_code), redirected, ""
@@ -135,22 +129,22 @@ def update_all_metrics(statuses: list):
             redirected=str(status["redirected"]).lower(),
         ).set(1 if healthy else 0)
 
-        logger.info(
+        logging.info(
             f"📦 Статус репозитория {repo['name']}: {'✅' if healthy else '❌'}"
         )
 
 
 def fetch_repositories_metrics(nexus_url: str, auth: tuple) -> list:
-    logger.info("🔍 Запуск сбора статуса репозиториев типа Proxy...")
+    logging.info("🔍 Запуск сбора статуса репозиториев типа Proxy...")
 
     start = time.perf_counter()
     raw_repos = get_from_nexus(nexus_url, "repositories", auth)
 
     if not raw_repos:
-        logger.error(
+        logging.error(
             f"❌ Не удалось получить список репозиториев из Nexus: {nexus_url}"
         )
-        logger.error("🚫 Пропускаем сбор Status метрик.")
+        logging.error("🚫 Пропускаем сбор Status метрик.")
         return []
 
     repos = [
@@ -170,20 +164,20 @@ def fetch_repositories_metrics(nexus_url: str, auth: tuple) -> list:
         type_counts[repo_type] = type_counts.get(repo_type, 0) + 1
 
     for repo_type, count in type_counts.items():
-        logger.info(f"📊 Репозиториев типа '{repo_type}': {count}")
+        logging.info(f"📊 Репозиториев типа '{repo_type}': {count}")
 
     REPO_COUNT.clear()
     for repo_type, count in type_counts.items():
         REPO_COUNT.labels(repo_type=repo_type).set(count)
 
-    logger.info(
+    logging.info(
         f"📡 Получено {len(repos)} proxy-репозиториев. Начинаем проверку URL..."
     )
 
     statuses = [fetch_status(repo, auth) for repo in repos]
-    logger.info(f"✅ Проверка завершена за {time.perf_counter() - start:.2f} секунд.")
+    logging.info(f"✅ Проверка завершена за {time.perf_counter() - start:.2f} секунд.")
 
     update_all_metrics(statuses)
-    logger.info("📈 Метрики обновлены.")
+    logging.info("📈 Метрики обновлены.")
 
     return statuses

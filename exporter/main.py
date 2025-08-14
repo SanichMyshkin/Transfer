@@ -1,8 +1,8 @@
 import time
-import logging
+from common.logs import logging
 
-from config import get_auth
-from config import NEXUS_API_URL, LAUNCH_INTERVAL, REPO_METRICS_INTERVAL
+from common.config import get_auth
+from common.config import NEXUS_API_URL, LAUNCH_INTERVAL, REPO_METRICS_INTERVAL
 
 from prometheus_client import start_http_server
 
@@ -14,20 +14,15 @@ from metrics.docker_tags import fetch_docker_tags_metrics
 from metrics.tasks import fetch_task_metrics, fetch_all_blob_and_repo_metrics
 from metrics.docker_ports import fetch_docker_ports_metrics
 
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(module)s - %(message)s"
-)
-logger = logging.getLogger(__name__)
-
 
 def main():
     start_http_server(8000)
     auth = get_auth()
 
-    logger.info("Метрики VictoriaMetrics доступны на :8000")
+    logging.info("Метрики VictoriaMetrics доступны на :8000")
 
     # Запускаем сбор метрик репозиториев сразу
-    logger.info("Первичный запуск сбора статуса репозиториев типа Proxy...")
+    logging.info("Первичный запуск сбора статуса репозиториев типа Proxy...")
     fetch_repositories_metrics(NEXUS_API_URL, auth)
     last_repo_metrics_time = time.time()
 
@@ -35,30 +30,31 @@ def main():
         current_time = time.time()
 
         if current_time - last_repo_metrics_time >= REPO_METRICS_INTERVAL:
-            logger.info("Периодический запуск сбора статуса репозиториев типа Proxy...")
+            logging.info(
+                "Периодический запуск сбора статуса репозиториев типа Proxy..."
+            )
             fetch_repositories_metrics(NEXUS_API_URL, auth)
             last_repo_metrics_time = current_time
 
-        logger.info("Запуск сбора размера блобов...")
+        logging.info("Запуск сбора размера блобов...")
         fetch_blob_metrics(NEXUS_API_URL, auth)
 
-        logger.info("Запуск сбора размера репозиториев и наличие задач очистки...")
+        logging.info("Запуск сбора размера репозиториев и наличие задач очистки...")
         fetch_repository_metrics()
 
-        logger.info("Запуск сбора задач...")
+        logging.info("Запуск сбора задач...")
         fetch_task_metrics(NEXUS_API_URL, auth)
 
-        logger.info("Запуск сбора повисших задач...")
+        logging.info("Запуск сбора повисших задач...")
         fetch_all_blob_and_repo_metrics(NEXUS_API_URL, auth)
 
-        logger.info("Запуск сбора Docker тегов...")
+        logging.info("Запуск сбора Docker тегов...")
         fetch_docker_tags_metrics()
 
-        logger.info("Запуск сбора Docker портов...")
+        logging.info("Запуск сбора Docker портов...")
         fetch_docker_ports_metrics()
 
         time.sleep(LAUNCH_INTERVAL)
-
 
 
 if __name__ == "__main__":

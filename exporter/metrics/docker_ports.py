@@ -1,13 +1,6 @@
-import logging
 from prometheus_client import Gauge
-
-from database.ports_query import fetch_docker_ports
-
-
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(module)s - %(message)s"
-)
-logger = logging.getLogger(__name__)
+from database.docker_ports import fetch_docker_ports
+from common.logs import logging
 
 # Метрика Prometheus
 docker_repo_port_gauge = Gauge(
@@ -16,23 +9,22 @@ docker_repo_port_gauge = Gauge(
     ["repository_name", "http_port", "remote_url", "repo_type"],
 )
 
-
 def fetch_docker_ports_metrics() -> None:
     try:
         result = fetch_docker_ports()
     except Exception as e:
-        logger.error(f"❌ Ошибка при обращении к базе данных docker-репозиториев: {e}")
-        logger.warning("⚠️ Метрики не обновлены. Возможно, база данных недоступна или повреждена.")
+        logging.error(f"❌ Ошибка при обращении к базе данных docker-репозиториев: {e}")
+        logging.warning("⚠️ Метрики не обновлены. Возможно, база данных недоступна или повреждена.")
         return
 
     if not result:
-        logger.warning(
+        logging.warning(
             "🚫 Не получено ни одного docker-репозитория из базы данных. "
             "Скорее всего, Nexus недоступен или база пуста. Пропускаем обновление метрик."
         )
         return
 
-    logger.info(f"✅ Получено {len(result)} docker-репозиториев из базы данных.")
+    logging.info(f"✅ Получено {len(result)} docker-репозиториев из базы данных.")
     docker_repo_port_gauge.clear()
 
     for entry in result:
@@ -40,7 +32,7 @@ def fetch_docker_ports_metrics() -> None:
         http_port = entry.get("http_port")
         remote_url = entry.get("remote_url", "")
 
-        logger.info(
+        logging.info(
             f"📦 Репозиторий: {repo_name} | 🌐 Порт: {http_port} | 🔗 Удалённый URL: {remote_url or '—'}"
         )
 
@@ -51,4 +43,4 @@ def fetch_docker_ports_metrics() -> None:
             repo_type="Proxy" if remote_url else "Hosted",
         ).set(1)
 
-    logger.info("✅ Метрики по портам docker-репозиториев успешно обновлены.")
+    logging.info("✅ Метрики по портам docker-репозиториев успешно обновлены.")

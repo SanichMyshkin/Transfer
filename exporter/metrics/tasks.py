@@ -1,15 +1,9 @@
-import logging
+from common.logs import logging
 from typing import Optional
 from prometheus_client import Gauge
 from metrics.utils.api import get_from_nexus
-from database.jobs_query import get_jobs_data  # твоя функция
+from database.jobs_reader import get_jobs_data  # твоя функция
 
-# Логирование
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(module)s - %(message)s",
-)
-logger = logging.getLogger(__name__)
 
 # --- Метрики ---
 TASK_INFO = Gauge(
@@ -99,13 +93,13 @@ def export_tasks_to_metrics(tasks: list) -> None:
                 last_run=task.get("lastRun") or "null",
             ).set(value)
 
-            logger.info(f"📊 [{icon}] Задача '{task_name}' ({task_type}): {label}")
+            logging.info(f"📊 [{icon}] Задача '{task_name}' ({task_type}): {label}")
         except Exception as e:
-            logger.warning(
+            logging.warning(
                 f"⚠️ Ошибка при экспорте метрик для задачи {task_id}: {e}", exc_info=True
             )
 
-    logger.info("✅ Экспорт метрик задач завершён.")
+    logging.info("✅ Экспорт метрик задач завершён.")
 
 
 def export_blob_repo_metrics(tasks: list, blobs: list, repos: list) -> None:
@@ -124,7 +118,7 @@ def export_blob_repo_metrics(tasks: list, blobs: list, repos: list) -> None:
         if blob:
             exists = 1 if blob.lower() in blobs else 0
             match_status = "✅" if exists else "❌"
-            logger.info(
+            logging.info(
                 f"📦 [{match_status}] Задача '{name}' ({task_type}) [blobstore: {blob}]"
             )
 
@@ -140,7 +134,7 @@ def export_blob_repo_metrics(tasks: list, blobs: list, repos: list) -> None:
         if repo:
             exists = 1 if repo.lower() in repos else 0
             match_status = "✅" if exists else "❌"
-            logger.info(
+            logging.info(
                 f"📦 [{match_status}] Задача '{name}' ({task_type}) [repository: {repo}]"
             )
 
@@ -153,7 +147,9 @@ def export_blob_repo_metrics(tasks: list, blobs: list, repos: list) -> None:
                 match_value=repo,
             ).set(exists)
 
-    logger.info(f"✅ Экспорт blob/repo метрик завершён. Обработано задач: {len(tasks)}")
+    logging.info(
+        f"✅ Экспорт blob/repo метрик завершён. Обработано задач: {len(tasks)}"
+    )
 
 
 # --- Основные функции ---
@@ -161,10 +157,10 @@ def fetch_task_metrics(NEXUS_API_URL, auth) -> None:
     """Сбор метрики всех задач Nexus."""
     task_data = fetch_all_from_nexus(NEXUS_API_URL, "tasks", auth)
     if not task_data:
-        logger.error("❌ Не удалось собрать метрики задач. Пропускаем сбор метрик!")
+        logging.error("❌ Не удалось собрать метрики задач. Пропускаем сбор метрик!")
         return
 
-    logger.info(
+    logging.info(
         f"📥 Получены данные задач Nexus: {len(task_data)} записей. Начинаем экспорт..."
     )
     export_tasks_to_metrics(task_data)
@@ -172,7 +168,7 @@ def fetch_task_metrics(NEXUS_API_URL, auth) -> None:
 
 def fetch_all_blob_and_repo_metrics(NEXUS_API_URL, auth) -> None:
     """Сбор метрик с проверкой blobstore и repository."""
-    logger.info("📥 Загружаем список blobstore и repository из Nexus...")
+    logging.info("📥 Загружаем список blobstore и repository из Nexus...")
 
     blobs_data = fetch_all_from_nexus(NEXUS_API_URL, "blobstores", auth)
     repos_data = fetch_all_from_nexus(NEXUS_API_URL, "repositories", auth)
@@ -188,12 +184,14 @@ def fetch_all_blob_and_repo_metrics(NEXUS_API_URL, auth) -> None:
         if isinstance(r, dict) and "name" in r
     ]
 
-    logger.info(f"📦 Найдено blobstores: {len(blobs)}, repositories: {len(repos)}")
+    logging.info(f"📦 Найдено blobstores: {len(blobs)}, repositories: {len(repos)}")
 
     tasks = get_jobs_data()
     filtered_tasks = [
         t for t in tasks if t.get("blobstoreName") or t.get("repositoryName")
     ]
 
-    logger.info(f"🔍 Отфильтровано задач для проверки blob/repo: {len(filtered_tasks)}")
+    logging.info(
+        f"🔍 Отфильтровано задач для проверки blob/repo: {len(filtered_tasks)}"
+    )
     export_blob_repo_metrics(filtered_tasks, blobs, repos)

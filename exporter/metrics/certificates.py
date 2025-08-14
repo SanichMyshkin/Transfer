@@ -1,11 +1,8 @@
-import logging
+## надо подумать как сразу серты закидывать а не мониторить
+from common.logs import logging
 from prometheus_client import Gauge
-from metrics.utlis.api import get_from_nexus
+from metrics.utils.api import get_from_nexus
 
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(module)s - %(message)s"
-)
-logger = logging.getLogger(__name__)
 
 CERT_MATCH_STATUS = Gauge(
     "nexus_cert_url_match",
@@ -33,7 +30,7 @@ def update_cert_match_metrics(nexus_url: str, auth: tuple):
         certs = get_from_nexus(nexus_url, "security/ssl/truststore", auth)
         repos = get_from_nexus(nexus_url, "repositories", auth)
     except Exception as e:
-        logger.error(f"Ошибка при получении данных из Nexus: {e}")
+        logging.error(f"Ошибка при получении данных из Nexus: {e}")
         return
 
     if not certs or not repos:
@@ -70,7 +67,7 @@ def update_cert_match_metrics(nexus_url: str, auth: tuple):
                 match_level=str(best_level),
             ).set(best_level)
 
-            logger.info(
+            logging.info(
                 f"✔️ Совпадение: Repo='{name}', URL='{remote}', CN='{best_cert_cn}', Уровень={best_level}"
             )
         else:
@@ -81,6 +78,6 @@ def update_cert_match_metrics(nexus_url: str, auth: tuple):
                 match_level="0",
             ).set(0)
 
-            logger.info(
+            logging.info(
                 f"⚠️ Нет совпадений: Repo='{name}', URL='{remote}' → ни один сертификат не подошёл"
             )

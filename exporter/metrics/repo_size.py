@@ -1,17 +1,9 @@
-import logging
-
 from prometheus_client import Gauge
-from database.repository_query import get_repository_sizes, get_repository_data
-from database.jobs_query import get_jobs_data
-from config import GITLAB_TOKEN, GITLAB_BRANCH, GITLAB_URL
+from database.repository_info import get_repository_sizes, get_repository_data
+from database.jobs_reader import get_jobs_data
+from common.config import GITLAB_TOKEN, GITLAB_BRANCH, GITLAB_URL
 from metrics.utils.api_gitlab import get_external_policies
-
-# Настройка логирования
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(module)s - %(message)s",
-)
-logger = logging.getLogger(__name__)
+from common.logs import logging
 
 # Единая метрика с двумя лейблами: внутренняя и внешняя политика
 REPO_STORAGE = Gauge(
@@ -37,17 +29,17 @@ ALLOWED_TASK_TYPES = {
 
 
 def fetch_repository_metrics() -> list:
-    logger.info("🔄 Сбор информации о репозиториях и метриках...")
+    logging.info("🔄 Сбор информации о репозиториях и метриках...")
 
     try:
         repo_size = get_repository_sizes()
         repo_data = get_repository_data()
     except Exception as e:
-        logger.error(f"❌ Ошибка при получении данных из БД: {e}")
+        logging.error(f"❌ Ошибка при получении данных из БД: {e}")
         return []
 
     if not repo_data:
-        logger.error(
+        logging.error(
             "❌ Не удалось получить данные о репозиториях — метрики не будут обновлены"
         )
         return []
@@ -58,7 +50,7 @@ def fetch_repository_metrics() -> list:
     try:
         task_data = get_jobs_data()
     except Exception as e:
-        logger.error(f"❌ Ошибка при получении задач из БД: {e}")
+        logging.error(f"❌ Ошибка при получении задач из БД: {e}")
         task_data = []
 
     # Задачи по blobStore
@@ -75,7 +67,7 @@ def fetch_repository_metrics() -> list:
     #external_links = get_external_policies(GITLAB_URL, GITLAB_TOKEN, GITLAB_BRANCH)
     external_links = {'dckr': 'https://wikipedia.com'}
 
-    logger.info(f"Полученные внешние политики: {external_links}")
+    logging.info(f"Полученные внешние политики: {external_links}")
     REPO_STORAGE.clear()
 
     for repo in repo_data:
@@ -93,7 +85,7 @@ def fetch_repository_metrics() -> list:
             custom_cleaner_url = ""
 
         # Лог
-        logger.info(
+        logging.info(
             f"📦 Репозиторий: {repo_name} | blob: {blob_name} | "
             f"delete: {'✅' if repo.get('delete') else '❌'} | "
             f"compact: {'✅' if repo.get('compact') else '❌'} | "
@@ -104,7 +96,7 @@ def fetch_repository_metrics() -> list:
         try:
             size = float(repo.get("size", 0) or 0)
         except (ValueError, TypeError):
-            logger.warning(
+            logging.warning(
                 f"⚠️ Невозможно преобразовать размер репозитория {repo_name} в число"
             )
             size = 0.0
@@ -120,5 +112,5 @@ def fetch_repository_metrics() -> list:
             compact_status=str(repo.get("compact", 0)),
         ).set(size)
 
-    logger.info("✅ Метрики репозиториев собраны успешно")
+    logging.info("✅ Метрики репозиториев собраны успешно")
     return repo_data
