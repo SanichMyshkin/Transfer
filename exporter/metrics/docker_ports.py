@@ -1,5 +1,5 @@
 from prometheus_client import Gauge
-from database.docker_ports import fetch_docker_ports
+from database.docker_ports_query import fetch_docker_ports
 from common.logs import logging
 
 # Метрика Prometheus

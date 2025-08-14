@@ -1,6 +1,6 @@
 from prometheus_client import Gauge
-from database.repository_info import get_repository_sizes, get_repository_data
-from database.jobs_reader import get_jobs_data
+from database.repository_size_query import get_repository_sizes, get_repository_data
+from database.utils.jobs_reader import get_jobs_data
 from common.config import GITLAB_TOKEN, GITLAB_BRANCH, GITLAB_URL
 from metrics.utils.api_gitlab import get_external_policies
 from common.logs import logging
@@ -65,7 +65,7 @@ def fetch_repository_metrics() -> list:
             task_statuses[blob_name][status_key] = 1
 
     #external_links = get_external_policies(GITLAB_URL, GITLAB_TOKEN, GITLAB_BRANCH)
-    external_links = {'dckr': 'https://wikipedia.com'}
+    external_links = {"dckr": "https://wikipedia.com"}
 
     logging.info(f"Полученные внешние политики: {external_links}")
     REPO_STORAGE.clear()

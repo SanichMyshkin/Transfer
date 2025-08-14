@@ -2,7 +2,7 @@ from common.logs import logging
 from typing import Optional
 from prometheus_client import Gauge
 from metrics.utils.api import get_from_nexus
-from database.jobs_reader import get_jobs_data  # твоя функция
+from database.utils.jobs_reader import get_jobs_data  # твоя функция
 
 
 # --- Метрики ---

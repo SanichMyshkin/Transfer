@@ -13,6 +13,7 @@ from metrics.blobs_size import fetch_blob_metrics
 from metrics.docker_tags import fetch_docker_tags_metrics
 from metrics.tasks import fetch_task_metrics, fetch_all_blob_and_repo_metrics
 from metrics.docker_ports import fetch_docker_ports_metrics
+from metrics.cleanup_policy import fetch_cleanup_policy_usage
 
 
 def main():
@@ -53,6 +54,9 @@ def main():
 
         logging.info("Запуск сбора Docker портов...")
         fetch_docker_ports_metrics()
+
+        logging.info("Запуск сбора НЕ используемых политик...")
+        fetch_cleanup_policy_usage(NEXUS_API_URL, auth)
 
         time.sleep(LAUNCH_INTERVAL)
 

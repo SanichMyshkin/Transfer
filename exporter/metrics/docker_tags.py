@@ -1,6 +1,6 @@
 from prometheus_client import Gauge
 from metrics.utils.api import build_nexus_url
-from database.docker_tags import fetch_docker_tags_data  # новый путь
+from database.docker_tags_query import fetch_docker_tags_data  # новый путь
 from common.logs import logging
 
 
