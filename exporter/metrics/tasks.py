@@ -115,13 +115,13 @@ def export_blob_repo_metrics(tasks: list, blobs: list, repos: list) -> None:
         blob = task.get("blobstoreName")
         repo = task.get("repositoryName")
 
-        if blob:
-            exists = 1 if blob.lower() in blobs else 0
+        if isinstance(blob, str) and blob.strip():
+            blob_clean = blob.strip().lower()
+            exists = 1 if blob_clean == "*" or blob_clean in blobs else 0
             match_status = "✅" if exists else "❌"
             logging.info(
                 f"📦 [{match_status}] Задача '{name}' ({task_type}) [blobstore: {blob}]"
             )
-
             TASK_MATCH_INFO.labels(
                 task_id=str(tid),
                 task_name=str(name),
@@ -131,13 +131,13 @@ def export_blob_repo_metrics(tasks: list, blobs: list, repos: list) -> None:
                 match_value=blob,
             ).set(exists)
 
-        if repo:
-            exists = 1 if repo.lower() in repos else 0
+        if isinstance(repo, str) and repo.strip():
+            repo_clean = repo.strip().lower()
+            exists = 1 if repo_clean == "*" or repo_clean in repos else 0
             match_status = "✅" if exists else "❌"
             logging.info(
                 f"📦 [{match_status}] Задача '{name}' ({task_type}) [repository: {repo}]"
             )
-
             TASK_MATCH_INFO.labels(
                 task_id=str(tid),
                 task_name=str(name),

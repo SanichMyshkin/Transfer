@@ -9,8 +9,6 @@ from typing import Dict
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
-
-
 def get_external_policies(
     gitlab_url: str,
     gitlab_token: str,
