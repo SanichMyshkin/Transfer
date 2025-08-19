@@ -9,7 +9,7 @@ from metrics.certs import sync_cert
     [
         ("*.example.com", "https://repo.example.com", 1),
         ("repo.example.com", "https://repo.example.com", 1),
-        ("example.com", "https://fooexample.com", 1),  # ← раньше было 2
+        ("example.com", "https://fooexample.com", 1),
         ("example.com", "https://another.com", 0),
         ("", "https://repo.example.com", 0),
         ("example.com", "", 0),

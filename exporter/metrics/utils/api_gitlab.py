@@ -15,7 +15,6 @@ def get_external_policies(
     gitlab_branch: str,
     target_path: str = "nexus/cleaner",
 ) -> Dict[str, str]:  # Теперь возвращает только один словарь
-
     result = {}  # {'repo_name': 'gitlab_url'}
     files_processed = 0
     repos_found = 0
@@ -89,3 +88,14 @@ def get_external_policies(
     except Exception as e:
         logging.error(f"⛔ Критическая ошибка при работе с GitLab: {e}")
         raise
+
+
+#### ЗАГЛУШКИ
+def get_file_raw_ports() -> str:
+    """Заглушка: возвращает текст файла с docker run"""
+    return """"""
+
+
+def get_nginx() -> str:
+    """Заглушка: возвращает текст nginx конфигурации"""
+    return """"""
