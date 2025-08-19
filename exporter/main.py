@@ -14,6 +14,7 @@ from metrics.docker_tags import fetch_docker_tags_metrics
 from metrics.tasks import fetch_task_metrics, fetch_all_blob_and_repo_metrics
 from metrics.docker_ports import fetch_docker_ports_metrics
 from metrics.cleanup_policy import fetch_cleanup_policy_usage
+from metrics.certificates_expired import fetch_cert_lifetime_metrics
 
 
 def main():
@@ -57,6 +58,9 @@ def main():
 
         logging.info("Запуск сбора НЕ используемых политик...")
         fetch_cleanup_policy_usage(NEXUS_API_URL, auth)
+
+        logging.info("Запуск сбора сертификатов...")
+        fetch_cert_lifetime_metrics(NEXUS_API_URL, get_auth())
 
         time.sleep(LAUNCH_INTERVAL)
 
