@@ -2,8 +2,8 @@ FROM python:3.11-slim
 
 RUN apt-get update && apt-get install -y ca-certificates
 
-COPY ./certs /usr/local/share/ca-certificates/
-RUN update-ca-certificates
+#COPY ./certs /usr/local/share/ca-certificates/
+#RUN update-ca-certificates
 
 WORKDIR /app
 COPY requirements.txt .

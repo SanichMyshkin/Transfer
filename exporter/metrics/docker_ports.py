@@ -3,9 +3,12 @@ from prometheus_client import Gauge
 from typing import Dict, List, Optional, Set
 
 from common.logs import logging
-from common.config import NEXUS_API_URL
+from common.config import NEXUS_API_URL, GITLAB_TOKEN, GITLAB_URL
 from metrics.utils.api import get_from_nexus
-from metrics.utils.api_gitlab import get_file_raw_ports, get_nginx
+from metrics.utils.api_gitlab import get_gitlab_file_content, get_gitlab_connection
+
+
+gl = get_gitlab_connection(GITLAB_URL, GITLAB_TOKEN)
 
 
 def extract_ports(file_text: str) -> List[int]:
@@ -59,7 +62,14 @@ def get_docker_repositories(nexus_url: str, auth: tuple) -> List[dict]:
     except Exception as e:
         logging.error(f"Ошибка при обращении к API Nexus: {e}")
         return []
-    return [r for r in repositories if r.get("format") == "docker"] if repositories else []
+
+    return [
+        r
+        for r in repositories
+        if repositories
+        and r.get("format") == "docker"
+        and r.get("type") in ["proxy", "hosted"]
+    ]
 
 
 def fetch_docker_ports_metrics(docker_repos: List[dict]) -> None:
@@ -70,7 +80,12 @@ def fetch_docker_ports_metrics(docker_repos: List[dict]) -> None:
     logging.info(f"Получено {len(docker_repos)} docker-репозиториев из Nexus API.")
     docker_repo_port_gauge.clear()
 
-    nginx_conf = get_nginx()
+    nginx_conf = get_gitlab_file_content(
+        GITLAB_URL,
+        GITLAB_TOKEN,
+        gl,
+        file_path="servers/msk-osf01nexus/wdata/services/upstream.conf",
+    )
     port_to_endpoints = map_ports_to_endpoints(nginx_conf)
 
     for repo in docker_repos:
@@ -78,10 +93,9 @@ def fetch_docker_ports_metrics(docker_repos: List[dict]) -> None:
         repo_url = repo.get("url", "")
         repo_type = repo.get("type", "unknown").capitalize()
 
-        http_port: Optional[int] = (
-            repo.get("docker", {}).get("httpPort")
-            or repo.get("docker", {}).get("httpsPort")
-        )
+        http_port: Optional[int] = repo.get("docker", {}).get("httpPort") or repo.get(
+            "docker", {}
+        ).get("httpsPort")
         if not http_port and repo_url:
             match = re.search(r":(\d+)", repo_url)
             http_port = int(match.group(1)) if match else None
@@ -94,6 +108,15 @@ def fetch_docker_ports_metrics(docker_repos: List[dict]) -> None:
             f"Repo: {repo_name} | Port: {http_port or '—'} | Remote: {remote_url or '—'} | Endpoint: {endpoint}"
         )
 
+        if endpoint != "unknown":
+            clean_endpoints = [ep.replace('/v2', '') for ep in endpoints]
+            full_endpoints = [
+                f"{NEXUS_API_URL.rstrip('/')}/{ep.lstrip('/')}" for ep in clean_endpoints
+            ]
+            final_endpoint = ", ".join(sorted(set(full_endpoints)))
+        else:
+            final_endpoint = "unknown"
+
         set_gauge(
             docker_repo_port_gauge,
             labels=dict(
@@ -101,11 +124,7 @@ def fetch_docker_ports_metrics(docker_repos: List[dict]) -> None:
                 http_port=str(http_port) if http_port else "None",
                 remote_url=remote_url if remote_url else "None",
                 repo_type=repo_type,
-                endpoint=(
-                    f"{NEXUS_API_URL.rstrip('/')}/{endpoint.lstrip('/')}"
-                    if endpoint != "unknown"
-                    else "unknown"
-                ),
+                endpoint=final_endpoint,
             ),
             value=1,
         )
@@ -115,7 +134,12 @@ def fetch_docker_ports_metrics(docker_repos: List[dict]) -> None:
 
 def fetch_ports_status_metrics(docker_repos: List[dict]) -> None:
     try:
-        raw_ports = get_file_raw_ports()
+        raw_ports = get_gitlab_file_content(
+            GITLAB_URL,
+            GITLAB_TOKEN,
+            gl,
+            file_path="servers/msk-osf01nexus/wdata/services/nexus3_docker.sh",
+        )
     except Exception as e:
         logging.error(f"Ошибка при получении портов из GitLab: {e}")
         return
@@ -124,10 +148,9 @@ def fetch_ports_status_metrics(docker_repos: List[dict]) -> None:
     busy_ports: Set[int] = set()
 
     for repo in docker_repos:
-        http_port = (
-            repo.get("docker", {}).get("httpPort")
-            or repo.get("docker", {}).get("httpsPort")
-        )
+        http_port = repo.get("docker", {}).get("httpPort") or repo.get(
+            "docker", {}
+        ).get("httpsPort")
         if http_port:
             busy_ports.add(int(http_port))
 

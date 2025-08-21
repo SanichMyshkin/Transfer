@@ -26,6 +26,19 @@ def main():
     # Запускаем сбор метрик репозиториев сразу
     logging.info("Первичный запуск сбора статуса репозиториев типа Proxy...")
     fetch_repositories_metrics(NEXUS_API_URL, auth)
+
+    logging.info("Первичный запуск сбора Docker портов...")
+    fetch_docker_ports(NEXUS_API_URL, get_auth())
+
+    logging.info("Первичный запуск сбора НЕ используемых политик...")
+    fetch_cleanup_policy_usage(NEXUS_API_URL, auth)
+
+    logging.info("Первичный запуск сбора сертификатов...")
+    fetch_cert_lifetime_metrics(NEXUS_API_URL, auth)
+
+    logging.info("Первичный запуск сбора повисших задач...")
+    fetch_all_blob_and_repo_metrics(NEXUS_API_URL, auth)
+
     last_repo_metrics_time = time.time()
 
     while True:
@@ -36,6 +49,19 @@ def main():
                 "Периодический запуск сбора статуса репозиториев типа Proxy..."
             )
             fetch_repositories_metrics(NEXUS_API_URL, auth)
+
+            logging.info("Периодический запуск сбора Docker портов...")
+            fetch_docker_ports(NEXUS_API_URL, get_auth())
+
+            logging.info("Периодический запуск сбора НЕ используемых политик...")
+            fetch_cleanup_policy_usage(NEXUS_API_URL, auth)
+
+            logging.info("Периодический запуск сбора сертификатов...")
+            fetch_cert_lifetime_metrics(NEXUS_API_URL, auth)
+
+            logging.info("Периодический запуск сбора повисших задач...")
+            fetch_all_blob_and_repo_metrics(NEXUS_API_URL, auth)
+
             last_repo_metrics_time = current_time
 
         logging.info("Запуск сбора размера блобов...")
@@ -52,15 +78,6 @@ def main():
 
         logging.info("Запуск сбора Docker тегов...")
         fetch_docker_tags_metrics()
-
-        logging.info("Запуск сбора Docker портов и статусов...")
-        fetch_docker_ports(NEXUS_API_URL, get_auth())
-
-        logging.info("Запуск сбора НЕ используемых политик...")
-        fetch_cleanup_policy_usage(NEXUS_API_URL, auth)
-
-        logging.info("Запуск сбора сертификатов...")
-        fetch_cert_lifetime_metrics(NEXUS_API_URL, auth)
 
         time.sleep(LAUNCH_INTERVAL)
 
