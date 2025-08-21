@@ -82,39 +82,52 @@ def scan_project_for_policies(
     return result
 
 
+# def get_external_policies(
+#     gitlab_url: str,
+#     gitlab_token: str,
+#     gitlab_branch: str,
+#     target_path: str = "nexus/cleaner",
+# ) -> Dict[str, str]:
+#     """Основная функция для получения внешних политик (сохранен оригинальный интерфейс)"""
+#     logging.info(f"🔗 Подключение к GitLab: {gitlab_url}")
+
+#     final_result = {}
+#     total_files = 0
+#     total_repos = 0
+
+#     try:
+#         gl = get_gitlab_connection(gitlab_url, gitlab_token)
+#         logging.info("🔍 Начинаем сканирование проектов...")
+
+#         for project in gl.projects.list(all=True, iterator=True):
+#             project_result = scan_project_for_policies(
+#                 project, gitlab_branch, target_path, gitlab_url
+#             )
+#             total_files += len(project_result)
+#             total_repos += sum(1 for repo in project_result if repo not in final_result)
+#             final_result.update(project_result)
+
+#         logging.info(
+#             f"✅ Завершено. Обработано файлов: {total_files}, уникальных репозиториев: {len(final_result)}"
+#         )
+#         return final_result
+
+#     except Exception as e:
+#         logging.error(f"⛔ Критическая ошибка: {str(e)}")
+#         raise
+
+
 def get_external_policies(
     gitlab_url: str,
     gitlab_token: str,
     gitlab_branch: str,
     target_path: str = "nexus/cleaner",
 ) -> Dict[str, str]:
-    """Основная функция для получения внешних политик (сохранен оригинальный интерфейс)"""
-    logging.info(f"🔗 Подключение к GitLab: {gitlab_url}")
-
-    final_result = {}
-    total_files = 0
-    total_repos = 0
-
-    try:
-        gl = get_gitlab_connection(gitlab_url, gitlab_token)
-        logging.info("🔍 Начинаем сканирование проектов...")
-
-        for project in gl.projects.list(all=True, iterator=True):
-            project_result = scan_project_for_policies(
-                project, gitlab_branch, target_path, gitlab_url
-            )
-            total_files += len(project_result)
-            total_repos += sum(1 for repo in project_result if repo not in final_result)
-            final_result.update(project_result)
-
-        logging.info(
-            f"✅ Завершено. Обработано файлов: {total_files}, уникальных репозиториев: {len(final_result)}"
-        )
-        return final_result
-
-    except Exception as e:
-        logging.error(f"⛔ Критическая ошибка: {str(e)}")
-        raise
+    return {
+        "dckr": "https://gitlab.example.com/team/configs/-/blob/master/nexus/cleaner/policy1.yaml",
+        "docker": "https://gitlab.example.com/team/configs/-/blob/master/nexus/cleaner/policy2.yaml",
+        "nexus-repo-3": "https://gitlab.example.com/devops/cleanup/-/blob/master/nexus/cleaner/policy3.yml",
+    }
 
 
 def get_gitlab_file_content(

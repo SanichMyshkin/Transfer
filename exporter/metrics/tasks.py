@@ -2,7 +2,9 @@ from common.logs import logging
 from typing import Optional
 from prometheus_client import Gauge
 from metrics.utils.api import get_from_nexus
-from database.utils.jobs_reader import get_jobs_data  # твоя функция
+from database.utils.jobs_reader import get_jobs_data
+from metrics.utils.api_gitlab import get_external_policies
+from common.config import GITLAB_TOKEN, GITLAB_URL, GITLAB_BRANCH
 
 
 # --- Метрики ---
@@ -25,6 +27,12 @@ TASK_MATCH_INFO = Gauge(
     "nexus_task_match_info",
     "Filtered tasks with matching blobstore or repository",
     ["task_id", "task_name", "type", "typeName", "match_type", "match_value"],
+)
+
+CUSTOM_POLICY_STATUS = Gauge(
+    "nexus_custom_policy_expired",
+    "Status of custom cleanup policies vs Nexus repositories (1 = ok, 0 = expired)",
+    ["repo", "policy_url"],
 )
 
 
@@ -149,6 +157,41 @@ def export_blob_repo_metrics(tasks: list, blobs: list, repos: list) -> None:
 
     logging.info(
         f"✅ Экспорт blob/repo метрик завершён. Обработано задач: {len(tasks)}"
+    )
+
+
+def fetch_custom_policy_metrics(NEXUS_API_URL, auth) -> None:
+    """Сравнивает кастомные политики с Nexus repositories и экспортирует метрику."""
+    logging.info(
+        "📥 Загружаем список repositories из Nexus для проверки кастомных политик..."
+    )
+
+    repos_data = fetch_all_from_nexus(NEXUS_API_URL, "repositories", auth)
+    repos = {
+        r.get("name", "").lower()
+        for r in repos_data
+        if isinstance(r, dict) and "name" in r
+    }
+
+    policies = get_external_policies(GITLAB_URL, GITLAB_TOKEN, GITLAB_BRANCH)
+    CUSTOM_POLICY_STATUS.clear()
+
+    for repo_name, policy_url in policies.items():
+        repo_clean = repo_name.lower()
+        exists = 1 if repo_clean in repos else 0
+
+        CUSTOM_POLICY_STATUS.labels(
+            repo=repo_name,
+            policy_url=policy_url,
+        ).set(exists)
+
+        status_icon = "✅" if exists else "❌"
+        logging.info(
+            f"📊 [{status_icon}] Repo '{repo_name}' -> {policy_url} (exists={exists})"
+        )
+
+    logging.info(
+        f"✅ Экспорт метрик кастомных политик завершён. Проверено: {len(policies)}"
     )
 
 
