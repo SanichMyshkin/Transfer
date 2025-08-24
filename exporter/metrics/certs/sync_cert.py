@@ -1,9 +1,73 @@
+# sync_ssl.py
 import requests
+import urllib3
 from urllib.parse import urlparse
-from common.logs import logging
-from metrics.utils.api import get_from_nexus
+from requests.exceptions import SSLError, RequestException, ConnectionError
+
+# ==============================
+# ЛОГИРОВАНИЕ
+# ==============================
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+
+# ==============================
+# HTTP-СЕССИЯ
+# ==============================
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120 Safari/537.36"
+    )
+}
+
+session = requests.Session()
+adapter = requests.adapters.HTTPAdapter(max_retries=0)
+session.mount("https://", adapter)
+session.mount("http://", adapter)
 
 
+# ==============================
+# УТИЛИТЫ ДЛЯ API
+# ==============================
+def safe_get_json(url: str, auth: tuple, timeout: int = 20):
+    try:
+        response = session.get(
+            url, auth=auth, headers=HEADERS, timeout=timeout, verify=True
+        )
+        response.raise_for_status()
+        return response.json()
+    except SSLError as ssl_err:
+        logging.warning(f"⚠️ SSL ошибка при запросе к {url}: {ssl_err}")
+        try:
+            response = session.get(
+                url, auth=auth, headers=HEADERS, timeout=timeout, verify=False
+            )
+            logging.warning(f"⚠️ Использован verify=False для {url}")
+            response.raise_for_status()
+            return response.json()
+        except RequestException as e:
+            logging.error(f"❌ Ошибка запроса без verify: {e}")
+            return []
+    except (ConnectionError, RequestException) as e:
+        logging.error(f"❌ Ошибка подключения к {url}: {e}")
+        return []
+
+
+def get_from_nexus(nexus_url: str, endpoint: str, auth: tuple, timeout: int = 20):
+    full_url = f"{nexus_url.rstrip('/')}/service/rest/v1/{endpoint.lstrip('/')}"
+    return safe_get_json(full_url, auth, timeout)
+
+
+# ==============================
+# СИНХРОНИЗАЦИЯ SSL
+# ==============================
 def match_level(cert_cn: str, remote_url: str) -> int:
     if not cert_cn or not remote_url:
         return 0
@@ -17,23 +81,29 @@ def match_level(cert_cn: str, remote_url: str) -> int:
 
 
 def fetch_remote_certs(nexus_url: str, remote_url: str, auth: tuple, repo: str):
-    """Получаем сертификаты с помощью Nexus API."""
+    """Получаем сертификаты с помощью Nexus API (только для HTTPS)."""
     parsed = urlparse(remote_url)
     host = parsed.hostname
     if not host:
         logging.warning(f"⚠️ Repo='{repo}': не удалось извлечь host из {remote_url}")
         return []
 
-    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    if parsed.scheme != "https":
+        logging.info(
+            f"⏭️ Repo='{repo}': {remote_url} не использует HTTPS, сертификаты не нужны"
+        )
+        return []
 
+    port = parsed.port or 443
     endpoint = f"security/ssl?host={host}&port={port}"
+
     try:
         certs = get_from_nexus(nexus_url, endpoint, auth)
     except Exception as e:
         logging.error(
             f"❌ Repo='{repo}': ошибка при запросе host/port для {remote_url}: {e}, fallback…"
         )
-        base_url = f"{parsed.scheme}://{host}"
+        base_url = f"https://{host}"
         endpoint = f"security/ssl?url={base_url}"
         try:
             certs = get_from_nexus(nexus_url, endpoint, auth)
@@ -55,7 +125,6 @@ def add_cert_to_truststore(
 ):
     """Добавляем сертификат в truststore Nexus, пробуя оба варианта API."""
     try:
-        # Пробуем JSON с ключом certificate
         resp = requests.post(
             f"{nexus_url}/service/rest/v1/security/ssl/truststore",
             auth=auth,
@@ -86,7 +155,9 @@ def add_cert_to_truststore(
         return False
 
 
-def remove_duplicate_certs(nexus_url: str, auth: tuple, cleanup_duplicates: bool = True):
+def remove_duplicate_certs(
+    nexus_url: str, auth: tuple, cleanup_duplicates: bool = True
+):
     """Удаляет дубликаты сертификатов из truststore (по fingerprint), если cleanup_duplicates=True."""
     try:
         truststore = get_from_nexus(nexus_url, "security/ssl/truststore", auth) or []
@@ -106,7 +177,6 @@ def remove_duplicate_certs(nexus_url: str, auth: tuple, cleanup_duplicates: bool
             continue
 
         if fp in seen:
-            # дубликат → удаляем
             try:
                 resp = requests.delete(
                     f"{nexus_url}/service/rest/v1/security/ssl/truststore/{cid}",
@@ -124,7 +194,7 @@ def remove_duplicate_certs(nexus_url: str, auth: tuple, cleanup_duplicates: bool
 
 
 def sync_remote_certs(nexus_url: str, auth: tuple, cleanup_duplicates: bool = True):
-    """Подтягиваем и добавляем сертификаты для всех proxy-репозиториев."""
+    """Подтягиваем и добавляем сертификаты для всех proxy-репозиториев (только https)."""
     try:
         truststore = get_from_nexus(nexus_url, "security/ssl/truststore", auth) or []
         repos = get_from_nexus(nexus_url, "repositories", auth) or []
@@ -142,14 +212,16 @@ def sync_remote_certs(nexus_url: str, auth: tuple, cleanup_duplicates: bool = Tr
         }
         for r in repos
         if r.get("type") == "proxy"
-        and r.get("attributes", {}).get("proxy", {}).get("remoteUrl")
+        and r.get("attributes", {})
+        .get("proxy", {})
+        .get("remoteUrl", "")
+        .startswith("https://")
     ]
 
     for repo in repos:
         remote = repo["remote"]
         name = repo["name"]
 
-        # проверяем уже существующие сертификаты
         best_level = 0
         best_cert_cn = None
         for cert in truststore:
@@ -159,7 +231,6 @@ def sync_remote_certs(nexus_url: str, auth: tuple, cleanup_duplicates: bool = Tr
                 best_level = level
                 best_cert_cn = cn
 
-        # всегда подтягиваем свежие сертификаты у remote
         remote_certs = fetch_remote_certs(nexus_url, remote, auth, name)
         if not remote_certs:
             logging.warning(
@@ -173,7 +244,6 @@ def sync_remote_certs(nexus_url: str, auth: tuple, cleanup_duplicates: bool = Tr
             if not remote_cn or not pem:
                 continue
 
-            # если в truststore такого CN ещё нет — добавляем
             if all(c.get("subjectCommonName") != remote_cn for c in truststore):
                 logging.info(
                     f"➕ Repo='{name}': добавляем новый сертификат CN='{remote_cn}' для {remote}"
@@ -182,14 +252,12 @@ def sync_remote_certs(nexus_url: str, auth: tuple, cleanup_duplicates: bool = Tr
                     nexus_url, auth, pem, remote_cn, remote, name
                 ):
                     truststore.append(rc)
-                    # после добавления чистим дубликаты (если включено)
                     remove_duplicate_certs(nexus_url, auth, cleanup_duplicates)
             else:
                 logging.info(
                     f"✅ Repo='{name}': сертификат CN='{remote_cn}' уже есть для {remote}"
                 )
 
-            # обновляем уровень совпадения
             level = match_level(remote_cn, remote)
             if level > best_level:
                 best_level = level
@@ -201,3 +269,17 @@ def sync_remote_certs(nexus_url: str, auth: tuple, cleanup_duplicates: bool = Tr
             )
         else:
             logging.info(f"⚠️ Repo='{name}': нет совпадений для URL='{remote}'")
+
+
+# ==============================
+# Точка входа
+# ==============================
+if __name__ == "__main__":
+    import os
+
+    NEXUS_URL = os.getenv("NEXUS_URL", "https://nexus.sanich.tech:8443")
+    NEXUS_USER = os.getenv("NEXUS_USER", "admin")
+    NEXUS_PASS = os.getenv("NEXUS_PASS", "admin123")
+
+    logging.info("🚀 Запуск синхронизации SSL сертификатов…")
+    sync_remote_certs(NEXUS_URL, (NEXUS_USER, NEXUS_PASS), cleanup_duplicates=False)
