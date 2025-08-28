@@ -91,14 +91,38 @@ def safe_get_raw(url: str, auth: tuple = None, timeout: int = 20):
         return None, e
 
 
-# # Узкоспециализированные обёртки (для читаемости)
-# def get_certificates(nexus_url: str, auth: tuple) -> list:
-#     return get_from_nexus(nexus_url, "security/ssl/truststore", auth)
+def post_to_nexus(
+    nexus_url: str, endpoint: str, auth: tuple, data=None, json=None, timeout: int = 20
+) -> bool:
+    """
+    Универсальная функция для POST-запросов в Nexus API.
+    Возвращает True при успешном ответе (2xx), иначе False.
+    """
+    url = f"{nexus_url.rstrip('/')}/service/rest/v1/{endpoint.lstrip('/')}"
+    try:
+        resp = session.post(
+            url,
+            auth=auth,
+            headers=HEADERS,
+            data=data,
+            json=json,
+            timeout=timeout,
+            verify=True,
+        )
+        if 200 <= resp.status_code < 300:
+            logging.info(f"✅ POST {url} → {resp.status_code}")
+            return True
+        else:
+            logging.error(f"❌ Ошибка POST {url}: {resp.status_code} {resp.text}")
+            return False
+    except RequestException as e:
+        logging.error(f"❌ Ошибка POST {url}: {e}")
+        return False
 
 
-# def get_repositories(nexus_url: str, auth: tuple) -> list:
-#     return get_from_nexus(nexus_url, "repositories", auth)
-
-
-# def get_tasks(nexus_url: str, auth: tuple) -> dict | list | None:
-#     return get_from_nexus(nexus_url, "tasks", auth)
+# === Узкоспециализированные обёртки (для читаемости, можно юзать post_to_nexus напрямую) ===
+# def run_task_request(nexus_url: str, task_id: str, auth: tuple) -> bool:
+#     return post_to_nexus(nexus_url, f"tasks/{task_id}/run", auth)
+#
+# def pause_task_request(nexus_url: str, task_id: str, auth: tuple) -> bool:
+#     return post_to_nexus(nexus_url, f"tasks/{task_id}/pause", auth)
