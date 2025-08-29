@@ -3,27 +3,42 @@
 # === Конфигурация ===
 GROUP_ID="com.example"
 ARTIFACT_ID="demo-lib"
-VERSIONS=("1.0" "2.0")
+VERSIONS=("2.1" "2.2")
 OUTPUT_DIR="./artifacts"
 
-# === Java-код ===
-JAVA_CODE='public class HelloWorld {
+JAVA_CODE='package com.example;
+
+public class HelloWorld {
     public static void main(String[] args) {
-        System.out.println("Hello from demo-lib!");
+        System.out.println("Hello from demo-lib version: " + HelloWorld.class.getPackage().getImplementationVersion());
+    }
+    
+    public static String getVersion() {
+        return HelloWorld.class.getPackage().getImplementationVersion();
     }
 }'
 
-mkdir -p ${OUTPUT_DIR}
+# Очистка и создание директории
+rm -rf "${OUTPUT_DIR}"
+mkdir -p "${OUTPUT_DIR}"
 
 for VERSION in "${VERSIONS[@]}"; do
-  BUILD_DIR="./build-${VERSION}"
-  mkdir -p "${BUILD_DIR}/src/main/java/com/example"
+  for TYPE in "release" "snapshot"; do
+    if [ "$TYPE" = "snapshot" ]; then
+      VERSION_FULL="${VERSION}-SNAPSHOT"
+    else
+      VERSION_FULL="${VERSION}"
+    fi
 
-  # 1. Создаём Java файл
-  echo "$JAVA_CODE" > "${BUILD_DIR}/src/main/java/com/example/HelloWorld.java"
+    BUILD_DIR="./build-${VERSION_FULL}"
+    rm -rf "${BUILD_DIR}"
+    mkdir -p "${BUILD_DIR}/src/main/java/com/example"
 
-  # 2. Создаём POM
-  cat > "${BUILD_DIR}/pom.xml" <<EOF
+    # Java файл
+    echo "$JAVA_CODE" > "${BUILD_DIR}/src/main/java/com/example/HelloWorld.java"
+
+    # POM файл
+    cat > "${BUILD_DIR}/pom.xml" <<EOF
 <project xmlns="http://maven.apache.org/POM/4.0.0"
          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 
@@ -31,22 +46,61 @@ for VERSION in "${VERSIONS[@]}"; do
   <modelVersion>4.0.0</modelVersion>
   <groupId>${GROUP_ID}</groupId>
   <artifactId>${ARTIFACT_ID}</artifactId>
-  <version>${VERSION}</version>
+  <version>${VERSION_FULL}</version>
+  <packaging>jar</packaging>
+  
+  <properties>
+    <maven.compiler.source>8</maven.compiler.source>
+    <maven.compiler.target>8</maven.compiler.target>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+  </properties>
+  
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-jar-plugin</artifactId>
+        <version>3.3.0</version>
+        <configuration>
+          <archive>
+            <manifest>
+              <addDefaultImplementationEntries>true</addDefaultImplementationEntries>
+            </manifest>
+          </archive>
+        </configuration>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.11.0</version>
+        <configuration>
+          <source>8</source>
+          <target>8</target>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
 </project>
 EOF
 
-  # 3. Собираем JAR
-  (
-    cd "$BUILD_DIR"
-    mvn clean package
-  )
+    # Сборка
+    echo "🔨 Собираем: ${ARTIFACT_ID}-${VERSION_FULL}"
+    (
+      cd "$BUILD_DIR"
+      mvn clean package -q
+    )
 
-  # 4. Копируем JAR и POM в artifacts/
-  cp "${BUILD_DIR}/target/${ARTIFACT_ID}-${VERSION}.jar" "${OUTPUT_DIR}/"
-  cp "${BUILD_DIR}/pom.xml" "${OUTPUT_DIR}/${ARTIFACT_ID}-${VERSION}.pom"
+    # Копируем артефакты
+    cp "${BUILD_DIR}/target/${ARTIFACT_ID}-${VERSION_FULL}.jar" "${OUTPUT_DIR}/" 2>/dev/null || echo "⚠️  JAR не найден для ${VERSION_FULL}"
+    cp "${BUILD_DIR}/pom.xml" "${OUTPUT_DIR}/${ARTIFACT_ID}-${VERSION_FULL}.pom"
 
-  # 5. Удаляем build
-  rm -rf "$BUILD_DIR"
+    # Очистка
+    rm -rf "$BUILD_DIR"
+    echo "✅ Собрано: ${ARTIFACT_ID}-${VERSION_FULL}"
+  done
 done
 
-echo "✅ Артефакты созданы в папке: $OUTPUT_DIR"
+echo ""
+echo "📦 Все артефакты созданы в: $OUTPUT_DIR"
+echo "Сгенерированные файлы:"
+ls -la "$OUTPUT_DIR"/

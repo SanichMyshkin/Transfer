@@ -107,7 +107,9 @@ def convert_raw_assets_to_components(assets):
     return components
 
 
-def delete_component(component_id, component_name, component_version, dry_run, use_asset=False):
+def delete_component(
+    component_id, component_name, component_version, dry_run, use_asset=False
+):
     if dry_run:
         logging.info(
             f"[DELETE] 🧪 [DRY_RUN] Пропущено удаление: {component_name}:{component_version} (ID: {component_id})"
@@ -135,7 +137,13 @@ def delete_component(component_id, component_name, component_version, dry_run, u
         logging.error(f"[DELETE] ❌ Ошибка при удалении {component_id}: {e}")
 
 
-def get_matching_rule(version, regex_rules, no_match_retention, no_match_reserved, no_match_min_days_since_last_download):
+def get_matching_rule(
+    version,
+    regex_rules,
+    no_match_retention,
+    no_match_reserved,
+    no_match_min_days_since_last_download,
+):
     version_lower = version.lower()
     matched_rules = []
 
@@ -149,11 +157,20 @@ def get_matching_rule(version, regex_rules, no_match_retention, no_match_reserve
         retention_days = rules.get("retention_days")
         reserved = rules.get("reserved")
         min_days_since_last_download = rules.get("min_days_since_last_download")
-        retention = timedelta(days=retention_days) if retention_days is not None else None
+        retention = (
+            timedelta(days=retention_days) if retention_days is not None else None
+        )
         return pattern, retention, reserved, min_days_since_last_download
 
-    retention = timedelta(days=no_match_retention) if no_match_retention is not None else None
-    return "no-match", retention, no_match_reserved, no_match_min_days_since_last_download
+    retention = (
+        timedelta(days=no_match_retention) if no_match_retention is not None else None
+    )
+    return (
+        "no-match",
+        retention,
+        no_match_reserved,
+        no_match_min_days_since_last_download,
+    )
 
 
 def filter_components_to_delete(
@@ -161,7 +178,7 @@ def filter_components_to_delete(
     regex_rules,
     no_match_retention,
     no_match_reserved,
-    no_match_min_days_since_last_download
+    no_match_min_days_since_last_download,
 ):
     now_utc = datetime.now(timezone.utc)
     grouped = defaultdict(list)
@@ -171,14 +188,18 @@ def filter_components_to_delete(
         name = component.get("name", "")
         assets = component.get("assets", [])
         if not assets or not version or not name:
-            logging.info(f" ⏭ Пропуск: отсутствует имя, версия или assets у компонента {component}")
+            logging.info(
+                f" ⏭ Пропуск: отсутствует имя, версия или assets у компонента {component}"
+            )
             continue
 
         last_modified_strs = [a.get("lastModified") for a in assets if a.get("lastModified")]
         last_download_strs = [a.get("lastDownloaded") for a in assets if a.get("lastDownloaded")]
 
         if not last_modified_strs:
-            logging.info(f" ⏭ Пропуск: отсутствует lastModified у компонента {name}:{version}")
+            logging.info(
+                f" ⏭ Пропуск: отсутствует lastModified у компонента {name}:{version}"
+            )
             continue
 
         try:
@@ -207,14 +228,16 @@ def filter_components_to_delete(
             no_match_min_days_since_last_download,
         )
 
-        component.update({
-            "last_modified": last_modified,
-            "last_download": last_download,
-            "retention": retention,
-            "reserved": reserved,
-            "pattern": pattern,
-            "min_days_since_last_download": min_days_since_last_download,
-        })
+        component.update(
+            {
+                "last_modified": last_modified,
+                "last_download": last_download,
+                "retention": retention,
+                "reserved": reserved,
+                "pattern": pattern,
+                "min_days_since_last_download": min_days_since_last_download,
+            }
+        )
 
         grouped[(name, pattern)].append(component)
 
@@ -232,37 +255,190 @@ def filter_components_to_delete(
             reserved = component.get("reserved")
             min_days_since_last_download = component.get("min_days_since_last_download")
 
-            # Обработка зарезервированных компонентов
+            # Зарезервированные
             if reserved is not None and i < reserved:
-                logging.info(f" 📦 Зарезервирован: {full_path} | правило ({pattern}) (позиция {i + 1}/{reserved})")
-                continue
-
-            # Проверка условий сохранения
-            passed_retention = retention is not None and age.days <= retention.days
-            passed_recent_download = (
-                last_download is not None and
-                min_days_since_last_download is not None and
-                (now_utc - last_download).days <= min_days_since_last_download
-            )
-
-            if passed_retention or passed_recent_download:
                 logging.info(
-                    f" 📦 Сохранён: {full_path} | правило ({pattern}) "
-                    f"(retention: {age.days} дн. ≤ {retention.days if retention else '–'}, "
-                    f"скачивали {((now_utc - last_download).days if last_download else '–')} дн. назад)"
+                    f" 📦 Зарезервирован: {full_path} | правило ({pattern}) (позиция {i + 1}/{reserved})"
                 )
                 continue
+
+            # Проверка retention
+            if retention is not None and age.days <= retention.days:
+                logging.info(
+                    f" 📦 Сохранён: {full_path} | правило ({pattern}) (retention: {age.days} дн. ≤ {retention.days})"
+                )
+                continue
+
+            # Проверка скачиваний
+            if last_download is not None and min_days_since_last_download is not None:
+                days_since_download = (now_utc - last_download).days
+                if days_since_download <= min_days_since_last_download:
+                    logging.info(
+                        f" 📦 Сохранён: {full_path} | правило ({pattern}) (скачивали {days_since_download} дн. назад ≤ {min_days_since_last_download})"
+                    )
+                    continue
+
+            # Если не прошли проверки → удаляем
+            reason = []
+            if retention is not None:
+                reason.append(f"retention: {age.days} дн. > {retention.days}")
+            if last_download:
+                reason.append(f"скачивали {(now_utc - last_download).days} дн. назад")
             else:
-                logging.info(
-                    f" 🗑 Удаление: {full_path} | правило ({pattern}) "
-                    f"(retention: {age.days} дн. > {retention.days if retention else '–'}, "
-                    f"скачивали {(now_utc - last_download).days if last_download else 'никогда'})"
-                )
-                to_delete.append(component)
+                reason.append("скачивали никогда")
+            reason_text = ", ".join(reason)
+
+            logging.info(
+                f" 🗑 Удаление: {full_path} | правило ({pattern}) ({reason_text})"
+            )
+            to_delete.append(component)
 
     logging.info(f" 🧹 Обнаружено к удалению: {len(to_delete)} компонент(ов)")
     return to_delete
 
+
+
+# ---------------------- MAVEN ----------------------
+
+def detect_maven_type(component):
+    """
+    Определяет тип Maven-компонента (snapshot или release).
+    """
+    version = component.get("version", "").lower()
+
+    # 1. Если явно содержит "snapshot" → snapshot
+    if "snapshot" in version:
+        return "snapshot"
+
+    # 2. Timestamped snapshots (пример: 1.0-20250829.123456-1)
+    timestamped_snapshot = re.match(r".*-\d{8}\.\d{6}-\d+", version)
+    if timestamped_snapshot:
+        return "snapshot"
+
+    # 3. Всё остальное → release
+    return "release"
+
+
+
+def filter_maven_components_to_delete(components, maven_rules):
+    now_utc = datetime.now(timezone.utc)
+    grouped = defaultdict(list)
+
+    for component in components:
+        name = component.get("group", "") + ":" + component.get("name", "")
+        version = component.get("version", "")
+        assets = component.get("assets", [])
+
+        if not assets or not version or not name:
+            logging.info(f" ⏭ Пропуск Maven-компонента без имени/версии: {component}")
+            continue
+
+        last_modified_strs = [a.get("lastModified") for a in assets if a.get("lastModified")]
+        last_download_strs = [a.get("lastDownloaded") for a in assets if a.get("lastDownloaded")]
+
+        if not last_modified_strs:
+            logging.info(f" ⏭ Пропуск: нет lastModified у {name}:{version}")
+            continue
+
+        try:
+            last_modified = max(parse(s) for s in last_modified_strs)
+        except Exception:
+            logging.info(f" ⏭ Ошибка парсинга lastModified у {name}:{version}")
+            continue
+
+        last_download = None
+        if last_download_strs:
+            try:
+                last_download = max(parse(s) for s in last_download_strs)
+            except Exception:
+                logging.info(f" ⚠ Ошибка парсинга lastDownloaded у {name}:{version}")
+                pass
+
+        maven_type = detect_maven_type(component)
+
+        rules_cfg = maven_rules.get(maven_type, {}).get("regex_rules", {})
+        no_match_retention = maven_rules.get(maven_type, {}).get("no_match_retention_days")
+        no_match_reserved = maven_rules.get(maven_type, {}).get("no_match_reserved")
+        no_match_min_days_since_last_download = maven_rules.get(maven_type, {}).get(
+            "no_match_min_days_since_last_download"
+        )
+
+        pattern, retention, reserved, min_days_since_last_download = get_matching_rule(
+            version,
+            rules_cfg,
+            no_match_retention,
+            no_match_reserved,
+            no_match_min_days_since_last_download,
+        )
+
+        component.update(
+            {
+                "last_modified": last_modified,
+                "last_download": last_download,
+                "retention": retention,
+                "reserved": reserved,
+                "pattern": pattern,
+                "maven_type": maven_type,
+                "min_days_since_last_download": min_days_since_last_download,
+            }
+        )
+
+        grouped[(name, pattern, maven_type)].append(component)
+
+    to_delete = []
+
+    for (name, pattern, maven_type), group in grouped.items():
+        sorted_group = sorted(group, key=lambda x: x["last_modified"], reverse=True)
+
+        for i, component in enumerate(sorted_group):
+            version = component.get("version", "Без версии")
+            full_name = f"{name}:{version}"
+            age = now_utc - component["last_modified"]
+            last_download = component.get("last_download")
+            retention = component.get("retention")
+            reserved = component.get("reserved")
+            min_days_since_last_download = component.get("min_days_since_last_download")
+
+            if reserved is not None and i < reserved:
+                logging.info(
+                    f" 📦 Зарезервирован (Maven {maven_type}): {full_name} | правило ({pattern}) (позиция {i + 1}/{reserved})"
+                )
+                continue
+
+            if retention is not None and age.days <= retention.days:
+                logging.info(
+                    f" 📦 Сохранён (Maven {maven_type}): {full_name} | правило ({pattern}) (retention: {age.days} дн. ≤ {retention.days})"
+                )
+                continue
+
+            if last_download is not None and min_days_since_last_download is not None:
+                days_since_download = (now_utc - last_download).days
+                if days_since_download <= min_days_since_last_download:
+                    logging.info(
+                        f" 📦 Сохранён (Maven {maven_type}): {full_name} | правило ({pattern}) (скачивали {days_since_download} дн. назад ≤ {min_days_since_last_download})"
+                    )
+                    continue
+
+            reason = []
+            if retention is not None:
+                reason.append(f"retention: {age.days} дн. > {retention.days}")
+            if last_download:
+                reason.append(f"скачивали {(now_utc - last_download).days} дн. назад")
+            else:
+                reason.append("скачивали никогда")
+            reason_text = ", ".join(reason)
+
+            logging.info(
+                f" 🗑 Удаление (Maven {maven_type}): {full_name} | правило ({pattern}) ({reason_text})"
+            )
+            to_delete.append(component)
+
+    logging.info(f" 🧹 Обнаружено к удалению (Maven): {len(to_delete)} компонент(ов)")
+    return to_delete
+
+
+
+# ---------------------- MAIN ----------------------
 
 def clear_repository(repo_name, cfg):
     logging.info(f"\n🔄 Начало очистки репозитория: {repo_name}")
@@ -272,8 +448,10 @@ def clear_repository(repo_name, cfg):
         logging.warning(f"⚠️ Пропущен репозиторий '{repo_name}' — неизвестный формат")
         return
 
-    if repo_format not in ["raw", "docker"]:
-        logging.warning(f"⚠️ Репозиторий '{repo_name}' имеет неподдерживаемый формат '{repo_format}' и будет пропущен")
+    if repo_format not in ["raw", "docker", "maven2"]:
+        logging.warning(
+            f"⚠️ Репозиторий '{repo_name}' имеет неподдерживаемый формат '{repo_format}' и будет пропущен"
+        )
         return
 
     items = get_repository_items(repo_name, repo_format)
@@ -283,16 +461,31 @@ def clear_repository(repo_name, cfg):
 
     if repo_format == "raw":
         components = convert_raw_assets_to_components(items)
-    else:
+        to_delete = filter_components_to_delete(
+            components,
+            regex_rules=cfg.get("regex_rules", {}),
+            no_match_retention=cfg.get("no_match_retention_days"),
+            no_match_reserved=cfg.get("no_match_reserved", None),
+            no_match_min_days_since_last_download=cfg.get(
+                "no_match_min_days_since_last_download", None
+            ),
+        )
+    elif repo_format == "maven2":
         components = items
-
-    to_delete = filter_components_to_delete(
-        components,
-        regex_rules=cfg.get("regex_rules", {}),
-        no_match_retention=cfg.get("no_match_retention_days"),
-        no_match_reserved=cfg.get("no_match_reserved", None),
-        no_match_min_days_since_last_download=cfg.get("no_match_min_days_since_last_download", None),
-    )
+        to_delete = filter_maven_components_to_delete(
+            components, cfg.get("maven_rules", {})
+        )
+    else:  # docker
+        components = items
+        to_delete = filter_components_to_delete(
+            components,
+            regex_rules=cfg.get("regex_rules", {}),
+            no_match_retention=cfg.get("no_match_retention_days"),
+            no_match_reserved=cfg.get("no_match_reserved", None),
+            no_match_min_days_since_last_download=cfg.get(
+                "no_match_min_days_since_last_download", None
+            ),
+        )
 
     if not to_delete:
         logging.info(f"✅ Нет компонентов для удаления в '{repo_name}'")

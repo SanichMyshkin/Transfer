@@ -17,7 +17,7 @@ NEXUS_URL = os.getenv("NEXUS_URL")
 NEXUS_USER = os.getenv("NEXUS_USER")
 NEXUS_PASS = os.getenv("NEXUS_PASS")
 
-NODE_INSTANCE = os.getenv("NODE_INSTANCE")
+NODE_INSTANCE = os.getenv("NODE_INSTANCE", None)
 NODE_MOUNTPOINT = os.getenv("NODE_MOUNTPOINT", "/")
 DISK_USAGE_THRESHOLD = float(os.getenv("DISK_USAGE_THRESHOLD", "80.0"))
 
