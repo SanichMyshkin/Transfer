@@ -1,10 +1,10 @@
 from unittest.mock import patch
 from datetime import datetime, timezone
-from cleaner import filter_components_to_delete
+from repository import filter_components_to_delete   # заменили cleaner на repository
 from .test_conf import make_component
 
 
-@patch("cleaner.datetime")
+@patch("repository.datetime")   # указываем новый путь
 def test_strict_min_days_since_last_download(mock_datetime):
     fixed_now = datetime(2025, 1, 1, tzinfo=timezone.utc)
     mock_datetime.now.return_value = fixed_now

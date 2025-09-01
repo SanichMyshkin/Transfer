@@ -1,4 +1,4 @@
-from cleaner import filter_components_to_delete, convert_raw_assets_to_components
+from repository import filter_components_to_delete, convert_raw_assets_to_components
 
 
 def test_raw_folder_grouping_reserved():

@@ -1,5 +1,5 @@
 from datetime import datetime, timedelta, timezone
-from cleaner import filter_maven_components_to_delete
+from maven import filter_maven_components_to_delete
 
 
 def make_component(group, artifact, version, last_modified, last_download=None):
