@@ -276,7 +276,7 @@ def run_nexus_task(task_type: str, blob_name: str):
 
 if __name__ == "__main__":
     # disk_usage = get_disk_usage_percent(NODE_INSTANCE, NODE_MOUNTPOINT)
-    disk_usage = 80.0  # заглушка, так как на тесте не настроен нод экспортер
+    disk_usage = 90.0  # заглушка, так как на тесте не настроен нод экспортер
     if disk_usage is None:
         logger.warning("Пропускаем — нет данных по дисковому пространству.")
     else:
