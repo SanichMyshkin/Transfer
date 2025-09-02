@@ -1,3 +1,5 @@
+import yaml
+from common import load_config, get_matching_rule
 from repository import filter_components_to_delete
 from .test_conf import make_component
 
@@ -114,3 +116,61 @@ def test_reserved_and_min_download():
     deleted = filter_components_to_delete(comps, rules, 10, 0, 0)
 
     assert [d["version"] for d in deleted] == ["v2"]
+
+
+def test_load_config_success(tmp_path):
+    config_data = {"foo": "bar"}
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(yaml.dump(config_data), encoding="utf-8")
+
+    result = load_config(str(config_file))
+    assert result == config_data
+
+
+def test_load_config_file_not_found(tmp_path, caplog):
+    result = load_config(str(tmp_path / "missing.yaml"))
+    assert result is None
+    assert "Ошибка загрузки конфига" in caplog.text
+
+
+def test_load_config_invalid_yaml(tmp_path, caplog):
+    bad_yaml = "{unclosed: [1,2,3}"  # битый YAML
+    config_file = tmp_path / "bad.yaml"
+    config_file.write_text(bad_yaml, encoding="utf-8")
+
+    result = load_config(str(config_file))
+    assert result is None
+    assert "Ошибка загрузки конфига" in caplog.text
+
+
+def test_get_matching_rule_with_match():
+    rules = {
+        ".*-snapshot": {"retention_days": 30, "reserved": 1},
+        ".*-snapshot-extra": {"retention_days": 10},  # более длинный паттерн
+    }
+    pattern, retention, reserved, min_days = get_matching_rule(
+        "1.0-SNAPSHOT-EXTRA",   # внутри функции станет "1.0-snapshot-extra"
+        rules,
+        no_match_retention=90,
+        no_match_reserved=2,
+        no_match_min_days_since_last_download=15,
+    )
+    assert pattern == ".*-snapshot-extra"   # теперь совпадёт
+    assert retention.days == 10
+    assert reserved is None
+    assert min_days is None
+
+
+def test_get_matching_rule_no_match():
+    rules = {"^2\\..*": {"retention_days": 5}}
+    pattern, retention, reserved, min_days = get_matching_rule(
+        "1.0.0",
+        rules,
+        no_match_retention=42,
+        no_match_reserved=7,
+        no_match_min_days_since_last_download=3,
+    )
+    assert pattern == "no-match"
+    assert retention.days == 42
+    assert reserved == 7
+    assert min_days == 3

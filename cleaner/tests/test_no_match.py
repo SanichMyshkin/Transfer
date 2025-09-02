@@ -1,4 +1,4 @@
-from trash.repository import filter_components_to_delete
+from repository import filter_components_to_delete
 from .test_conf import make_component
 
 
