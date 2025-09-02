@@ -2,6 +2,7 @@ import os
 import requests
 import urllib3
 from requests.exceptions import SSLError, RequestException, ConnectionError
+from dotenv import load_dotenv
 import logging
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -19,6 +20,10 @@ HEADERS = {
     )
 }
 
+# --- SSL/Cert config ---
+NEXUS_CERT = os.getenv("NEXUS_CERT")  # путь до кастомного CA/cert
+VERIFY = NEXUS_CERT if NEXUS_CERT else True
+
 session = requests.Session()
 adapter = requests.adapters.HTTPAdapter(max_retries=0)
 session.mount("https://", adapter)
@@ -28,7 +33,7 @@ session.mount("http://", adapter)
 def safe_get_json(url: str, auth: tuple, timeout: int = 20):
     try:
         response = session.get(
-            url, auth=auth, headers=HEADERS, timeout=timeout, verify=True
+            url, auth=auth, headers=HEADERS, timeout=timeout, verify=VERIFY
         )
         response.raise_for_status()
         return response.json()
@@ -81,7 +86,7 @@ def drop_all_certs(nexus_url: str, auth: tuple):
                 f"{nexus_url.rstrip('/')}/service/rest/v1/security/ssl/truststore/{cert_id}",
                 auth=auth,
                 timeout=10,
-                verify=False,  # чтобы не упало на SSL
+                verify=VERIFY,
             )
             resp.raise_for_status()
             logging.info(f"🗑️ Удалён сертификат CN='{cn}', ID='{cert_id}'")
@@ -92,8 +97,10 @@ def drop_all_certs(nexus_url: str, auth: tuple):
 
 
 if __name__ == "__main__":
-    NEXUS_URL = os.getenv("NEXUS_URL", "https://nexus.sanich.tech:8443")
-    NEXUS_USER = os.getenv("NEXUS_USER", "admin")
-    NEXUS_PASS = os.getenv("NEXUS_PASS", "admin123")
+    load_dotenv()
+
+    NEXUS_URL = os.getenv("NEXUS_URL")
+    NEXUS_USER = os.getenv("NEXUS_USER")
+    NEXUS_PASS = os.getenv("NEXUS_PASS")
 
     drop_all_certs(NEXUS_URL, (NEXUS_USER, NEXUS_PASS))

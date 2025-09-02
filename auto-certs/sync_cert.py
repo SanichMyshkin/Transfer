@@ -2,6 +2,7 @@ import requests
 import urllib3
 from urllib.parse import urlparse
 from requests.exceptions import RequestException
+from dotenv import load_dotenv
 import logging
 import os
 
@@ -20,6 +21,10 @@ HEADERS = {
     )
 }
 
+# --- SSL/Cert config ---
+NEXUS_CERT = os.getenv("NEXUS_CERT")  # путь до кастомного CA/cert
+VERIFY = NEXUS_CERT if NEXUS_CERT else False
+
 session = requests.Session()
 adapter = requests.adapters.HTTPAdapter(max_retries=0)
 session.mount("https://", adapter)
@@ -29,7 +34,7 @@ session.mount("http://", adapter)
 def safe_get_json(url: str, auth: tuple, timeout: int = 20):
     try:
         response = session.get(
-            url, auth=auth, headers=HEADERS, timeout=timeout, verify=False
+            url, auth=auth, headers=HEADERS, timeout=timeout, verify=VERIFY
         )
         if response.status_code == 400:
             logging.warning(f"❗ Nexus вернул 400 Bad Request при запросе {url}")
@@ -72,7 +77,7 @@ def add_cert_to_truststore(
             headers={"Content-Type": "application/json"},
             json={"certificate": pem},
             timeout=10,
-            verify=False,
+            verify=VERIFY,
         )
         if resp.status_code == 400:
             logging.warning(
@@ -84,7 +89,7 @@ def add_cert_to_truststore(
                 headers={"Content-Type": "application/x-pem-file"},
                 data=pem.encode(),
                 timeout=10,
-                verify=False,
+                verify=VERIFY,
             )
         if resp.status_code == 409:
             logging.info(
@@ -141,8 +146,9 @@ def sync_remote_certs(nexus_url: str, auth: tuple):
 
 
 if __name__ == "__main__":
-    NEXUS_URL = os.getenv("NEXUS_URL", "https://nexus.sanich.tech:8443")
-    NEXUS_USER = os.getenv("NEXUS_USER", "admin")
-    NEXUS_PASS = os.getenv("NEXUS_PASS", "admin123")
+    load_dotenv()
+    NEXUS_URL = os.getenv("NEXUS_URL")
+    NEXUS_USER = os.getenv("NEXUS_USER")
+    NEXUS_PASS = os.getenv("NEXUS_PASS")
     logging.info("🚀 Запуск синхронизации SSL сертификатов…")
     sync_remote_certs(NEXUS_URL, (NEXUS_USER, NEXUS_PASS))
