@@ -1,10 +1,10 @@
-# Документация проекта
+# Документация Nexus-exporter
 
 ---
 
 ## Оглавление
 
-- [Документация проекта](#документация-проекта)
+- [Документация Nexus-exporter](#документация-nexus-exporter)
   - [Оглавление](#оглавление)
   - [Карта взаимодействия модулей](#карта-взаимодействия-модулей)
   - [1. Назначение и обзор](#1-назначение-и-обзор)
@@ -540,12 +540,20 @@ graph TD
 - `nexus_blob_storage_usage{blobstore=, type=used|free}`
 - `nexus_blob_quota{blobstore=}`
 
-**Ключевые функции**:
+**Ключевые функции (единый формат)**:
 
-- `get_blobstores(nexus_url, auth)` — список blobstore из Nexus API.
-- `get_quota(data)` — извлечение квоты.
-- `update_metrics(blobstores)` — обновление метрик.
-- `fetch_blob_metrics(nexus_url, auth)` — оркестрация.
+- `get_blobstores(nexus_url, auth)` — получает список blobstore из Nexus API.
+  - Принимает: `nexus_url: str`, `auth: tuple[str,str]`.
+  - Возвращает: `list` или `None`.
+- `get_quota(data)` — извлекает квоту из ответа API.
+  - Принимает: `data: dict`.
+  - Возвращает: `int | None`.
+- `update_metrics(blobstores)` — обновляет Prometheus‑метрики по blobstore.
+  - Принимает: `blobstores: list`.
+  - Возвращает: `None`.
+- `fetch_blob_metrics(nexus_url, auth)` — оркестрирует сбор и экспорт.
+  - Принимает: `nexus_url: str`, `auth: tuple[str,str]`.
+  - Возвращает: `None`.
 
 ```mermaid
 graph TD
@@ -561,11 +569,17 @@ graph TD
 **Назначение**: дни до истечения SSL‑сертификатов в truststore.  
 **Метрика**: `nexus_cert_days_left{alias=, subject=}`
 
-**Ключевые функции**:
+**Ключевые функции (единый формат)**:
 
-- `clean_pem(pem)` — нормализация PEM.
-- `short_pem(pem)` — укороченное представление.
-- `fetch_cert_lifetime_metrics(nexus_url, auth)` — сбор и экспорт метрик.
+- `clean_pem(pem)` — нормализует PEM.
+  - Принимает: `pem: str`.
+  - Возвращает: `str`.
+- `short_pem(pem)` — даёт укорочённое представление.
+  - Принимает: `pem: str`.
+  - Возвращает: `str`.
+- `fetch_cert_lifetime_metrics(nexus_url, auth)` — собирает и экспортирует метрики сроков.
+  - Принимает: `nexus_url: str`, `auth: tuple[str,str]`.
+  - Возвращает: `None`.
 
 ```mermaid
 graph TD
@@ -580,10 +594,14 @@ graph TD
 **Назначение**: сравнение SSL‑сертификатов с remote‑URL proxy‑репозиториев.  
 **Метрика**: `nexus_cert_url_match{repo=, level=exact|wildcard|mismatch}`
 
-**Ключевые функции**:
+**Ключевые функции (единый формат)**:
 
-- `match_level(cert_cn, remote_url)` — уровень совпадения.
-- `update_cert_match_metrics(nexus_url, auth)` — сбор и экспорт метрик.
+- `match_level(cert_cn, remote_url)` — вычисляет уровень совпадения CN и URL.
+  - Принимает: `cert_cn: str`, `remote_url: str`.
+  - Возвращает: `int`.
+- `update_cert_match_metrics(nexus_url, auth)` — собирает и экспортирует метрику соответствия.
+  - Принимает: `nexus_url: str`, `auth: tuple[str,str]`.
+  - Возвращает: `None`.
 
 ```mermaid
 graph TD
@@ -597,7 +615,9 @@ graph TD
 **Назначение**: контроль использования политик очистки.  
 **Метрика**: `nexus_cleanup_policy_used{policy=, used=0|1}`
 
-**Ключевая функция**: `fetch_cleanup_policy_usage(api_url, auth)`.
+**Ключевая функция (единый формат)**: `fetch_cleanup_policy_usage(api_url, auth)`.
+  - Принимает: `api_url: str`, `auth: tuple[str,str]`.
+  - Возвращает: `None`.
 
 ```mermaid
 graph TD
@@ -614,12 +634,20 @@ graph TD
 - `docker_repository_port_info{repo=, http_port=}`
 - `docker_port_status{port=, endpoint=, status=up|down}`
 
-**Ключевые функции**:
+**Ключевые функции (единый формат)**:
 
-- `extract_ports(file_text)` — извлечение портов из скриптов.
-- `map_ports_to_endpoints(nginx_conf)` — сопоставление порт→эндпоинт.
-- `get_docker_repositories(nexus_url, auth)` — список Docker‑репозиториев.
-- `fetch_docker_ports(nexus_url, auth)` — сбор и экспорт метрик.
+- `extract_ports(file_text)` — извлекает порты из текста файлов.
+  - Принимает: `file_text: str`.
+  - Возвращает: `List[int]`.
+- `map_ports_to_endpoints(nginx_conf)` — сопоставляет порты nginx эндпоинтам.
+  - Принимает: `nginx_conf: str`.
+  - Возвращает: `Dict[int, List[str]]`.
+- `get_docker_repositories(nexus_url, auth)` — получает список Docker‑репозиториев.
+  - Принимает: `nexus_url: str`, `auth: tuple[str,str]`.
+  - Возвращает: `List[dict]`.
+- `fetch_docker_ports(nexus_url, auth)` — собирает и экспортирует метрики по портам.
+  - Принимает: `nexus_url: str`, `auth: tuple[str,str]`.
+  - Возвращает: `None`.
 
 ```mermaid
 graph TD
@@ -640,10 +668,14 @@ graph TD
 **Назначение**: сведения о Docker‑образах и тегах.  
 **Метрика**: `docker_image_tags_info{image=, tag=, repo=, blobstore=}`
 
-**Ключевые функции**:
+**Ключевые функции (единый формат)**:
 
-- `process_docker_result(result)` — группировка по образам и тегам.
-- `fetch_docker_tags_metrics()` — сбор и экспорт метрик.
+- `process_docker_result(result)` — группирует строки БД по образам и тегам.
+  - Принимает: `result: list`.
+  - Возвращает: `list`.
+- `fetch_docker_tags_metrics()` — собирает и экспортирует метрики тегов.
+  - Принимает: нет.
+  - Возвращает: `None`.
 
 ```mermaid
 graph TD
@@ -657,7 +689,9 @@ graph TD
 **Назначение**: размеры репозиториев и связанные задачи.  
 **Метрика**: `nexus_repo_size{repo=, blobstore=}`
 
-**Ключевая функция**: `fetch_repository_metrics()`.
+**Ключевая функция (единый формат)**: `fetch_repository_metrics()`.
+  - Принимает: нет.
+  - Возвращает: `list`.
 
 ```mermaid
 graph TD
@@ -675,11 +709,17 @@ graph TD
 - `nexus_proxy_repo_status{repo=, url=, status=up|down}`
 - `nexus_repo_count{format=, type=}`
 
-**Ключевые функции**:
+**Ключевые функции (единый формат)**:
 
-- `check_url_status(name, url, auth, check_dns)` — проверка доступности.
-- `fetch_status(repo, auth)` — проверка репозитория.
-- `fetch_repositories_metrics(nexus_url, auth)` — сбор и экспорт метрик.
+- `check_url_status(name, url, auth, check_dns)` — проверяет доступность remote‑URL.
+  - Принимает: `name: str`, `url: str`, `auth: tuple[str,str]`, `check_dns: bool`.
+  - Возвращает: `tuple[int, str]`.
+- `fetch_status(repo, auth)` — проверяет один репозиторий.
+  - Принимает: `repo: dict`, `auth: tuple[str,str]`.
+  - Возвращает: `dict`.
+- `fetch_repositories_metrics(nexus_url, auth)` — собирает и экспортирует статусы.
+  - Принимает: `nexus_url: str`, `auth: tuple[str,str]`.
+  - Возвращает: `list[dict]`.
 
 ```mermaid
 graph TD
@@ -699,11 +739,17 @@ graph TD
 - `nexus_task_match_info{task=, matches=}`
 - `nexus_custom_policy_expired{policy=, expired=0|1}`
 
-**Ключевые функции**:
+**Ключевые функции (единый формат)**:
 
-- `fetch_task_metrics(NEXUS_API_URL, auth)` — сбор всех задач.
-- `fetch_all_blob_and_repo_metrics(NEXUS_API_URL, auth)` — blob/repo задачи.
-- `fetch_custom_policy_metrics(NEXUS_API_URL, auth)` — кастомные политики.
+- `fetch_task_metrics(NEXUS_API_URL, auth)` — собирает и экспортирует метрики задач.
+  - Принимает: `NEXUS_API_URL: str`, `auth: tuple[str,str]`.
+  - Возвращает: `None`.
+- `fetch_all_blob_and_repo_metrics(NEXUS_API_URL, auth)` — анализирует blob/repo задачи.
+  - Принимает: `NEXUS_API_URL: str`, `auth: tuple[str,str]`.
+  - Возвращает: `None`.
+- `fetch_custom_policy_metrics(NEXUS_API_URL, auth)` — собирает метрики кастомных политик.
+  - Принимает: `NEXUS_API_URL: str`, `auth: tuple[str,str]`.
+  - Возвращает: `None`.
 
 ```mermaid
 graph TD
@@ -785,7 +831,7 @@ graph TD
 | `nexus_cert_url_match` | `repo`, `level` | Nexus API |
 | `nexus_cleanup_policy_used` | `policy`, `used` | Nexus API, DB |
 | `docker_repository_port_info` | `repo`, `http_port` | Nexus API, DB |
-| `docker_port_status` | `port`, `endpoint`, `status` | Nginx, скрипты |
+| `docker_port_status` | `port`, `endpoint`, `status` | Nginx.conf, Bash-скрипты |
 | `docker_image_tags_info` | `image`, `tag`, `repo`, `blobstore` | DB |
 | `nexus_repo_size` | `repo`, `blobstore` | DB |
 | `nexus_proxy_repo_status` | `repo`, `url`, `status` | Nexus API |
