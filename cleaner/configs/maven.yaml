@@ -7,15 +7,15 @@ maven_rules:
   snapshot:
     regex_rules:
       ".*":
-        retention_days: -1
-        reserved: 2
-        #min_days_since_last_download: 1
+        #retention_days: -1
+        #reserved: 3
+        min_days_since_last_download: 1
   
-  release:
-    regex_rules:
-      ".*":
-        retention_days: -1
-        reserved: 1
-        #min_days_since_last_download: 30
+  # release:
+  #   regex_rules:
+  #     ".*":
+  #       retention_days: -1
+  #       reserved: 1
+  #       #min_days_since_last_download: 30
 
 dry_run: true

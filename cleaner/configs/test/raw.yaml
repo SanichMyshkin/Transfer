@@ -1,7 +1,7 @@
 dry_run: true
 
 repo_names:
-  - target-raw
+  - target-raw1
 
 # Общее поведение, если не сработало ни одно правило
 no_match_retention_days: 7

@@ -3,7 +3,7 @@
 # === Конфигурация ===
 GROUP_ID="com.example"
 ARTIFACT_ID="demo-lib"
-VERSIONS=("2.1" "2.2")
+VERSIONS=("2.4" "2.5")
 OUTPUT_DIR="./artifacts"
 
 JAVA_CODE='package com.example;

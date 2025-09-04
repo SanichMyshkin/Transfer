@@ -616,8 +616,9 @@ graph TD
 **Метрика**: `nexus_cleanup_policy_used{policy=, used=0|1}`
 
 **Ключевая функция (единый формат)**: `fetch_cleanup_policy_usage(api_url, auth)`.
-  - Принимает: `api_url: str`, `auth: tuple[str,str]`.
-  - Возвращает: `None`.
+
+- Принимает: `api_url: str`, `auth: tuple[str,str]`.
+- Возвращает: `None`.
 
 ```mermaid
 graph TD
@@ -690,8 +691,9 @@ graph TD
 **Метрика**: `nexus_repo_size{repo=, blobstore=}`
 
 **Ключевая функция (единый формат)**: `fetch_repository_metrics()`.
-  - Принимает: нет.
-  - Возвращает: `list`.
+
+- Принимает: нет.
+- Возвращает: `list`.
 
 ```mermaid
 graph TD
