@@ -16,6 +16,10 @@
     - [6.2. `docker_ports_query.py`](#62-docker_ports_querypy)
     - [6.3. `docker_tags_query.py`](#63-docker_tags_querypy)
     - [6.4. `repository_size_query.py`](#64-repository_size_querypy)
+    - [6.5. `database/utils` (вспомогательные модули)](#65-databaseutils-вспомогательные-модули)
+      - [6.5.1. `connection.py`](#651-connectionpy)
+      - [6.5.2. `query_to_db.py`](#652-query_to_dbpy)
+      - [6.5.3. `jobs_reader.py`](#653-jobs_readerpy)
   - [7. Метрики — пакет `metrics`](#7-метрики--пакет-metrics)
     - [7.1. `blobs_size.py`](#71-blobs_sizepy)
     - [7.2. `certificates_expired.py`](#72-certificates_expiredpy)
@@ -26,8 +30,31 @@
     - [7.7. `repo_size.py`](#77-repo_sizepy)
     - [7.8. `repo_status.py`](#78-repo_statuspy)
     - [7.9. `tasks.py`](#79-taskspy)
+    - [7.10. `metrics/utils` (вспомогательные модули)](#710-metricsutils-вспомогательные-модули)
+      - [7.10.1. `api.py`](#7101-apipy)
+      - [7.10.2. `api_gitlab.py`](#7102-api_gitlabpy)
   - [8. Справочник метрик Prometheus](#8-справочник-метрик-prometheus)
   - [9. Карта взаимодействия модулей](#9-карта-взаимодействия-модулей)
+    - [9.1. Мини‑схемы по модулям](#91-минисхемы-по-модулям)
+      - [`main.py`](#mainpy)
+      - [`database/cleanup_query.py`](#databasecleanup_querypy)
+      - [`database/docker_ports_query.py`](#databasedocker_ports_querypy)
+      - [`database/docker_tags_query.py`](#databasedocker_tags_querypy)
+      - [`database/repository_size_query.py`](#databaserepository_size_querypy)
+      - [`database/utils/connection.py`](#databaseutilsconnectionpy)
+      - [`database/utils/query_to_db.py`](#databaseutilsquery_to_dbpy)
+      - [`database/utils/jobs_reader.py`](#databaseutilsjobs_readerpy)
+      - [`metrics/blobs_size.py`](#metricsblobs_sizepy)
+      - [`metrics/certificates_expired.py`](#metricscertificates_expiredpy)
+      - [`metrics/certificates.py`](#metricscertificatespy)
+      - [`metrics/cleanup_policy.py`](#metricscleanup_policypy)
+      - [`metrics/docker_ports.py`](#metricsdocker_portspy)
+      - [`metrics/docker_tags.py`](#metricsdocker_tagspy)
+      - [`metrics/repo_size.py`](#metricsrepo_sizepy)
+      - [`metrics/repo_status.py`](#metricsrepo_statuspy)
+      - [`metrics/tasks.py`](#metricstaskspy)
+      - [`metrics/utils/api.py`](#metricsutilsapipy)
+      - [`metrics/utils/api_gitlab.py`](#metricsutilsapi_gitlabpy)
 
 ---
 
@@ -249,6 +276,40 @@ logger.error("Ошибка подключения к БД")
 
 **Зависимости**: `database.utils.query_to_db.fetch_data`.
 
+### 6.5. `database/utils` (вспомогательные модули)
+
+#### 6.5.1. `connection.py`
+
+**Назначение**: безопасное создание подключения к PostgreSQL по `DATABASE_URL`.
+
+**Ключевая функция**:
+
+- `get_db_connection() -> psycopg2.connection` — разбирает URL, открывает соединение; логирует и пробрасывает ошибку при неудаче.
+
+**Зависимости**: `psycopg2`, `common.config.DATABASE_URL`, `common.logs.logging`.
+
+#### 6.5.2. `query_to_db.py`
+
+**Назначение**: унифицированные обращения к БД с логированием.
+
+**Публичные функции**:
+
+- `fetch_data(query: str, params=None) -> list[tuple]` — выполняет `SELECT`, логирует параметры и количество строк, закрывает соединение.
+- `execute_custom(exec_func)` — обёртка для произвольной логики с курсором (динамический SQL, агрегаты и т. п.).
+
+**Зависимости**: `database.utils.connection.get_db_connection`, `common.logs.logging`.
+
+#### 6.5.3. `jobs_reader.py`
+
+**Назначение**: чтение и парсинг данных о задачах из таблицы `qrtz_job_details` (формат Java‑объектов).
+
+**Публичные функции**:
+
+- `get_jobs_data() -> list[dict]` — вытягивает бинарные `job_data`, декодирует через `javaobj`, конвертирует в питоновские структуры.
+- `convert_java(obj) -> dict | str | None` — рекурсивный конвертер Java‑структур в Python.
+
+**Зависимости**: `database.utils.query_to_db.fetch_data`, `javaobj.v2`, `common.logs.logging`.
+
 ---
 
 ## 7. Метрики — пакет `metrics`
@@ -358,6 +419,38 @@ logger.error("Ошибка подключения к БД")
 - `fetch_task_metrics(NEXUS_API_URL, auth)` — сбор всех задач.
 - `fetch_all_blob_and_repo_metrics(NEXUS_API_URL, auth)` — blob/repo задачи.
 - `fetch_custom_policy_metrics(NEXUS_API_URL, auth)` — кастомные политики.
+
+### 7.10. `metrics/utils` (вспомогательные модули)
+
+#### 7.10.1. `api.py`
+
+**Назначение**: безопасные HTTP‑обёртки для работы с Nexus API и прямыми URL.
+
+**Публичные функции**:
+
+- `get_from_nexus(nexus_url, endpoint, auth, timeout=20) -> dict | list` — GET JSON `service/rest/v1/...` с обработкой SSL/сетевых ошибок.
+- `safe_get_json(url, auth, timeout=20) -> dict | list` — надёжный GET JSON с fallback на `verify=False` при SSL ошибках.
+- `safe_get_raw(url, auth=None, timeout=20) -> tuple[Response|None, Exception|None]` — получение «сырого» ответа (редиректы разрешены).
+- `post_to_nexus(nexus_url, endpoint, auth, data=None, json=None, timeout=20) -> bool` — POST к Nexus API, `True` при 2xx.
+- `build_nexus_url(repo, image, encoding=True) -> str` — формирует ссылку на браузерный UI Nexus для образа/тегов.
+
+**Примечания**:
+
+- Глобальная `requests.Session` без ретраев; SSL‑предупреждения подавлены для читаемых логов.
+
+#### 7.10.2. `api_gitlab.py`
+
+**Назначение**: доступ к GitLab API для чтения файлов и сканирования YAML‑политик.
+
+**Публичные функции**:
+
+- `get_gitlab_connection(gitlab_url, gitlab_token) -> gitlab.Gitlab` — создаёт коннект и выполняет `auth()`.
+- `get_external_policies(gitlab_url, gitlab_token, gitlab_branch, target_path='nexus/cleaner') -> dict[str,str]` — заглушка с примерами ссылок (интерфейс сохранён для совместимости).
+- `get_gitlab_file_content(..., project_path, file_path, branch='master') -> str` — универсальный геттер содержимого файла.
+- `scan_project_for_policies(project, branch, target_path, gitlab_url) -> dict` — обходит репозиторий, собирает `repo_names` из YAML.
+- `process_yaml_file(project, file_info, branch, result, gitlab_url) -> bool` — разбирает один YAML, валидирует структуру, агрегирует результаты.
+
+**Зависимости**: `python-gitlab`, `PyYAML`, `common.logs.logging`.
 
 ---
 
@@ -565,4 +658,212 @@ graph TD
   db_repo_sizes --> db_exec
   db_repo_data --> db_fetch
   db_jobs --> db_fetch
+```
+
+### 9.1. Мини‑схемы по модулям
+
+Ниже — компактные схемы по каждому модулю. Узлы — функции, стрелки показывают ключевые вызовы между модулями.
+
+#### `main.py`
+
+```mermaid
+graph TD
+  main["main()"] --> rs["metrics.repo_status.fetch_repositories_metrics"]
+  main --> dp["metrics.docker_ports.fetch_docker_ports"]
+  main --> cp["metrics.cleanup_policy.fetch_cleanup_policy_usage"]
+  main --> ce["metrics.certificates_expired.fetch_cert_lifetime_metrics"]
+  main --> bs["metrics.blobs_size.fetch_blob_metrics"]
+  main --> rsize["metrics.repo_size.fetch_repository_metrics"]
+  main --> tasks["metrics.tasks.fetch_task_metrics"]
+  main --> dt["metrics.docker_tags.fetch_docker_tags_metrics"]
+  main --> tcustom["metrics.tasks.fetch_custom_policy_metrics"]
+```
+
+---
+
+#### `database/cleanup_query.py`
+
+```mermaid
+graph TD
+  fn["fetch_cleanup_name"] --> q["database.utils.query_to_db.fetch_data"]
+```
+
+#### `database/docker_ports_query.py`
+
+```mermaid
+graph TD
+  fn["fetch_docker_ports"] --> q["database.utils.query_to_db.fetch_data"]
+  fn --> log["common.logs.logging"]
+```
+
+#### `database/docker_tags_query.py`
+
+```mermaid
+graph TD
+  fn["fetch_docker_tags_data"] --> q["database.utils.query_to_db.fetch_data"]
+```
+
+#### `database/repository_size_query.py`
+
+```mermaid
+graph TD
+  sizes["get_repository_sizes"] --> exec["database.utils.query_to_db.execute_custom"]
+  sizes --> log["common.logs.logging"]
+  data["get_repository_data"] --> q["database.utils.query_to_db.fetch_data"]
+```
+
+#### `database/utils/connection.py`
+
+```mermaid
+graph TD
+  conn["get_db_connection"] --> cfg["common.config.DATABASE_URL"]
+  conn --> psy["psycopg2.connect"]
+  conn --> log["common.logs.logging"]
+```
+
+#### `database/utils/query_to_db.py`
+
+```mermaid
+graph TD
+  fetch["fetch_data"] --> dbc["get_db_connection"]
+  fetch --> log["common.logs.logging"]
+  exec["execute_custom"] --> dbc
+  exec --> log
+```
+
+#### `database/utils/jobs_reader.py`
+
+```mermaid
+graph TD
+  jobs["get_jobs_data"] --> q["database.utils.query_to_db.fetch_data"]
+  jobs --> conv["convert_java"]
+  conv --> java["javaobj.v2"]
+  jobs --> log["common.logs.logging"]
+```
+
+---
+
+#### `metrics/blobs_size.py`
+
+```mermaid
+graph TD
+  fetch["fetch_blob_metrics"] --> get["get_blobstores"]
+  fetch --> upd["update_metrics"]
+  get --> api["metrics.utils.api.get_from_nexus"]
+  upd --> prom["prometheus_client.Gauge"]
+  get --> quota["get_quota"]
+```
+
+#### `metrics/certificates_expired.py`
+
+```mermaid
+graph TD
+  fetch["fetch_cert_lifetime_metrics"] --> api["metrics.utils.api.get_from_nexus"]
+  fetch --> clean["clean_pem"]
+  fetch --> short["short_pem"]
+  fetch --> prom["prometheus_client.Gauge"]
+```
+
+#### `metrics/certificates.py`
+
+```mermaid
+graph TD
+  update["update_cert_match_metrics"] --> api["metrics.utils.api.get_from_nexus"]
+  update --> level["match_level"]
+  update --> prom["prometheus_client.Gauge"]
+```
+
+#### `metrics/cleanup_policy.py`
+
+```mermaid
+graph TD
+  fetch["fetch_cleanup_policy_usage"] --> api["metrics.utils.api.get_from_nexus"]
+  fetch --> db["database.cleanup_query.fetch_cleanup_name"]
+  fetch --> prom["prometheus_client.Gauge"]
+```
+
+#### `metrics/docker_ports.py`
+
+```mermaid
+graph TD
+  top["fetch_docker_ports"] --> repos["get_docker_repositories"]
+  top --> portsM["fetch_docker_ports_metrics"]
+  top --> portsS["fetch_ports_status_metrics"]
+  repos --> api["metrics.utils.api.get_from_nexus"]
+  portsM --> gitfile["metrics.utils.api_gitlab.get_gitlab_file_content"]
+  portsM --> map["map_ports_to_endpoints"]
+  portsS --> gitfile
+  portsS --> ext["extract_ports"]
+  portsM --> prom["prometheus_client.Gauge"]
+  portsS --> prom
+```
+
+#### `metrics/docker_tags.py`
+
+```mermaid
+graph TD
+  fetch["fetch_docker_tags_metrics"] --> db["database.docker_tags_query.fetch_docker_tags_data"]
+  fetch --> proc["process_docker_result"]
+  fetch --> prom["prometheus_client.Gauge"]
+```
+
+#### `metrics/repo_size.py`
+
+```mermaid
+graph TD
+  fetch["fetch_repository_metrics"] --> sizes["database.repository_size_query.get_repository_sizes"]
+  fetch --> data["database.repository_size_query.get_repository_data"]
+  fetch --> jobs["database.utils.jobs_reader.get_jobs_data"]
+  fetch --> prom["prometheus_client.Gauge"]
+```
+
+#### `metrics/repo_status.py`
+
+```mermaid
+graph TD
+  fetchAll["fetch_repositories_metrics"] --> f["fetch_status"]
+  f --> url["check_url_status"]
+  url --> raw["metrics.utils.api.safe_get_raw"]
+  fetchAll --> upd["update_all_metrics"]
+  fetchAll --> prom["prometheus_client.Gauge"]
+```
+
+#### `metrics/tasks.py`
+
+```mermaid
+graph TD
+  tmain["fetch_task_metrics"] --> fall["fetch_all_from_nexus"]
+  tmain --> exp["export_tasks_to_metrics"]
+  tall["fetch_all_blob_and_repo_metrics"] --> fall
+  tall --> jobs["database.utils.jobs_reader.get_jobs_data"]
+  tall --> expBR["export_blob_repo_metrics"]
+  tcustom["fetch_custom_policy_metrics"] --> fall
+  tcustom --> pol["metrics.utils.api_gitlab.get_external_policies"]
+  exp --> prom["prometheus_client.Gauge"]
+  expBR --> prom
+```
+
+#### `metrics/utils/api.py`
+
+```mermaid
+graph TD
+  get["get_from_nexus"] --> sjson["safe_get_json"]
+  sjson --> sess["requests.Session"]
+  sjson --> log["common.logs.logging"]
+  sraw["safe_get_raw"] --> sess
+  sraw --> log
+  post["post_to_nexus"] --> sess
+  post --> log
+  build["build_nexus_url"] --> cfg["common.config.NEXUS_API_URL"]
+```
+
+#### `metrics/utils/api_gitlab.py`
+
+```mermaid
+graph TD
+  conn["get_gitlab_connection"] --> gl["gitlab.Gitlab.auth"]
+  file["get_gitlab_file_content"] --> conn
+  scan["scan_project_for_policies"] --> file
+  proc["process_yaml_file"] --> file
+  ext["get_external_policies (stub)"]
 ```
