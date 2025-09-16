@@ -128,25 +128,22 @@ def filter_components_to_delete(
     grouped = defaultdict(list)
     no_match_list = []
 
+    # ===== Шаг 1: собираем компоненты =====
     for component in components:
         version = component.get("version", "")
         name = component.get("name", "")
         assets = component.get("assets", [])
         if not assets or not version or not name:
-            logging.info(f" ⏭ Пропуск: отсутствует имя, версия или assets у компонента {component}")
             continue
 
         last_modified_strs = [a.get("lastModified") for a in assets if a.get("lastModified")]
         last_download_strs = [a.get("lastDownloaded") for a in assets if a.get("lastDownloaded")]
-
         if not last_modified_strs:
-            logging.info(f" ⏭ Пропуск: отсутствует lastModified у компонента {name}:{version}")
             continue
 
         try:
             last_modified = max(parse(s) for s in last_modified_strs)
         except Exception:
-            logging.info(f" ⏭ Пропуск: ошибка парсинга lastModified у {name}:{version}")
             continue
 
         last_download = None
@@ -154,10 +151,13 @@ def filter_components_to_delete(
             try:
                 last_download = max(parse(s) for s in last_download_strs)
             except Exception:
-                logging.info(f" ⚠ Ошибка парсинга lastDownloaded у {name}:{version}")
+                pass
 
+        component.update({"last_modified": last_modified, "last_download": last_download})
+
+        # ===== Проверка версии "latest" =====
         if version.lower() == "latest":
-            logging.info(f" 🔒 Защищён от удаления (latest): {name}:{version}")
+            component.update({"pattern": "latest", "will_delete": False})
             continue
 
         pattern, retention, reserved, min_days_since_last_download = get_matching_rule(
@@ -169,11 +169,9 @@ def filter_components_to_delete(
         )
 
         component.update({
-            "last_modified": last_modified,
-            "last_download": last_download,
+            "pattern": pattern,
             "retention": retention,
             "reserved": reserved,
-            "pattern": pattern,
             "min_days_since_last_download": min_days_since_last_download,
         })
 
@@ -182,51 +180,41 @@ def filter_components_to_delete(
         else:
             grouped[(name, pattern)].append(component)
 
-    # ===== Обработка всех no-match глобально =====
+    saved = []
     to_delete = []
 
+    # ===== Шаг 2: Обработка no-match глобально =====
     if no_match_list:
-        sorted_no_match = sorted(no_match_list, key=lambda x: x["last_modified"], reverse=True)
-        reserved_count = no_match_reserved or 0
+        # Если ни один параметр не задан — сохраняем все
+        if no_match_retention is None and no_match_reserved is None and no_match_min_days_since_last_download is None:
+            for comp in no_match_list:
+                comp["will_delete"] = False
+                saved.append(comp)
+        else:
+            sorted_no_match = sorted(no_match_list, key=lambda x: x["last_modified"], reverse=True)
+            reserved_count = no_match_reserved or 0
+            for i, comp in enumerate(sorted_no_match):
+                age = now_utc - comp["last_modified"]
+                last_download = comp.get("last_download")
+                min_days = comp.get("min_days_since_last_download")
 
-        for i, comp in enumerate(sorted_no_match):
-            full_path = os.path.join(comp["name"], comp["version"]).replace("\\", "/")
-            age = now_utc - comp["last_modified"]
-            last_download = comp.get("last_download")
-            retention = comp.get("retention")
-            min_days = comp.get("min_days_since_last_download")
+                if i < reserved_count:
+                    comp["will_delete"] = False
+                    saved.append(comp)
+                elif no_match_retention is not None and age.days <= no_match_retention:
+                    comp["will_delete"] = False
+                    saved.append(comp)
+                elif last_download and min_days is not None and (now_utc - last_download).days <= min_days:
+                    comp["will_delete"] = False
+                    saved.append(comp)
+                else:
+                    comp["will_delete"] = True
+                    to_delete.append(comp)
 
-            if i < reserved_count:
-                logging.info(f" 📦 Зарезервирован: {full_path} | правило (no-match) (позиция {i + 1}/{reserved_count})")
-                continue
-
-            if retention is not None and age.days <= retention.days:
-                logging.info(f" 📦 Сохранён: {full_path} | правило (no-match) (retention: {age.days} дн. ≤ {retention.days})")
-                continue
-
-            if last_download and min_days is not None:
-                days_since_download = (now_utc - last_download).days
-                if days_since_download <= min_days:
-                    logging.info(f" 📦 Сохранён: {full_path} | правило (no-match) (скачивали {days_since_download} дн. назад ≤ {min_days})")
-                    continue
-
-            reason = []
-            if retention is not None:
-                reason.append(f"retention: {age.days} дн. > {retention.days}")
-            if last_download:
-                reason.append(f"скачивали {(now_utc - last_download).days} дн. назад")
-            else:
-                reason.append("скачивали никогда")
-            reason_text = ", ".join(reason)
-
-            logging.info(f" 🗑 Удаление: {full_path} | правило (no-match) ({reason_text})")
-            to_delete.append(comp)
-
-    # ===== Обработка остальных компонентов по группам =====
+    # ===== Шаг 3: Обработка обычных групп =====
     for (name, pattern), group in grouped.items():
         sorted_group = sorted(group, key=lambda x: x["last_modified"], reverse=True)
         for i, comp in enumerate(sorted_group):
-            full_path = os.path.join(name, comp["version"]).replace("\\", "/")
             age = now_utc - comp["last_modified"]
             last_download = comp.get("last_download")
             retention = comp.get("retention")
@@ -234,33 +222,45 @@ def filter_components_to_delete(
             min_days = comp.get("min_days_since_last_download")
 
             if reserved is not None and i < reserved:
-                logging.info(f" 📦 Зарезервирован: {full_path} | правило ({pattern}) (позиция {i + 1}/{reserved})")
-                continue
-
-            if retention is not None and age.days <= retention.days:
-                logging.info(f" 📦 Сохранён: {full_path} | правило ({pattern}) (retention: {age.days} дн. ≤ {retention.days})")
-                continue
-
-            if last_download and min_days is not None:
-                days_since_download = (now_utc - last_download).days
-                if days_since_download <= min_days:
-                    logging.info(f" 📦 Сохранён: {full_path} | правило ({pattern}) (скачивали {days_since_download} дн. назад ≤ {min_days})")
-                    continue
-
-            reason = []
-            if retention is not None:
-                reason.append(f"retention: {age.days} дн. > {retention.days}")
-            if last_download:
-                reason.append(f"скачивали {(now_utc - last_download).days} дн. назад")
+                comp["will_delete"] = False
+                saved.append(comp)
+            elif retention is not None and age.days <= retention.days:
+                comp["will_delete"] = False
+                saved.append(comp)
+            elif last_download and min_days is not None and (now_utc - last_download).days <= min_days:
+                comp["will_delete"] = False
+                saved.append(comp)
             else:
-                reason.append("скачивали никогда")
-            reason_text = ", ".join(reason)
+                comp["will_delete"] = True
+                to_delete.append(comp)
 
-            logging.info(f" 🗑 Удаление: {full_path} | правило ({pattern}) ({reason_text})")
-            to_delete.append(comp)
+    # ===== Шаг 4: Логирование =====
+    for comp in saved:
+        full_path = os.path.join(comp["name"], comp.get("version", "Без версии")).replace("\\", "/")
+        pattern = comp.get("pattern")
+        if pattern == "latest":
+            logging.info(f" 🔒 Защищён от удаления (latest): {full_path}")
+        elif pattern == "no-match":
+            logging.info(f" 📦 Зарезервирован (no-match): {full_path}")
+        else:
+            logging.info(f" 📦 Зарезервирован: {full_path} | правило ({pattern}) (позиция {i+1}/{comp.get('reserved')})")
+
+    for comp in to_delete:
+        full_path = os.path.join(comp["name"], comp.get("version", "Без версии")).replace("\\", "/")
+        pattern = comp.get("pattern")
+        reason = []
+        if comp.get("retention") is not None:
+            reason.append(f"retention: {(now_utc - comp['last_modified']).days} дн. > {comp['retention'].days}")
+        if comp.get("last_download"):
+            reason.append(f"скачивали {(now_utc - comp['last_download']).days} дн. назад")
+        else:
+            reason.append("скачивали никогда")
+        reason_text = ", ".join(reason)
+        logging.info(f" 🗑 Удаление: {full_path} | правило ({pattern}) ({reason_text})")
 
     logging.info(f" 🧹 Обнаружено к удалению: {len(to_delete)} компонент(ов)")
     return to_delete
+
 
 
 

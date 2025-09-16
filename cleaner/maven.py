@@ -25,30 +25,32 @@ def detect_maven_type(component):
 
 
 def filter_maven_components_to_delete(components, maven_rules):
+    from collections import defaultdict
+    from datetime import datetime, timezone
+    from dateutil.parser import parse
+    import logging
+
     now_utc = datetime.now(timezone.utc)
     grouped = defaultdict(list)
     no_match_list = []
 
-    for component in components:
-        name = component.get("group", "") + ":" + component.get("name", "")
-        version = component.get("version", "")
-        assets = component.get("assets", [])
+    # ===== Шаг 1: собираем компоненты =====
+    for comp in components:
+        name = comp.get("group", "") + ":" + comp.get("name", "")
+        version = comp.get("version", "")
+        assets = comp.get("assets", [])
 
         if not assets or not version or not name:
-            logging.info(f" ⏭ Пропуск Maven-компонента без имени/версии: {component}")
             continue
 
         last_modified_strs = [a.get("lastModified") for a in assets if a.get("lastModified")]
         last_download_strs = [a.get("lastDownloaded") for a in assets if a.get("lastDownloaded")]
-
         if not last_modified_strs:
-            logging.info(f" ⏭ Пропуск: нет lastModified у {name}:{version}")
             continue
 
         try:
             last_modified = max(parse(s) for s in last_modified_strs)
         except Exception:
-            logging.info(f" ⏭ Ошибка парсинга lastModified у {name}:{version}")
             continue
 
         last_download = None
@@ -56,85 +58,67 @@ def filter_maven_components_to_delete(components, maven_rules):
             try:
                 last_download = max(parse(s) for s in last_download_strs)
             except Exception:
-                logging.info(f" ⚠ Ошибка парсинга lastDownloaded у {name}:{version}")
+                pass
 
-        maven_type = detect_maven_type(component)
-
+        maven_type = detect_maven_type(comp)
         rules_cfg = maven_rules.get(maven_type, {}).get("regex_rules", {})
         no_match_retention = maven_rules.get(maven_type, {}).get("no_match_retention_days")
         no_match_reserved = maven_rules.get(maven_type, {}).get("no_match_reserved")
-        no_match_min_days_since_last_download = maven_rules.get(maven_type, {}).get(
-            "no_match_min_days_since_last_download"
+        no_match_min_days = maven_rules.get(maven_type, {}).get("no_match_min_days_since_last_download")
+
+        pattern, retention, reserved, min_days = get_matching_rule(
+            version, rules_cfg, no_match_retention, no_match_reserved, no_match_min_days
         )
 
-        pattern, retention, reserved, min_days_since_last_download = get_matching_rule(
-            version,
-            rules_cfg,
-            no_match_retention,
-            no_match_reserved,
-            no_match_min_days_since_last_download,
-        )
-
-        component.update({
+        comp.update({
             "last_modified": last_modified,
             "last_download": last_download,
             "retention": retention,
             "reserved": reserved,
             "pattern": pattern,
             "maven_type": maven_type,
-            "min_days_since_last_download": min_days_since_last_download,
+            "min_days_since_last_download": min_days,
         })
 
         if pattern == "no-match":
-            no_match_list.append(component)
+            no_match_list.append(comp)
         else:
-            grouped[(name, pattern, maven_type)].append(component)
+            grouped[(name, pattern, maven_type)].append(comp)
 
+    saved = []
     to_delete = []
 
-    # ===== Обработка всех no-match глобально =====
+    # ===== Шаг 2: обработка no-match глобально =====
     if no_match_list:
-        sorted_no_match = sorted(no_match_list, key=lambda x: x["last_modified"], reverse=True)
-        reserved_count = no_match_reserved or 0
+        if no_match_retention is None and no_match_reserved is None and no_match_min_days is None:
+            for comp in no_match_list:
+                comp["will_delete"] = False
+                saved.append(comp)
+        else:
+            sorted_no_match = sorted(no_match_list, key=lambda x: x["last_modified"], reverse=True)
+            reserved_count = no_match_reserved or 0
+            for i, comp in enumerate(sorted_no_match):
+                age = now_utc - comp["last_modified"]
+                last_download = comp.get("last_download")
+                min_days = comp.get("min_days_since_last_download")
 
-        for i, comp in enumerate(sorted_no_match):
-            full_name = f"{comp.get('group','')}:{comp.get('name','')}:{comp.get('version','Без версии')}"
-            age = now_utc - comp["last_modified"]
-            last_download = comp.get("last_download")
-            retention = comp.get("retention")
-            min_days = comp.get("min_days_since_last_download")
+                if i < reserved_count:
+                    comp["will_delete"] = False
+                    saved.append(comp)
+                elif no_match_retention is not None and age.days <= no_match_retention:
+                    comp["will_delete"] = False
+                    saved.append(comp)
+                elif last_download and min_days is not None and (now_utc - last_download).days <= min_days:
+                    comp["will_delete"] = False
+                    saved.append(comp)
+                else:
+                    comp["will_delete"] = True
+                    to_delete.append(comp)
 
-            if i < reserved_count:
-                logging.info(f" 📦 Зарезервирован (Maven {comp['maven_type']}): {full_name} | правило (no-match) (позиция {i + 1}/{reserved_count})")
-                continue
-
-            if retention is not None and age.days <= retention.days:
-                logging.info(f" 📦 Сохранён (Maven {comp['maven_type']}): {full_name} | правило (no-match) (retention: {age.days} дн. ≤ {retention.days})")
-                continue
-
-            if last_download and min_days is not None:
-                days_since_download = (now_utc - last_download).days
-                if days_since_download <= min_days:
-                    logging.info(f" 📦 Сохранён (Maven {comp['maven_type']}): {full_name} | правило (no-match) (скачивали {days_since_download} дн. назад ≤ {min_days})")
-                    continue
-
-            reason = []
-            if retention is not None:
-                reason.append(f"retention: {age.days} дн. > {retention.days}")
-            if last_download:
-                reason.append(f"скачивали {(now_utc - last_download).days} дн. назад")
-            else:
-                reason.append("скачивали никогда")
-            reason_text = ", ".join(reason)
-
-            logging.info(f" 🗑 Удаление (Maven {comp['maven_type']}): {full_name} | правило (no-match) ({reason_text})")
-            to_delete.append(comp)
-
-    # ===== Обработка остальных по группам =====
+    # ===== Шаг 3: обработка обычных групп =====
     for (name, pattern, maven_type), group in grouped.items():
         sorted_group = sorted(group, key=lambda x: x["last_modified"], reverse=True)
         for i, comp in enumerate(sorted_group):
-            full_name = f"{name}:{comp.get('version','Без версии')}"
             age = now_utc - comp["last_modified"]
             last_download = comp.get("last_download")
             retention = comp.get("retention")
@@ -142,30 +126,38 @@ def filter_maven_components_to_delete(components, maven_rules):
             min_days = comp.get("min_days_since_last_download")
 
             if reserved is not None and i < reserved:
-                logging.info(f" 📦 Зарезервирован (Maven {maven_type}): {full_name} | правило ({pattern}) (позиция {i + 1}/{reserved})")
-                continue
-
-            if retention is not None and age.days <= retention.days:
-                logging.info(f" 📦 Сохранён (Maven {maven_type}): {full_name} | правило ({pattern}) (retention: {age.days} дн. ≤ {retention.days})")
-                continue
-
-            if last_download and min_days is not None:
-                days_since_download = (now_utc - last_download).days
-                if days_since_download <= min_days:
-                    logging.info(f" 📦 Сохранён (Maven {maven_type}): {full_name} | правило ({pattern}) (скачивали {days_since_download} дн. назад ≤ {min_days})")
-                    continue
-
-            reason = []
-            if retention is not None:
-                reason.append(f"retention: {age.days} дн. > {retention.days}")
-            if last_download:
-                reason.append(f"скачивали {(now_utc - last_download).days} дн. назад")
+                comp["will_delete"] = False
+                saved.append(comp)
+            elif retention is not None and age.days <= retention.days:
+                comp["will_delete"] = False
+                saved.append(comp)
+            elif last_download and min_days is not None and (now_utc - last_download).days <= min_days:
+                comp["will_delete"] = False
+                saved.append(comp)
             else:
-                reason.append("скачивали никогда")
-            reason_text = ", ".join(reason)
+                comp["will_delete"] = True
+                to_delete.append(comp)
 
-            logging.info(f" 🗑 Удаление (Maven {maven_type}): {full_name} | правило ({pattern}) ({reason_text})")
-            to_delete.append(comp)
+    # ===== Шаг 4: Логирование =====
+    for comp in saved:
+        full_name = f"{comp.get('group','')}:{comp.get('name','')}:{comp.get('version','Без версии')}"
+        pattern = comp.get("pattern")
+        if pattern == "no-match":
+            logging.info(f" 📦 Зарезервирован (no-match): {full_name}")
+        else:
+            logging.info(f" 📦 Зарезервирован: {full_name} | правило ({pattern}) (позиция {i+1}/{comp.get('reserved')})")
+
+    for comp in to_delete:
+        full_name = f"{comp.get('group','')}:{comp.get('name','')}:{comp.get('version','Без версии')}"
+        pattern = comp.get("pattern")
+        reason = []
+        if comp.get("retention") is not None:
+            reason.append(f"retention: {(now_utc - comp['last_modified']).days} дн. > {comp['retention'].days}")
+        if comp.get("last_download"):
+            reason.append(f"скачивали {(now_utc - comp['last_download']).days} дн. назад")
+        else:
+            reason.append("скачивали никогда")
+        logging.info(f" 🗑 Удаление (Maven {comp.get('maven_type')}): {full_name} | правило ({pattern}) ({', '.join(reason)})")
 
     logging.info(f" 🧹 Обнаружено к удалению (Maven): {len(to_delete)} компонент(ов)")
     return to_delete

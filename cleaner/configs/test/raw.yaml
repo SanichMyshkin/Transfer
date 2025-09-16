@@ -4,8 +4,9 @@ repo_names:
 regex_rules:
   "test.*":
     #retention_days: -1
-    reserved: 3
+    reserved: 1
 
-no_match_reserved: 1
+#no_match_reserved: 1
+no_match_retention_days: 47
 
 dry_run: true

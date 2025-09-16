@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 import logging
 import requests
 import logging
@@ -140,9 +141,7 @@ def test_delete_component_request_exception(monkeypatch, caplog):
     assert "Ошибка при удалении" in caplog.text
 
 
-# ===== filter_components_to_delete =====
-def test_filter_components_bad_last_modified(caplog):
-    caplog.set_level(logging.INFO)
+def test_bad_last_modified():
     comps = [
         {
             "id": "1",
@@ -151,16 +150,17 @@ def test_filter_components_bad_last_modified(caplog):
             "assets": [{"path": "f/file", "lastModified": "bad-date"}],
         }
     ]
-    deleted = filter_components_to_delete(comps, {}, 0, 0, 0)
-    assert deleted == []
-    assert "ошибка парсинга lastmodified" in caplog.text.lower()
+    deleted = filter_components_to_delete(comps, {}, None, None, None)
+    assert deleted == []  # ничего не удаляется
 
 
-def test_filter_components_bad_last_download(caplog):
-    caplog.set_level(logging.INFO)
+# =========================
+# 2️⃣ Некорректный lastDownloaded + no-match с retention=0 → компонент удаляется
+# =========================
+def test_bad_last_download_removal():
     comps = [
         {
-            "id": "1",
+            "id": "2",
             "name": "pkg",
             "version": "v1",
             "assets": [
@@ -172,11 +172,28 @@ def test_filter_components_bad_last_download(caplog):
             ],
         }
     ]
+    # Применяем retention=0 для no-match, чтобы компонент удалялся
     deleted = filter_components_to_delete(comps, {}, 0, 0, 0)
-    # по новой логике: no-match применяет retention=0 → артефакт удаляется
     assert len(deleted) == 1
     assert deleted[0]["name"] == "pkg"
-    assert "ошибка парсинга lastdownloaded" in caplog.text.lower()
+
+
+# =========================
+# 3️⃣ no-match без параметров → компонент сохраняется
+# =========================
+def test_no_match_defaults_to_save():
+    comps = [
+        {
+            "id": "3",
+            "name": "pkg",
+            "version": "v1",
+            "assets": [
+                {"path": "f/file", "lastModified": datetime.now(timezone.utc).isoformat()}
+            ],
+        }
+    ]
+    deleted = filter_components_to_delete(comps, {}, None, None, None)
+    assert deleted == []  # компонент должен быть сохранён
 
 
 
