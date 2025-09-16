@@ -2,11 +2,11 @@ repo_names:
   - test-migration
 
 regex_rules:
-  "test.*":
+  "ps.*":
     #retention_days: -1
     reserved: 1
 
-#no_match_reserved: 1
-no_match_retention_days: 47
+no_match_reserved: 1
+
 
 dry_run: true

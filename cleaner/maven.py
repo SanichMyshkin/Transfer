@@ -25,10 +25,6 @@ def detect_maven_type(component):
 
 
 def filter_maven_components_to_delete(components, maven_rules):
-    from collections import defaultdict
-    from datetime import datetime, timezone
-    from dateutil.parser import parse
-    import logging
 
     now_utc = datetime.now(timezone.utc)
     grouped = defaultdict(list)
@@ -139,26 +135,33 @@ def filter_maven_components_to_delete(components, maven_rules):
                 to_delete.append(comp)
 
     # ===== Шаг 4: Логирование =====
+# ===== Шаг 4: Логирование =====
     for comp in saved:
         full_name = f"{comp.get('group','')}:{comp.get('name','')}:{comp.get('version','Без версии')}"
         pattern = comp.get("pattern")
+        reason = []
+        if comp.get("reserved") is not None and "will_delete" in comp and not comp["will_delete"]:
+            reason.append(f"зарезервирован (позиция {comp.get('position', '?')}/{comp.get('reserved')})")
+        if comp.get("retention") is not None:
+            reason.append(f"свежий (возраст {(now_utc - comp['last_modified']).days} дн. ≤ {comp['retention'].days})")
+        if comp.get("last_download") and comp.get("min_days_since_last_download") is not None:
+            reason.append(f"недавно скачивали ({(now_utc - comp['last_download']).days} дн. ≤ {comp['min_days_since_last_download']})")
         if pattern == "no-match":
-            logging.info(f" 📦 Зарезервирован (no-match): {full_name}")
-        else:
-            logging.info(f" 📦 Зарезервирован: {full_name} | правило ({pattern}) (позиция {i+1}/{comp.get('reserved')})")
+            reason.append("не попал под условия фильтрации (no-match)")
+
+        logging.info(f" ✅ Сохранён (Maven {comp.get('maven_type')}): {full_name} | правило ({pattern}) — причина: {', '.join(reason)}")
 
     for comp in to_delete:
         full_name = f"{comp.get('group','')}:{comp.get('name','')}:{comp.get('version','Без версии')}"
         pattern = comp.get("pattern")
         reason = []
         if comp.get("retention") is not None:
-            reason.append(f"retention: {(now_utc - comp['last_modified']).days} дн. > {comp['retention'].days}")
-        if comp.get("last_download"):
-            reason.append(f"скачивали {(now_utc - comp['last_download']).days} дн. назад")
-        else:
+            reason.append(f"старый (возраст {(now_utc - comp['last_modified']).days} дн. > {comp['retention'].days})")
+        if comp.get("last_download") and comp.get("min_days_since_last_download") is not None:
+            reason.append(f"давно не скачивали ({(now_utc - comp['last_download']).days} дн. > {comp['min_days_since_last_download']})")
+        if not comp.get("last_download"):
             reason.append("скачивали никогда")
-        logging.info(f" 🗑 Удаление (Maven {comp.get('maven_type')}): {full_name} | правило ({pattern}) ({', '.join(reason)})")
 
-    logging.info(f" 🧹 Обнаружено к удалению (Maven): {len(to_delete)} компонент(ов)")
+        logging.info(f" 🗑 Удаление (Maven {comp.get('maven_type')}): {full_name} | правило ({pattern}) — причина: {', '.join(reason)}")
+
     return to_delete
-
