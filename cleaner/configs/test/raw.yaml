@@ -1,9 +1,11 @@
 repo_names:
-  - dckr
+  - test-migration
 
 regex_rules:
   "test.*":
-    retention_days: 5
-    reserved: 1
+    #retention_days: -1
+    reserved: 3
 
+no_match_reserved: 1
 
+dry_run: true

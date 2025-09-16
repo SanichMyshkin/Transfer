@@ -159,7 +159,7 @@ def test_maven_no_matching_rule_uses_fallback():
         }
     }
     deleted = filter_maven_components_to_delete(comps, rules)
-    assert len(deleted) == 0  # по новой логике защищается
+    assert len(deleted) == 1 
 
 def test_maven_reserved_overrides_retention():
     now = datetime.now(timezone.utc)

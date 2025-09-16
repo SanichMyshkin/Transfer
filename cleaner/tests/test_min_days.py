@@ -64,6 +64,5 @@ def test_hello_world_does_not_match_suffix():
         no_match_reserved=0,
         no_match_min_days_since_last_download=0,
     )
-
-    # Ни один паттерн не подходит → no-match = защищаем
-    assert len(to_delete) == 0
+    
+    assert len(to_delete) == 1
