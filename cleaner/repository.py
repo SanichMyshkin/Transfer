@@ -267,7 +267,7 @@ def filter_components_to_delete(
         if pattern == "latest":
             reasons.append("специальный тег latest (не удаляется)")
         if pattern == "no-match":
-            reasons.append("не попал под условия фильтрации (no-match)")
+            reasons.append("нет условия фильтрации (no-match)")
         if comp.get("reserved") is not None and not comp.get("will_delete"):
             reasons.append(f"зарезервирован (оставляем {comp.get('reserved')} шт.)")
         if comp.get("retention") is not None:
@@ -295,7 +295,7 @@ def filter_components_to_delete(
         if not comp.get("last_download"):
             reasons.append("скачивали никогда")
         if pattern == "no-match":
-            reasons.append("не попал под условия фильтрации (no-match)")
+            reasons.append("нет условия для сохранения (no-match)")
 
         logging.info(f" 🗑 Удаление: {full_path} | правило ({pattern}) — причина: {', '.join(reasons)}")
 

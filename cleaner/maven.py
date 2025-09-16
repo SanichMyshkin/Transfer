@@ -147,7 +147,7 @@ def filter_maven_components_to_delete(components, maven_rules):
         if comp.get("last_download") and comp.get("min_days_since_last_download") is not None:
             reason.append(f"недавно скачивали ({(now_utc - comp['last_download']).days} дн. ≤ {comp['min_days_since_last_download']})")
         if pattern == "no-match":
-            reason.append("не попал под условия фильтрации (no-match)")
+            reason.append("нет условия фильтрации (no-match)")
 
         logging.info(f" ✅ Сохранён (Maven {comp.get('maven_type')}): {full_name} | правило ({pattern}) — причина: {', '.join(reason)}")
 

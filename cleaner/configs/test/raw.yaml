@@ -1,10 +1,6 @@
 repo_names:
   - test-migration
 
-regex_rules:
-  "ps.*":
-    #retention_days: -1
-    reserved: 1
 
 no_match_reserved: 1
 
