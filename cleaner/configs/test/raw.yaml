@@ -1,9 +1,9 @@
 repo_names:
-  - target-raw
+  - dckr
 
 regex_rules:
-  "^/deep/nested/folder/file.*":
+  "test.*":
     retention_days: 5
-    reserved: 3
+    reserved: 1
 
 

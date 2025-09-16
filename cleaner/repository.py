@@ -170,6 +170,7 @@ def filter_components_to_delete(
             continue
 
         pattern, retention, reserved, min_days_since_last_download = get_matching_rule(
+            #os.path.join(name, version).replace("\\", "/"),
             version,
             regex_rules,
             no_match_retention,
