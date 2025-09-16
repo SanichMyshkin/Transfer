@@ -11,7 +11,8 @@ def test_retention_applies_no_match():
         no_match_reserved=0,
         no_match_min_days_since_last_download=1,
     )
-    assert len(to_delete) == 1
+    # По новой логике no-match всегда сохраняется
+    assert len(to_delete) == 0
 
 
 def test_no_match_retention():
@@ -23,7 +24,7 @@ def test_no_match_retention():
         no_match_reserved=0,
         no_match_min_days_since_last_download=0,
     )
-    assert len(to_delete) == 1
+    assert len(to_delete) == 0  # защищено
 
 
 def test_no_match_reserved_protection():
@@ -38,5 +39,4 @@ def test_no_match_reserved_protection():
         no_match_reserved=1,
         no_match_min_days_since_last_download=0,
     )
-    assert len(to_delete) == 1
-    assert to_delete[0]["version"] == "b"
+    assert len(to_delete) == 0  # обе версии сохраняются, так как no-match

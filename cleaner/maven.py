@@ -102,18 +102,28 @@ def filter_maven_components_to_delete(components, maven_rules):
             reserved = component.get("reserved")
             min_days_since_last_download = component.get("min_days_since_last_download")
 
+            # ===== Обработка NO-MATCH =====
+            if pattern == "no-match":
+                logging.info(
+                    f" ⏭ Пропуск (Maven {maven_type}): {full_name} | не попал ни под одно правило фильтрации"
+                )
+                continue
+
+            # Зарезервированные
             if reserved is not None and i < reserved:
                 logging.info(
                     f" 📦 Зарезервирован (Maven {maven_type}): {full_name} | правило ({pattern}) (позиция {i + 1}/{reserved})"
                 )
                 continue
 
+            # Проверка retention
             if retention is not None and age.days <= retention.days:
                 logging.info(
                     f" 📦 Сохранён (Maven {maven_type}): {full_name} | правило ({pattern}) (retention: {age.days} дн. ≤ {retention.days})"
                 )
                 continue
 
+            # Проверка скачиваний
             if last_download is not None and min_days_since_last_download is not None:
                 days_since_download = (now_utc - last_download).days
                 if days_since_download <= min_days_since_last_download:

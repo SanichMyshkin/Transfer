@@ -148,7 +148,9 @@ def test_maven_timestamped_snapshot_detected_and_deleted():
 def test_maven_no_matching_rule_uses_fallback():
     now = datetime.now(timezone.utc)
     comps = [
-        make_component("com.example", "lib", "9.9", (now - timedelta(days=100)).isoformat())
+        make_component(
+            "com.example", "lib", "9.9", (now - timedelta(days=100)).isoformat()
+        )
     ]
     rules = {
         "release": {
@@ -157,8 +159,7 @@ def test_maven_no_matching_rule_uses_fallback():
         }
     }
     deleted = filter_maven_components_to_delete(comps, rules)
-    assert len(deleted) == 1
-
+    assert len(deleted) == 0  # по новой логике защищается
 
 def test_maven_reserved_overrides_retention():
     now = datetime.now(timezone.utc)

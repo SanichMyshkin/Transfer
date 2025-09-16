@@ -22,13 +22,17 @@ BASE_URL = os.getenv("BASE_URL")
 def get_repository_format(repo_name):
     url = f"{BASE_URL}service/rest/v1/repositories"
     try:
-        response = requests.get(url, auth=(USER_NAME, PASSWORD), timeout=10, verify=False)
+        response = requests.get(
+            url, auth=(USER_NAME, PASSWORD), timeout=10, verify=False
+        )
         response.raise_for_status()
         for repo in response.json():
             if repo.get("name") == repo_name:
                 return repo.get("format")
     except Exception as e:
-        logging.error(f"[FORMAT] ❌ Не удалось определить формат репозитория {repo_name}: {e}")
+        logging.error(
+            f"[FORMAT] ❌ Не удалось определить формат репозитория {repo_name}: {e}"
+        )
     return None
 
 
@@ -83,7 +87,9 @@ def convert_raw_assets_to_components(assets):
     return components
 
 
-def delete_component(component_id, component_name, component_version, dry_run, use_asset=False):
+def delete_component(
+    component_id, component_name, component_version, dry_run, use_asset=False
+):
     if dry_run:
         logging.info(
             f"[DELETE] 🧪 [DRY_RUN] Пропущено удаление: {component_name}:{component_version} (ID: {component_id})"
@@ -93,7 +99,9 @@ def delete_component(component_id, component_name, component_version, dry_run, u
     endpoint = "assets" if use_asset else "components"
     url = f"{BASE_URL}service/rest/v1/{endpoint}/{component_id}"
     try:
-        response = requests.delete(url, auth=(USER_NAME, PASSWORD), timeout=10, verify=False)
+        response = requests.delete(
+            url, auth=(USER_NAME, PASSWORD), timeout=10, verify=False
+        )
         response.raise_for_status()
         logging.info(
             f"[DELETE] ✅ Удалён: {component_name}:{component_version} (ID: {component_id})"
@@ -130,8 +138,12 @@ def filter_components_to_delete(
             )
             continue
 
-        last_modified_strs = [a.get("lastModified") for a in assets if a.get("lastModified")]
-        last_download_strs = [a.get("lastDownloaded") for a in assets if a.get("lastDownloaded")]
+        last_modified_strs = [
+            a.get("lastModified") for a in assets if a.get("lastModified")
+        ]
+        last_download_strs = [
+            a.get("lastDownloaded") for a in assets if a.get("lastDownloaded")
+        ]
 
         if not last_modified_strs:
             logging.info(
@@ -191,6 +203,13 @@ def filter_components_to_delete(
             retention = component.get("retention")
             reserved = component.get("reserved")
             min_days_since_last_download = component.get("min_days_since_last_download")
+
+            # ===== Обработка NO-MATCH =====
+            if pattern == "no-match":
+                logging.info(
+                    f" ⏭ Пропуск: {full_path} | не попал ни под одно правило фильтрации"
+                )
+                continue
 
             # Зарезервированные
             if reserved is not None and i < reserved:

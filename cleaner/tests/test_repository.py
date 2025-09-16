@@ -173,7 +173,8 @@ def test_filter_components_bad_last_download(caplog):
         }
     ]
     deleted = filter_components_to_delete(comps, {}, 0, 0, 0)
-    assert deleted != []  # компонент попадает под удаление
+    # из-за no-match → защищено
+    assert deleted == []
     assert "ошибка парсинга lastdownloaded" in caplog.text.lower()
 
 

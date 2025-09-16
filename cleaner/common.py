@@ -18,6 +18,7 @@ logging.basicConfig(
     handlers=[file_handler, logging.StreamHandler()],
 )
 
+
 # ===== ОБЩИЕ УТИЛИТЫ =====
 def load_config(path):
     try:
@@ -54,6 +55,15 @@ def get_matching_rule(
             timedelta(days=retention_days) if retention_days is not None else None
         )
         return pattern, retention, reserved, min_days_since_last_download
+
+    # === NO-MATCH поведение ===
+    if (
+        no_match_retention is None
+        and no_match_reserved is None
+        and no_match_min_days_since_last_download is None
+    ):
+        # по умолчанию — защищаем от удаления
+        return "no-match", None, float("inf"), None
 
     retention = (
         timedelta(days=no_match_retention) if no_match_retention is not None else None
