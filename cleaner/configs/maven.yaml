@@ -1,13 +1,14 @@
 repo_names:
-  - maven2-test1
+  - maven2-test
 
 maven_rules:
   snapshot:
     regex_rules:
-      ".*":
-        min_days_since_last_download: 1
+      ".*-.*":
+        #retention_days: 7
+        reserved: 2
+    no_match_retention_days: 40
+    no_match_reserved: 1
 
-  # глобальные правила no-match (работают и для snapshot, и для release)
-    no_match_reserved: 10
 
 dry_run: true
