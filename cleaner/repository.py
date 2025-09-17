@@ -166,8 +166,12 @@ def filter_components_to_delete(
         if not assets or not version or not name:
             continue
 
-        last_modified_strs = [a.get("lastModified") for a in assets if a.get("lastModified")]
-        last_download_strs = [a.get("lastDownloaded") for a in assets if a.get("lastDownloaded")]
+        last_modified_strs = [
+            a.get("lastModified") for a in assets if a.get("lastModified")
+        ]
+        last_download_strs = [
+            a.get("lastDownloaded") for a in assets if a.get("lastDownloaded")
+        ]
         if not last_modified_strs:
             continue
 
@@ -183,11 +187,19 @@ def filter_components_to_delete(
             except Exception:
                 last_download = None
 
-        component.update({"last_modified": last_modified, "last_download": last_download})
+        component.update(
+            {"last_modified": last_modified, "last_download": last_download}
+        )
 
         # версия "latest" — не удаляем
         if isinstance(version, str) and version.lower() == "latest":
-            component.update({"pattern": "latest", "will_delete": False, "delete_reason": "версия 'latest' — сохраняем"})
+            component.update(
+                {
+                    "pattern": "latest",
+                    "will_delete": False,
+                    "delete_reason": "версия 'latest' — сохраняем",
+                }
+            )
             continue
 
         # получить совпадающее правило (внешняя функция). Ожидаем:
@@ -234,7 +246,9 @@ def filter_components_to_delete(
                 comp["delete_reason"] = "нет правил no-match → сохраняем"
                 saved.append(comp)
         else:
-            sorted_no_match = sorted(no_match_list, key=lambda x: x["last_modified"], reverse=True)
+            sorted_no_match = sorted(
+                no_match_list, key=lambda x: x["last_modified"], reverse=True
+            )
             # Здесь используем нормализованные значения из компонента, но если их нет — берём из аргументов функции
             for i, comp in enumerate(sorted_no_match):
                 age = now_utc - comp["last_modified"]
@@ -246,14 +260,18 @@ def filter_components_to_delete(
                 # 1) reserved
                 if reserved_count and i < reserved_count:
                     comp["will_delete"] = False
-                    comp["delete_reason"] = f"зарезервирован (позиция {i+1}/{reserved_count}, no-match)"
+                    comp["delete_reason"] = (
+                        f"зарезервирован (позиция {i + 1}/{reserved_count}, no-match)"
+                    )
                     saved.append(comp)
                     continue
 
                 # 2) retention (возраст)
                 if retention_days is not None and age.days <= retention_days:
                     comp["will_delete"] = False
-                    comp["delete_reason"] = f"свежий (возраст {age.days} дн. ≤ {retention_days} дн., no-match)"
+                    comp["delete_reason"] = (
+                        f"свежий (возраст {age.days} дн. ≤ {retention_days} дн., no-match)"
+                    )
                     saved.append(comp)
                     continue
 
@@ -262,21 +280,29 @@ def filter_components_to_delete(
                     days_since_dl = (now_utc - last_download).days
                     if days_since_dl <= min_days:
                         comp["will_delete"] = False
-                        comp["delete_reason"] = f"недавно скачивали ({days_since_dl} дн. ≤ {min_days} дн., no-match)"
+                        comp["delete_reason"] = (
+                            f"недавно скачивали ({days_since_dl} дн. ≤ {min_days} дн., no-match)"
+                        )
                         saved.append(comp)
                         continue
 
                 # Если дошли сюда — составляем подробную причину удаления
                 failures = []
                 if reserved_count:
-                    failures.append(f"позиция {i+1} > reserved {reserved_count}")
+                    failures.append(f"позиция {i + 1} > reserved {reserved_count}")
                 if retention_days is not None:
-                    failures.append(f"возраст {age.days} дн. > retention {retention_days} дн.")
+                    failures.append(
+                        f"возраст {age.days} дн. > retention {retention_days} дн."
+                    )
                 if min_days is not None:
                     if last_download:
-                        failures.append(f"последнее скачивание {(now_utc - last_download).days} дн. > min_days {min_days} дн.")
+                        failures.append(
+                            f"последнее скачивание {(now_utc - last_download).days} дн. > min_days {min_days} дн."
+                        )
                     else:
-                        failures.append(f"нет данных о скачивании (требуется min_days={min_days} дн.)")
+                        failures.append(
+                            f"нет данных о скачивании (требуется min_days={min_days} дн.)"
+                        )
 
                 if not failures:
                     # редкий кейс: нет условий сохранения → явно пишем
@@ -301,14 +327,18 @@ def filter_components_to_delete(
             # 1) reserved
             if reserved_count and i < reserved_count:
                 comp["will_delete"] = False
-                comp["delete_reason"] = f"зарезервирован (позиция {i+1}/{reserved_count}, правило '{pattern}')"
+                comp["delete_reason"] = (
+                    f"зарезервирован (позиция {i + 1}/{reserved_count}, правило '{pattern}')"
+                )
                 saved.append(comp)
                 continue
 
             # 2) retention
             if retention_days is not None and age.days <= retention_days:
                 comp["will_delete"] = False
-                comp["delete_reason"] = f"свежий (возраст {age.days} дн. ≤ {retention_days} дн., правило '{pattern}')"
+                comp["delete_reason"] = (
+                    f"свежий (возраст {age.days} дн. ≤ {retention_days} дн., правило '{pattern}')"
+                )
                 saved.append(comp)
                 continue
 
@@ -317,21 +347,29 @@ def filter_components_to_delete(
                 days_since_dl = (now_utc - last_download).days
                 if days_since_dl <= min_days:
                     comp["will_delete"] = False
-                    comp["delete_reason"] = f"недавно скачивали ({days_since_dl} дн. ≤ {min_days} дн., правило '{pattern}')"
+                    comp["delete_reason"] = (
+                        f"недавно скачивали ({days_since_dl} дн. ≤ {min_days} дн., правило '{pattern}')"
+                    )
                     saved.append(comp)
                     continue
 
             # Не подошёл ни один критерий для сохранения → формируем подробную причину удаления
             failures = []
             if reserved_count:
-                failures.append(f"позиция {i+1} > reserved {reserved_count}")
+                failures.append(f"позиция {i + 1} > reserved {reserved_count}")
             if retention_days is not None:
-                failures.append(f"возраст {age.days} дн. > retention {retention_days} дн.")
+                failures.append(
+                    f"возраст {age.days} дн. > retention {retention_days} дн."
+                )
             if min_days is not None:
                 if last_download:
-                    failures.append(f"последнее скачивание {(now_utc - last_download).days} дн. > min_days {min_days} дн.")
+                    failures.append(
+                        f"последнее скачивание {(now_utc - last_download).days} дн. > min_days {min_days} дн."
+                    )
                 else:
-                    failures.append(f"нет данных о скачивании (требуется min_days={min_days} дн.)")
+                    failures.append(
+                        f"нет данных о скачивании (требуется min_days={min_days} дн.)"
+                    )
 
             if not failures:
                 reason = f"не соответствует правилу '{pattern}' → удаляем"
@@ -344,18 +382,22 @@ def filter_components_to_delete(
 
     # ===== Шаг 4: Логирование =====
     for comp in saved:
-        full_path = os.path.join(comp["name"], comp.get("version", "Без версии")).replace("\\", "/")
-        logging.info(f" ✅ Сохранён: {full_path} | причина: {comp.get('delete_reason')}")
+        full_path = os.path.join(
+            comp["name"], comp.get("version", "Без версии")
+        ).replace("\\", "/")
+        logging.info(
+            f" ✅ Сохранён: {full_path} | причина: {comp.get('delete_reason')}"
+        )
 
     for comp in to_delete:
-        full_path = os.path.join(comp["name"], comp.get("version", "Без версии")).replace("\\", "/")
+        full_path = os.path.join(
+            comp["name"], comp.get("version", "Без версии")
+        ).replace("\\", "/")
         logging.info(f" 🗑 Удаление: {full_path} | причина: {comp.get('delete_reason')}")
 
     logging.info(f" 🧹 Обнаружено к удалению: {len(to_delete)} компонент(ов)")
 
     return to_delete
-
-
 
 
 # ===== ОЧИСТКА РЕПОЗИТОРИЯ =====

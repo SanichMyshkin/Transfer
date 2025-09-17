@@ -188,13 +188,15 @@ def test_no_match_defaults_to_save():
             "name": "pkg",
             "version": "v1",
             "assets": [
-                {"path": "f/file", "lastModified": datetime.now(timezone.utc).isoformat()}
+                {
+                    "path": "f/file",
+                    "lastModified": datetime.now(timezone.utc).isoformat(),
+                }
             ],
         }
     ]
     deleted = filter_components_to_delete(comps, {}, None, None, None)
     assert deleted == []  # компонент должен быть сохранён
-
 
 
 # ===== clear_repository =====

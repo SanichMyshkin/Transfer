@@ -24,32 +24,6 @@ def detect_maven_type(component):
     return "release"
 
 
-import logging
-import re
-from datetime import datetime, timezone, timedelta
-from collections import defaultdict
-from dateutil.parser import parse
-from common import get_matching_rule
-
-
-def detect_maven_type(component):
-    """
-    Определяет тип Maven-компонента (snapshot или release).
-    """
-    version = component.get("version", "").lower()
-
-    # 1. Если явно содержит "snapshot" → snapshot
-    if "snapshot" in version:
-        return "snapshot"
-
-    # 2. Timestamped snapshots (пример: 1.0-20250829.123456-1)
-    if re.match(r".*-\d{8}\.\d{6}-\d+", version):
-        return "snapshot"
-
-    # 3. Всё остальное → release
-    return "release"
-
-
 def filter_maven_components_to_delete(components, maven_rules):
     now_utc = datetime.now(timezone.utc)
     grouped = defaultdict(list)

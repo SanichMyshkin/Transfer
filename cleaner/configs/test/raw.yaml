@@ -1,8 +1,11 @@
 repo_names:
-  - test-migration1
+  - test-migration
 
-#no_match_retention_days: 46
-no_match_reserved: 1
+#regex_rules:
+  #".*":
+    #retention_days: 7
+    #reserved: 2
+#no_match_retention_days: 48
 
 
 dry_run: true
