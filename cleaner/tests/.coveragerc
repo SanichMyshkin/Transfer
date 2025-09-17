@@ -1,5 +1,0 @@
-[run]
-omit =
-    tests/*
-
-# pytest --cov=. --cov-report=term-missing --cov-config=tests/.coveragerc

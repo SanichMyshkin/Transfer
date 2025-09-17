@@ -5,10 +5,7 @@ maven_rules:
   snapshot:
     regex_rules:
       ".*-.*":
-        #retention_days: 7
+        retention_days: 19
         reserved: 2
-    no_match_retention_days: 40
-    no_match_reserved: 1
-
 
 dry_run: true

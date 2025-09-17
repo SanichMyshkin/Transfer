@@ -1,10 +1,11 @@
 repo_names:
-  - test-migration
+  - test-migration1
 
-#regex_rules:
-  #".*":
-    #retention_days: 7
-    #reserved: 2
+regex_rules:
+  ".*test.*":
+    retention_days: 7
+    reserved: 2
+    min_days_since_last_download: 7
 #no_match_retention_days: 48
 
 

@@ -112,7 +112,7 @@ def filter_maven_components_to_delete(components, maven_rules):
             reserved_count = no_match_reserved or 0
 
             for i, comp in enumerate(sorted_no_match):
-                age = now_utc - comp["last_modified"]
+                age_days = (now_utc - comp["last_modified"]).days
                 last_download = comp.get("last_download")
                 min_days = comp.get("min_days_since_last_download")
 
@@ -122,10 +122,10 @@ def filter_maven_components_to_delete(components, maven_rules):
                         f"зарезервирован (позиция {i + 1}/{reserved_count}, no-match_reserved)"
                     )
                     saved.append(comp)
-                elif no_match_retention is not None and age.days <= no_match_retention:
+                elif no_match_retention is not None and age_days <= no_match_retention:
                     comp["will_delete"] = False
                     comp["delete_reason"] = (
-                        f"свежий (возраст {age.days} дн. ≤ {no_match_retention}, no-match_retention_days)"
+                        f"свежий (возраст {age_days} дн. ≤ {no_match_retention} дн., no-match_retention_days)"
                     )
                     saved.append(comp)
                 elif (
@@ -135,7 +135,7 @@ def filter_maven_components_to_delete(components, maven_rules):
                 ):
                     comp["will_delete"] = False
                     comp["delete_reason"] = (
-                        f"недавно скачивали ({(now_utc - last_download).days} дн. ≤ {min_days}, no-match_min_days_since_last_download)"
+                        f"недавно скачивали ({(now_utc - last_download).days} дн. ≤ {min_days} дн., no-match_min_days_since_last_download)"
                     )
                     saved.append(comp)
                 else:
@@ -145,10 +145,10 @@ def filter_maven_components_to_delete(components, maven_rules):
                             f"удаляется: не попал в reserved ({reserved_count})"
                         )
                     elif (
-                        no_match_retention is not None and age.days > no_match_retention
+                        no_match_retention is not None and age_days > no_match_retention
                     ):
                         comp["delete_reason"] = (
-                            f"удаляется: возраст {age.days} дн. > {no_match_retention} (no-match_retention_days)"
+                            f"удаляется: возраст {age_days} дн. > {no_match_retention} дн. (no-match_retention_days)"
                         )
                     elif (
                         last_download
@@ -156,7 +156,7 @@ def filter_maven_components_to_delete(components, maven_rules):
                         and (now_utc - last_download).days > min_days
                     ):
                         comp["delete_reason"] = (
-                            f"удаляется: давно не скачивали ({(now_utc - last_download).days} дн. > {min_days}, no-match_min_days_since_last_download)"
+                            f"удаляется: давно не скачивали ({(now_utc - last_download).days} дн. > {min_days} дн., no-match_min_days_since_last_download)"
                         )
                     else:
                         comp["delete_reason"] = (
@@ -170,7 +170,7 @@ def filter_maven_components_to_delete(components, maven_rules):
         reserved = group[0].get("reserved")
 
         for i, comp in enumerate(sorted_group):
-            age = now_utc - comp["last_modified"]
+            age_days = (now_utc - comp["last_modified"]).days
             last_download = comp.get("last_download")
             retention = comp.get("retention")
             min_days = comp.get("min_days_since_last_download")
@@ -181,10 +181,10 @@ def filter_maven_components_to_delete(components, maven_rules):
                     f"зарезервирован (позиция {i + 1}/{reserved}, reserved)"
                 )
                 saved.append(comp)
-            elif retention is not None and age <= retention:
+            elif retention is not None and age_days <= retention.days:
                 comp["will_delete"] = False
                 comp["delete_reason"] = (
-                    f"свежий (возраст {age.days} дн. ≤ {retention.days}, retention_days)"
+                    f"свежий (возраст {age_days} дн. ≤ {retention.days} дн., retention_days)"
                 )
                 saved.append(comp)
             elif (
@@ -194,7 +194,7 @@ def filter_maven_components_to_delete(components, maven_rules):
             ):
                 comp["will_delete"] = False
                 comp["delete_reason"] = (
-                    f"недавно скачивали ({(now_utc - last_download).days} дн. ≤ {min_days}, min_days_since_last_download)"
+                    f"недавно скачивали ({(now_utc - last_download).days} дн. ≤ {min_days} дн., min_days_since_last_download)"
                 )
                 saved.append(comp)
             else:
@@ -203,9 +203,9 @@ def filter_maven_components_to_delete(components, maven_rules):
                     comp["delete_reason"] = (
                         f"удаляется: не попал в reserved ({reserved})"
                     )
-                elif retention is not None and age > retention:
+                elif retention is not None and age_days > retention.days:
                     comp["delete_reason"] = (
-                        f"удаляется: возраст {age.days} дн. > {retention.days} (retention_days)"
+                        f"удаляется: возраст {age_days} дн. > {retention.days} дн. (retention_days)"
                     )
                 elif (
                     last_download
@@ -213,7 +213,7 @@ def filter_maven_components_to_delete(components, maven_rules):
                     and (now_utc - last_download).days > min_days
                 ):
                     comp["delete_reason"] = (
-                        f"удаляется: давно не скачивали ({(now_utc - last_download).days} дн. > {min_days}, min_days_since_last_download)"
+                        f"удаляется: давно не скачивали ({(now_utc - last_download).days} дн. > {min_days} дн., min_days_since_last_download)"
                     )
                 else:
                     comp["delete_reason"] = "удаляется: не соответствует правилам regex"
