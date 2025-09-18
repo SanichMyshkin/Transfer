@@ -1,11 +1,11 @@
 repo_names:
-  - maven2-test1
+  - maven2-test
 
 maven_rules:
   snapshot:
     regex_rules:
       ".*-.*":
-        retention_days: 19
+        retention_days: 18
         reserved: 2
 
 dry_run: true
