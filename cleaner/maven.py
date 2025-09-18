@@ -24,10 +24,19 @@ def detect_maven_type(component):
     return "release"
 
 
+def _retention_days(retention):
+    """Преобразует retention в количество дней (int)."""
+    if retention is None:
+        return None
+    if hasattr(retention, "days"):  # timedelta
+        return retention.days
+    return int(retention)
+
+
 def filter_maven_components_to_delete(components, maven_rules):
     now_utc = datetime.now(timezone.utc)
     grouped = defaultdict(list)
-    no_match_list = []
+    grouped_no_match = defaultdict(list)
 
     # ===== Шаг 1: собираем компоненты =====
     for comp in components:
@@ -86,7 +95,7 @@ def filter_maven_components_to_delete(components, maven_rules):
         )
 
         if pattern == "no-match":
-            no_match_list.append(comp)
+            grouped_no_match[(name, maven_type)].append(comp)
         else:
             grouped[(name, pattern, maven_type)].append(comp)
 
@@ -94,77 +103,86 @@ def filter_maven_components_to_delete(components, maven_rules):
     to_delete = []
 
     # ===== Шаг 2: обработка no-match =====
-    if no_match_list:
+    for (name, maven_type), group in grouped_no_match.items():
+        sorted_group = sorted(group, key=lambda x: x["last_modified"], reverse=True)
+
         if (
-            no_match_retention is None
-            and no_match_reserved is None
-            and no_match_min_days is None
-        ):
-            # Нет правил → сохраняем все
-            for comp in no_match_list:
-                comp["will_delete"] = False
-                comp["delete_reason"] = "нет правил no-match → сохраняем"
-                saved.append(comp)
-        else:
-            sorted_no_match = sorted(
-                no_match_list, key=lambda x: x["last_modified"], reverse=True
+            maven_rules.get(maven_type, {}).get("no_match_retention_days") is None
+            and maven_rules.get(maven_type, {}).get("no_match_reserved") is None
+            and maven_rules.get(maven_type, {}).get(
+                "no_match_min_days_since_last_download"
             )
-            reserved_count = no_match_reserved or 0
+            is None
+        ):
+            for comp in sorted_group:
+                comp["will_delete"] = False
+                comp["delete_reason"] = f"нет правил no-match → сохраняем ({name})"
+                saved.append(comp)
+            continue
 
-            for i, comp in enumerate(sorted_no_match):
-                age_days = (now_utc - comp["last_modified"]).days
-                last_download = comp.get("last_download")
-                min_days = comp.get("min_days_since_last_download")
+        for i, comp in enumerate(sorted_group):
+            age_days = (now_utc - comp["last_modified"]).days
+            last_download = comp.get("last_download")
+            reserved = comp.get("reserved") or 0
+            retention = comp.get("retention")
+            min_days = comp.get("min_days_since_last_download")
 
-                if i < reserved_count:
+            # 1) reserved
+            if reserved and i < reserved:
+                comp["will_delete"] = False
+                comp["delete_reason"] = (
+                    f"зарезервирован (позиция {i + 1}/{reserved}, no-match, {name})"
+                )
+                saved.append(comp)
+                continue
+
+            # 2) retention
+            limit = _retention_days(retention)
+            if limit is not None and age_days <= limit:
+                comp["will_delete"] = False
+                comp["delete_reason"] = (
+                    f"свежий (возраст {age_days} дн. ≤ {limit} дн., no-match, {name})"
+                )
+                saved.append(comp)
+                continue
+
+            # 3) last download
+            if min_days is not None and last_download:
+                days_since_dl = (now_utc - last_download).days
+                if days_since_dl <= int(min_days):
                     comp["will_delete"] = False
                     comp["delete_reason"] = (
-                        f"зарезервирован (позиция {i + 1}/{reserved_count}, no-match_reserved)"
+                        f"недавно скачивали ({days_since_dl} дн. ≤ {int(min_days)} дн., no-match, {name})"
                     )
                     saved.append(comp)
-                elif no_match_retention is not None and age_days <= no_match_retention:
-                    comp["will_delete"] = False
-                    comp["delete_reason"] = (
-                        f"свежий (возраст {age_days} дн. ≤ {no_match_retention} дн., no-match_retention_days)"
+                    continue
+
+            # иначе → удаляем
+            failures = []
+            if reserved:
+                failures.append(f"позиция {i + 1} > reserved {reserved}")
+            if limit is not None:
+                failures.append(f"возраст {age_days} дн. > retention {limit} дн.")
+            if min_days is not None:
+                if last_download:
+                    failures.append(
+                        f"последнее скачивание {(now_utc - last_download).days} дн. > min_days {int(min_days)} дн."
                     )
-                    saved.append(comp)
-                elif (
-                    last_download
-                    and min_days is not None
-                    and (now_utc - last_download).days <= min_days
-                ):
-                    comp["will_delete"] = False
-                    comp["delete_reason"] = (
-                        f"недавно скачивали ({(now_utc - last_download).days} дн. ≤ {min_days} дн., no-match_min_days_since_last_download)"
-                    )
-                    saved.append(comp)
                 else:
-                    comp["will_delete"] = True
-                    if reserved_count and i >= reserved_count:
-                        comp["delete_reason"] = (
-                            f"удаляется: не попал в reserved ({reserved_count})"
-                        )
-                    elif (
-                        no_match_retention is not None and age_days > no_match_retention
-                    ):
-                        comp["delete_reason"] = (
-                            f"удаляется: возраст {age_days} дн. > {no_match_retention} дн. (no-match_retention_days)"
-                        )
-                    elif (
-                        last_download
-                        and min_days is not None
-                        and (now_utc - last_download).days > min_days
-                    ):
-                        comp["delete_reason"] = (
-                            f"удаляется: давно не скачивали ({(now_utc - last_download).days} дн. > {min_days} дн., no-match_min_days_since_last_download)"
-                        )
-                    else:
-                        comp["delete_reason"] = (
-                            "удаляется: не соответствует правилам no-match"
-                        )
-                    to_delete.append(comp)
+                    failures.append(
+                        f"нет данных о скачивании (требуется min_days={int(min_days)} дн.)"
+                    )
 
-    # ===== Шаг 3: обработка групп с regex =====
+            reason = (
+                f"удаляется по правилам no-match ({name}): " + "; ".join(failures)
+                if failures
+                else f"нет условий сохранения (no-match, {name}) → удаляем"
+            )
+            comp["will_delete"] = True
+            comp["delete_reason"] = reason
+            to_delete.append(comp)
+
+    # ===== Шаг 3: обработка regex-групп =====
     for (name, pattern, maven_type), group in grouped.items():
         sorted_group = sorted(group, key=lambda x: x["last_modified"], reverse=True)
         reserved = group[0].get("reserved")
@@ -175,49 +193,60 @@ def filter_maven_components_to_delete(components, maven_rules):
             retention = comp.get("retention")
             min_days = comp.get("min_days_since_last_download")
 
+            # 1) reserved
             if reserved is not None and i < reserved:
                 comp["will_delete"] = False
                 comp["delete_reason"] = (
-                    f"зарезервирован (позиция {i + 1}/{reserved}, reserved)"
+                    f"зарезервирован (позиция {i + 1}/{reserved}, правило '{pattern}', {name})"
                 )
                 saved.append(comp)
-            elif retention is not None and age_days <= retention.days:
+                continue
+
+            # 2) retention
+            limit = _retention_days(retention)
+            if limit is not None and age_days <= limit:
                 comp["will_delete"] = False
                 comp["delete_reason"] = (
-                    f"свежий (возраст {age_days} дн. ≤ {retention.days} дн., retention_days)"
+                    f"свежий (возраст {age_days} дн. ≤ {limit} дн., правило '{pattern}', {name})"
                 )
                 saved.append(comp)
-            elif (
-                last_download
-                and min_days is not None
-                and (now_utc - last_download).days <= min_days
-            ):
-                comp["will_delete"] = False
-                comp["delete_reason"] = (
-                    f"недавно скачивали ({(now_utc - last_download).days} дн. ≤ {min_days} дн., min_days_since_last_download)"
-                )
-                saved.append(comp)
-            else:
-                comp["will_delete"] = True
-                if reserved is not None and i >= reserved:
+                continue
+
+            # 3) last download
+            if min_days is not None and last_download:
+                days_since_dl = (now_utc - last_download).days
+                if days_since_dl <= int(min_days):
+                    comp["will_delete"] = False
                     comp["delete_reason"] = (
-                        f"удаляется: не попал в reserved ({reserved})"
+                        f"недавно скачивали ({days_since_dl} дн. ≤ {int(min_days)} дн., правило '{pattern}', {name})"
                     )
-                elif retention is not None and age_days > retention.days:
-                    comp["delete_reason"] = (
-                        f"удаляется: возраст {age_days} дн. > {retention.days} дн. (retention_days)"
-                    )
-                elif (
-                    last_download
-                    and min_days is not None
-                    and (now_utc - last_download).days > min_days
-                ):
-                    comp["delete_reason"] = (
-                        f"удаляется: давно не скачивали ({(now_utc - last_download).days} дн. > {min_days} дн., min_days_since_last_download)"
+                    saved.append(comp)
+                    continue
+
+            # иначе → удаляем
+            failures = []
+            if reserved is not None:
+                failures.append(f"позиция {i + 1} > reserved {reserved}")
+            if limit is not None:
+                failures.append(f"возраст {age_days} дн. > retention {limit} дн.")
+            if min_days is not None:
+                if last_download:
+                    failures.append(
+                        f"последнее скачивание {(now_utc - last_download).days} дн. > min_days {int(min_days)} дн."
                     )
                 else:
-                    comp["delete_reason"] = "удаляется: не соответствует правилам regex"
-                to_delete.append(comp)
+                    failures.append(
+                        f"нет данных о скачивании (требуется min_days={int(min_days)} дн.)"
+                    )
+
+            reason = (
+                f"удаляется по правилу '{pattern}' ({name}): " + "; ".join(failures)
+                if failures
+                else f"не соответствует правилу '{pattern}' → удаляем"
+            )
+            comp["will_delete"] = True
+            comp["delete_reason"] = reason
+            to_delete.append(comp)
 
     # ===== Шаг 4: Логирование =====
     for comp in saved:
