@@ -134,18 +134,18 @@ def get_gitlab_file_content(
     gitlab_url: str = None,
     gitlab_token: str = None,
     gl: gitlab.Gitlab = None,
-    project_path: str = "sre-platfom-support/nexus-15562",
+    project_id: int = 2611,
     file_path: str = None,
     branch: str = "master",
 ) -> str:
     """
-    Универсальная функция для получения содержимого файла из GitLab
+    Универсальная функция для получения содержимого файла из GitLab через ID проекта
 
     Args:
         gitlab_url: URL GitLab (если не передан gl)
         gitlab_token: Токен GitLab (если не передан gl)
         gl: Существующее подключение к GitLab
-        project_path: Путь к проекту (namespace/project)
+        project_id: ID проекта в GitLab
         file_path: Путь к файлу в репозитории
         branch: Ветка для получения файла
 
@@ -156,26 +156,31 @@ def get_gitlab_file_content(
         logging.error("❌ Не указан путь к файлу")
         return ""
 
+    if not project_id:
+        logging.error("❌ Не указан ID проекта")
+        return ""
+
     try:
         # Используем существующее подключение или создаем новое
         if gl is None:
             if not gitlab_url or not gitlab_token:
                 logging.error("❌ Не указаны URL или токен GitLab")
                 return ""
-            gl = get_gitlab_connection(gitlab_url, gitlab_token)
+            gl = gitlab.Gitlab(gitlab_url, private_token=gitlab_token)
 
-        # Получаем проект и файл
-        project = gl.projects.get(project_path)
-        file_content = (
-            project.files.get(file_path=file_path, ref=branch).decode().decode("utf-8")
-        )
+        # Получаем проект по ID
+        project = gl.projects.get(project_id)
 
-        logging.info(f"✅ Получен файл {file_path} из проекта {project_path}")
+        # Получаем файл
+        file_data = project.files.get(file_path=file_path, ref=branch)
+        file_content = file_data.decode().decode("utf-8")
+
+        logging.info(f"✅ Получен файл {file_path} из проекта ID={project_id}")
         return file_content
 
     except gitlab.exceptions.GitlabGetError as e:
         if e.response_code == 404:
-            logging.error(f"❌ Файл {file_path} не найден в проекте {project_path}")
+            logging.error(f"❌ Файл {file_path} не найден в проекте ID={project_id}")
         else:
             logging.error(f"❌ Ошибка доступа к файлу {file_path}: {str(e)}")
         return ""
