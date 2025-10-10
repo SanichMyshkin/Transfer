@@ -82,20 +82,6 @@ def scan_project_for_policies(
     return result
 
 
-import gitlab
-import yaml
-import base64
-from io import StringIO
-from typing import Dict
-from common.logs import logging
-
-
-def get_gitlab_connection(gitlab_url: str, gitlab_token: str) -> gitlab.Gitlab:
-    """Создание подключения к GitLab"""
-    gl = gitlab.Gitlab(gitlab_url, private_token=gitlab_token, ssl_verify=False)
-    gl.auth()
-    return gl
-
 
 def get_external_policies(
     gitlab_url: str,
