@@ -87,7 +87,7 @@ def get_external_policies(
     gitlab_url: str,
     gitlab_token: str,
     gitlab_branch: str,
-    group_id: int,
+    group_id: int = 3514,
     target_path: str = "nexus/cleaner",
 ) -> Dict[str, str]:
     """
