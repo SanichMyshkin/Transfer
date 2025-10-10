@@ -2,6 +2,7 @@ import gitlab
 import yaml
 from common.logs import logging
 import urllib3
+import base64
 from io import StringIO
 from typing import Dict
 
@@ -82,7 +83,6 @@ def scan_project_for_policies(
     return result
 
 
-
 def get_external_policies(
     gitlab_url: str,
     gitlab_token: str,
@@ -93,6 +93,9 @@ def get_external_policies(
     """
     Получает политики из всех проектов группы GitLab.
     Ищет YAML-файлы в пути nexus/cleaner, извлекает repo_names.
+
+    Возвращает:
+        { repo_name: ссылка_на_файл }
     """
     logging.info(f"🔗 Подключение к GitLab: {gitlab_url}")
     result = {}
@@ -109,25 +112,36 @@ def get_external_policies(
                 project = gl.projects.get(project_info.id)
                 logging.debug(f"🔍 Сканирование проекта: {project.path_with_namespace}")
 
-                # Получаем список файлов
-                items = project.repository_tree(path=target_path, recursive=True, ref=gitlab_branch)
+                # Получаем список файлов в target_path
+                items = project.repository_tree(
+                    path=target_path, recursive=True, ref=gitlab_branch
+                )
                 yaml_files = [
-                    item for item in items
-                    if item["type"] == "blob" and item["name"].endswith((".yml", ".yaml"))
+                    item
+                    for item in items
+                    if item["type"] == "blob"
+                    and item["name"].endswith((".yml", ".yaml"))
                 ]
 
                 if not yaml_files:
                     continue
 
-                logging.info(f"📁 Проект {project.path_with_namespace}: найдено {len(yaml_files)} YAML файлов")
+                logging.info(
+                    f"📁 Проект {project.path_with_namespace}: найдено {len(yaml_files)} YAML файлов"
+                )
 
                 for file_info in yaml_files:
                     file_path = file_info["path"]
                     try:
-                        file_obj = project.files.get(file_path=file_path, ref=gitlab_branch)
-                        file_content = base64.b64decode(file_obj.content).decode("utf-8")
-                        data = yaml.safe_load(StringIO(file_content))
+                        file_obj = project.files.get(
+                            file_path=file_path, ref=gitlab_branch
+                        )
+                        # ✅ base64-декодирование содержимого
+                        file_content = base64.b64decode(file_obj.content).decode(
+                            "utf-8"
+                        )
 
+                        data = yaml.safe_load(StringIO(file_content))
                         if not isinstance(data, dict) or "repo_names" not in data:
                             continue
 
@@ -135,15 +149,21 @@ def get_external_policies(
 
                         for repo_name in data["repo_names"]:
                             if repo_name in result:
-                                logging.warning(f"⚠️ Повтор: '{repo_name}' уже был добавлен. Файл: {file_link}")
+                                logging.warning(
+                                    f"⚠️ Повтор: '{repo_name}' уже был добавлен. Файл: {file_link}"
+                                )
                             else:
                                 result[repo_name] = file_link
 
                     except Exception as e:
-                        logging.error(f"❌ Ошибка чтения файла {file_path} в проекте {project.path_with_namespace}: {str(e)}")
+                        logging.error(
+                            f"❌ Ошибка чтения файла {file_path} в проекте {project.path_with_namespace}: {str(e)}"
+                        )
 
             except Exception as e:
-                logging.error(f"❌ Ошибка при обработке проекта {project_info.name}: {str(e)}")
+                logging.error(
+                    f"❌ Ошибка при обработке проекта {project_info.name}: {str(e)}"
+                )
 
         logging.info(f"✅ Завершено. Собрано политик: {len(result)}")
         return result
@@ -151,7 +171,6 @@ def get_external_policies(
     except Exception as e:
         logging.error(f"⛔ Критическая ошибка при получении политик: {str(e)}")
         return {}
-
 
 
 # def get_external_policies(
