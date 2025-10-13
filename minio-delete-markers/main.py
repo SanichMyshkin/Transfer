@@ -44,7 +44,9 @@ DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
 
 
 if MINIO_ENDPOINT is None or ACCESS_KEY is None or SECRET_KEY is None:
-    logging.error(f"💥 MINIO_ENDPOINT, ACCESS_KEY, SECRET_KEY must be set\n{100 * '='}")
+    logging.error(
+        f"💥 MINIO_ENDPOINT, ACCESS_KEY, SECRET_KEY must be set {100 * '='}\n"
+    )
     exit(1)
 
 
@@ -57,15 +59,14 @@ client = Minio(
 
 
 def check_and_fix_lifecycle(bucket_name: str):
-    """Добавляет правило: удалить delete markers и noncurrent версии через 1 день."""
-    if PREFIX:
-        if not bucket_name.startswith(PREFIX):
-            logging.info(
-                f"⏭ Пропускаем бакет {bucket_name} — не соответствует префиксу {PREFIX}"
-            )
-            return
-        else:
-            logging.info(f"🔍 Обрабатываем бакет {bucket_name} с префиксом {PREFIX}")
+    """Добавляет правило для delete markers и/или noncurrent версий, если их нет."""
+    if PREFIX and not bucket_name.startswith(PREFIX):
+        logging.info(
+            f"⏭ Пропускаем бакет {bucket_name} — не соответствует префиксу {PREFIX}"
+        )
+        return
+    logging.info(f"🔍 Обрабатываем бакет {bucket_name}")
+
     try:
         policy = client.get_bucket_lifecycle(bucket_name)
     except S3Error as e:
@@ -75,7 +76,7 @@ def check_and_fix_lifecycle(bucket_name: str):
             logging.error(f"❌ Ошибка при получении lifecycle для {bucket_name}: {e}")
             return
 
-    # корректно обрабатываем разные форматы возврата
+    # корректно обрабатываем разные форматы
     if not policy:
         lifecycle = LifecycleConfig([])
     elif isinstance(policy, LifecycleConfig):
@@ -83,33 +84,43 @@ def check_and_fix_lifecycle(bucket_name: str):
     else:
         lifecycle = LifecycleConfig.fromxml(policy.decode("utf-8"))
 
-    found = any(
-        (
-            getattr(rule.expiration, "expired_object_delete_marker", False)
-            and getattr(rule.noncurrent_version_expiration, "noncurrent_days", None)
-            == 1
-        )
+    # проверяем, есть ли уже правила
+    has_delete_marker_rule = any(
+        getattr(rule.expiration, "expired_object_delete_marker", False)
+        for rule in lifecycle.rules
+        if rule.status == ENABLED
+    )
+    has_noncurrent_rule = any(
+        getattr(rule.noncurrent_version_expiration, "noncurrent_days", None) == 1
         for rule in lifecycle.rules
         if rule.status == ENABLED
     )
 
-    if found:
-        logging.info(f"ℹ️ {bucket_name}: нужное правило уже существует")
+    if has_delete_marker_rule and has_noncurrent_rule:
+        logging.info(f"ℹ️ {bucket_name}: нужные правила уже существуют")
         return
 
-    logging.warning(f"⚠️ {bucket_name}: lifecycle правило отсутствует")
+    logging.warning(f"⚠️ {bucket_name}: lifecycle правило отсутствует или неполное")
 
     if DRY_RUN:
         logging.info(f"🧪 [DRY RUN] Добавил бы lifecycle правило для {bucket_name}")
         return
 
-    logging.info(f"🔧 Добавляю lifecycle правило для {bucket_name}")
+    logging.info(f"🔧 Добавляю missing правила для {bucket_name}")
 
-    expiration = Expiration(days=0, expired_object_delete_marker=True)
-    noncurrent_exp = NoncurrentVersionExpiration(noncurrent_days=1)
+    # создаём rule только с отсутствующими параметрами
+    expiration = (
+        Expiration(days=0, expired_object_delete_marker=True)
+        if not has_delete_marker_rule
+        else None
+    )
+    noncurrent_exp = (
+        NoncurrentVersionExpiration(noncurrent_days=1)
+        if not has_noncurrent_rule
+        else None
+    )
 
     rule = Rule(
-        # rule_id="auto-delete-markers-and-old-versions",
         status=ENABLED,
         expiration=expiration,
         noncurrent_version_expiration=noncurrent_exp,
@@ -117,7 +128,7 @@ def check_and_fix_lifecycle(bucket_name: str):
 
     lifecycle.rules.append(rule)
     client.set_bucket_lifecycle(bucket_name, lifecycle)
-    logging.info(f"✅ Lifecycle правило добавлено в {bucket_name}")
+    logging.info(f"✅ Lifecycle правило обновлено в {bucket_name}")
 
 
 def main():
@@ -133,4 +144,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-    logging.info(f"🧾 Обработка завершена \n{100 * '='}")
+    logging.info(f"🧾 Обработка завершена {100 * '='}\n")
