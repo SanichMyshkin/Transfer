@@ -13,7 +13,7 @@ services:
       - minio-net
 
   nexus:
-    image: sonatype/nexus3:3.82.0
+    image: sonatype/nexus3:3.83.2
     restart: unless-stopped
     container_name: nexus
     volumes:
