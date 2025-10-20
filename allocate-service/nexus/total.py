@@ -20,39 +20,115 @@ def load_logs(filename):
         records = [parse_log_line(line.strip()) for line in f if line.strip()]
     df = pd.DataFrame([r for r in records if r])
     if df.empty:
-        raise SystemExit(f"Файл {filename} пуст или не содержит корректных JSON-записей.")
+        raise SystemExit(
+            f"Файл {filename} пуст или не содержит корректных JSON-записей."
+        )
     return df
 
 
+# === 1. Чтение и подготовка ===
 df = load_logs("trash/nexus.jsonl")
 
-df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
+# Чёткий формат времени: 2025-10-15 08:19:56,769+0000
+df["timestamp"] = pd.to_datetime(
+    df["timestamp"], format="%Y-%m-%d %H:%M:%S,%f%z", errors="coerce"
+)
 df = df.dropna(subset=["timestamp"])
 
-df[["username", "ip"]] = df["initiator"].astype(str).str.extract(r"^(?:(.+?)/)?(\d+\.\d+\.\d+\.\d+)$")
+df[["username", "ip"]] = (
+    df["initiator"].astype(str).str.extract(r"^(?:(.+?)/)?(\d+\.\d+\.\d+\.\d+)$")
+)
 df["username"] = df["username"].fillna("anonymous")
 df = df[~df["username"].str.contains(r"\*TASK", na=False)]
 
 df = df.sort_values(by=["initiator", "repo", "timestamp"])
-max_interval = timedelta(seconds=300)
+
+# === 2. Формирование первичных обращений ===
+max_interval = timedelta(minutes=5)
 df["gap"] = (
-    (df["initiator"] != df["initiator"].shift()) |
-    (df["repo"] != df["repo"].shift()) |
-    ((df["timestamp"] - df["timestamp"].shift()) > max_interval)
+    (df["initiator"] != df["initiator"].shift())
+    | (df["repo"] != df["repo"].shift())
+    | ((df["timestamp"] - df["timestamp"].shift()) > max_interval)
 )
 df["session_id"] = df["gap"].cumsum()
 
 sessions = (
     df.groupby(["initiator", "repo", "session_id"])
-      .agg(
-          start_time=("timestamp", "min"),
-          end_time=("timestamp", "max"),
-          username=("username", "first"),
-          ip=("ip", "first"),
-      )
-      .reset_index()
+    .agg(
+        start_time=("timestamp", "min"),
+        end_time=("timestamp", "max"),
+        username=("username", "first"),
+        ip=("ip", "first"),
+    )
+    .reset_index()
 )
 
+# === 3. Объединение коротких подряд сессий ===
+sessions = sessions.sort_values(by=["initiator", "repo", "start_time"])
+merge_gap = timedelta(minutes=1)
+sessions["merge_gap"] = (
+    (sessions["initiator"] != sessions["initiator"].shift())
+    | (sessions["repo"] != sessions["repo"].shift())
+    | ((sessions["start_time"] - sessions["end_time"].shift()) > merge_gap)
+)
+sessions["merged_session_id"] = sessions["merge_gap"].cumsum()
+
+sessions = (
+    sessions.groupby(["initiator", "repo", "merged_session_id"])
+    .agg(
+        start_time=("start_time", "min"),
+        end_time=("end_time", "max"),
+        username=("username", "first"),
+        ip=("ip", "first"),
+    )
+    .reset_index()
+)
+
+# === 4. Идентификатор пользователя (username или IP для анонимов) ===
+sessions["user_identity"] = sessions.apply(
+    lambda r: (
+        r["username"] if r["username"] not in {"anonymous", "*UNKNOWN"} else r["ip"]
+    ),
+    axis=1,
+)
+
+# === 5. Сводка по репозиториям ===
+repo_stats = (
+    sessions.groupby("repo")
+    .agg(
+        total_requests=("merged_session_id", "count"),
+        total_users=("user_identity", pd.Series.nunique),
+    )
+    .reset_index()
+)
+
+
+# === 6. Пользователи по каждому репозиторию с IP ===
+def combine_users_with_ips(group):
+    mapping = {}
+    for _, row in group.iterrows():
+        u = row["username"]
+        ip = row["ip"]
+        if pd.isna(ip) and u in {"anonymous", "*UNKNOWN"}:
+            continue
+        if u in {"anonymous", "*UNKNOWN"}:
+            mapping[ip] = None  # просто IP
+        else:
+            mapping[u] = ip  # username (ip)
+    parts = []
+    for user, ip in sorted([(u, i) for u, i in mapping.items() if u is not None]):
+        if ip:
+            parts.append(f"{user} ({ip})")
+        else:
+            parts.append(user)
+    return ", ".join(parts)
+
+
+repo_users = (
+    sessions.groupby("repo").apply(combine_users_with_ips).reset_index(name="users")
+)
+
+# === 7. Пользователи и IP ===
 user_ips = (
     sessions.groupby("username")["ip"]
     .apply(lambda x: sorted([ip for ip in set(x) if pd.notna(ip)]))
@@ -60,28 +136,29 @@ user_ips = (
     .rename(columns={"ip": "ip_list"})
 )
 
-repo_stats = (
-    sessions.groupby("repo")
-    .agg(
-        total_requests=("session_id", "count"),
-        total_users=("username", pd.Series.nunique),
-    )
-    .reset_index()
-)
-
 anon_names = {"anonymous", "*UNKNOWN"}
 users_normal = user_ips[~user_ips["username"].isin(anon_names)]
 users_anonymous = user_ips[user_ips["username"].isin(anon_names)]
 
+# === 8. Вывод ===
 print("=== Сводка по репозиториям ===")
 if repo_stats.empty:
     print("Нет данных по репозиториям.")
 else:
     print(repo_stats.to_string(index=False))
 
+print("\n=== Пользователи по каждому репозиторию ===")
+if repo_users.empty:
+    print("Нет данных по репозиториям и пользователям.")
+else:
+    for _, row in repo_users.iterrows():
+        print(f"{row['repo']}:\n  {row['users']}")
+
 print("\n=== Уникальные пользователи ===")
 print(f"Обычных пользователей: {len(users_normal)}")
-print(f"Анонимных (уникальных IP): {sum(len(ips) for ips in users_anonymous['ip_list'])}")
+print(
+    f"Анонимных (уникальных IP): {sum(len(ips) for ips in users_anonymous['ip_list'])}"
+)
 
 print("\n=== Список обычных пользователей и их IP ===")
 if users_normal.empty:
