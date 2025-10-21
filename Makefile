@@ -4,6 +4,10 @@ full:
 lite:
 	docker compose -f docker-compose.yml up -d
 
+gray:
+	docker compose -f docker-compose.gray.yml up -d
+
 down:
-	docker compose -f docker-compose.yml -f docker-compose.override.yml down
+	docker compose -f docker-compose.yml -f docker-compose.override.yml -f docker-compose.gray.yml down
+
 

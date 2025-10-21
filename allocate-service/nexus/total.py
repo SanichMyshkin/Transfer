@@ -25,12 +25,17 @@ merge_gap : timedelta
 
 Итог:
 ------
-На выходе формируется список обращений (sessions) с указанием
-времени начала и конца, пользователя, IP и репозитория.
+На выходе формируется Excel-файл с несколькими таблицами:
+- Сводка по репозиториям
+- Пользователи по каждому репозиторию
+- Обычные пользователи (логины + IP)
+- Анонимные пользователи (IP)
 """
 
 
+# === Функции ===
 def parse_log_line(line: str):
+    """Безопасный парсинг одной строки JSONL"""
     try:
         d = json.loads(line)
         return {
@@ -43,6 +48,7 @@ def parse_log_line(line: str):
 
 
 def load_logs(filename):
+    """Загрузка JSONL файла и преобразование в DataFrame"""
     with open(filename, "r", encoding="utf-8") as f:
         records = [parse_log_line(line.strip()) for line in f if line.strip()]
     df = pd.DataFrame([r for r in records if r])
@@ -56,7 +62,6 @@ def load_logs(filename):
 # === 1. Чтение и подготовка ===
 df = load_logs("trash/nexus.jsonl")
 
-# Чёткий формат времени: 2025-10-15 08:19:56,769+0000
 df["timestamp"] = pd.to_datetime(
     df["timestamp"], format="%Y-%m-%d %H:%M:%S,%f%z", errors="coerce"
 )
@@ -111,7 +116,7 @@ sessions = (
     .reset_index()
 )
 
-# === 4. Идентификатор пользователя (username или IP для анонимов) ===
+# === 4. Идентификатор пользователя ===
 sessions["user_identity"] = sessions.apply(
     lambda r: (
         r["username"] if r["username"] not in {"anonymous", "*UNKNOWN"} else r["ip"]
@@ -129,8 +134,7 @@ repo_stats = (
     .reset_index()
 )
 
-
-# === 6. Пользователи по каждому репозиторию с IP ===
+# === 6. Пользователи по каждому репозиторию ===
 def combine_users_with_ips(group):
     mapping = {}
     for _, row in group.iterrows():
@@ -139,9 +143,9 @@ def combine_users_with_ips(group):
         if pd.isna(ip) and u in {"anonymous", "*UNKNOWN"}:
             continue
         if u in {"anonymous", "*UNKNOWN"}:
-            mapping[ip] = None  # просто IP
+            mapping[ip] = None
         else:
-            mapping[u] = ip  # username (ip)
+            mapping[u] = ip
     parts = []
     for user, ip in sorted([(u, i) for u, i in mapping.items() if u is not None]):
         if ip:
@@ -152,7 +156,9 @@ def combine_users_with_ips(group):
 
 
 repo_users = (
-    sessions.groupby("repo").apply(combine_users_with_ips).reset_index(name="users")
+    sessions.groupby("repo", group_keys=False)[["username", "ip"]]
+    .apply(combine_users_with_ips)
+    .reset_index(name="users")
 )
 
 # === 7. Пользователи и IP ===
@@ -167,37 +173,80 @@ anon_names = {"anonymous", "*UNKNOWN"}
 users_normal = user_ips[~user_ips["username"].isin(anon_names)]
 users_anonymous = user_ips[user_ips["username"].isin(anon_names)]
 
-# === 8. Вывод ===
-print("=== Сводка по репозиториям ===")
-if repo_stats.empty:
-    print("Нет данных по репозиториям.")
-else:
-    print(repo_stats.to_string(index=False))
+# Преобразуем анонимов: по одному IP на строку
+anon_rows = []
+for _, row in users_anonymous.iterrows():
+    for ip in row["ip_list"]:
+        anon_rows.append({"username": row["username"], "ip": ip})
+users_anonymous_flat = pd.DataFrame(anon_rows)
 
-print("\n=== Пользователи по каждому репозиторию ===")
-if repo_users.empty:
-    print("Нет данных по репозиториям и пользователям.")
-else:
-    for _, row in repo_users.iterrows():
-        print(f"{row['repo']}:\n  {row['users']}")
+# === Убираем временную зону (Excel не поддерживает tz-aware) ===
+for col in ["start_time", "end_time"]:
+    if isinstance(sessions[col].dtype, pd.DatetimeTZDtype):
+        sessions[col] = sessions[col].dt.tz_localize(None)
 
-print("\n=== Уникальные пользователи ===")
-print(f"Обычных пользователей: {len(users_normal)}")
-print(
-    f"Анонимных (уникальных IP): {sum(len(ips) for ips in users_anonymous['ip_list'])}"
-)
+# === 8. Формирование Excel ===
+output_file = "nexus_report.xlsx"
 
-print("\n=== Список обычных пользователей и их IP ===")
-if users_normal.empty:
-    print("Нет зарегистрированных пользователей.")
-else:
-    for _, row in users_normal.sort_values("username").iterrows():
-        print(f"{row['username']} ({', '.join(row['ip_list'])})")
+def prepend_instruction(df, text_lines):
+    """Добавляет строки-инструкции перед таблицей, без смещения столбцов"""
+    blank_row = {col: None for col in df.columns}
+    instruction_rows = []
+    for line in text_lines:
+        row = blank_row.copy()
+        first_col = list(df.columns)[0]
+        row[first_col] = line
+        instruction_rows.append(row)
+    return pd.concat([pd.DataFrame(instruction_rows), df], ignore_index=True)
 
-print("\n=== Список анонимусов (по одному IP на строку) ===")
-if users_anonymous.empty:
-    print("Нет анонимных обращений.")
-else:
-    for _, row in users_anonymous.iterrows():
-        for ip in row["ip_list"]:
-            print(f"{row['username']} ({ip})")
+
+with pd.ExcelWriter(output_file, engine="xlsxwriter") as writer:
+    # --- 1. Сводка по репозиториям ---
+    text_repo = [
+        "Эта таблица показывает, сколько обращений было к каждому репозиторию.",
+        "Поля: total_requests — количество обращений, total_users — уникальных пользователей.",
+        ""
+    ]
+    df_repo = prepend_instruction(repo_stats, text_repo)
+    df_repo.to_excel(writer, sheet_name="Сводка по репозиториям", index=False)
+
+    # --- 2. Пользователи по каждому репозиторию ---
+    text_repo_users = [
+        "Здесь видно, кто именно обращался к каждому репозиторию.",
+        "Формат: username (ip). Если только IP — пользователь анонимный.",
+        ""
+    ]
+    df_repo_users = prepend_instruction(repo_users, text_repo_users)
+    df_repo_users.to_excel(writer, sheet_name="Пользователи по репозиторию", index=False)
+
+    # --- 3. Обычные пользователи ---
+    text_normal = [
+        "Список зарегистрированных пользователей и IP-адресов, с которых они подключались.",
+        ""
+    ]
+    df_normal = prepend_instruction(users_normal, text_normal)
+    df_normal.to_excel(writer, sheet_name="Обычные пользователи", index=False)
+
+    # --- 4. Анонимные пользователи ---
+    text_anon = [
+        "Анонимные подключения без логина. Каждый IP — отдельная строка.",
+        ""
+    ]
+    df_anon = prepend_instruction(users_anonymous_flat, text_anon)
+    df_anon.to_excel(writer, sheet_name="Анонимные пользователи", index=False)
+
+    # --- Автоматическая подгонка ширины ---
+    all_sheets = {
+        "Сводка по репозиториям": df_repo,
+        "Пользователи по репозиторию": df_repo_users,
+        "Обычные пользователи": df_normal,
+        "Анонимные пользователи": df_anon,
+    }
+
+    for sheet_name, df_tmp in all_sheets.items():
+        worksheet = writer.sheets[sheet_name]
+        for i, col in enumerate(df_tmp.columns):
+            max_len = max(len(str(col)), df_tmp[col].astype(str).map(len).max()) + 2
+            worksheet.set_column(i, i, max_len)
+
+print(f"\n✅ Отчёт успешно сохранён: {output_file}")

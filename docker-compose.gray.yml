@@ -1,0 +1,71 @@
+services:
+  mongodb:
+    image: mongo:6.0
+    container_name: mongodb
+    restart: always
+    volumes:
+      - ./volume/mongodb:/data/db
+    networks:
+      - graylog-net
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.runCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  opensearch:
+    image: opensearchproject/opensearch:2.14.0
+    container_name: opensearch
+    restart: always
+    environment:
+      - discovery.type=single-node
+      - bootstrap.memory_lock=true
+      - "OPENSEARCH_JAVA_OPTS=-Xms256m -Xmx256m"
+      - OPENSEARCH_INITIAL_ADMIN_PASSWORD=S@n1ch!Tech2025
+      - plugins.security.disabled=true
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    volumes:
+      - ./volume/opensearch-data:/usr/share/opensearch/data
+    ports:
+      - "9200:9200"
+    networks:
+      - graylog-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9200"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  graylog:
+    image: graylog/graylog:6.0
+    container_name: graylog
+    restart: always
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+    environment:
+      GRAYLOG_PASSWORD_SECRET: some-long-random-secret
+      GRAYLOG_ROOT_USERNAME: admin
+      GRAYLOG_ROOT_PASSWORD_SHA2: 240be518fabd2724ddb6f04eeb1da5967448d7e831c08c8fa822809f74c720a9
+      GRAYLOG_HTTP_EXTERNAL_URI: http://localhost:9000/
+      GRAYLOG_ELASTICSEARCH_HOSTS: http://opensearch:9200
+      GRAYLOG_MONGODB_URI: mongodb://mongodb:27017/graylog
+      GRAYLOG_SERVER_JAVA_OPTS: "-Xms512m -Xmx512m"
+    ports:
+      - "9000:9000"        # Web UI
+      - "5044:5044"        # Beats input (Filebeat)
+      - "12201:12201/udp"  # GELF UDP
+    volumes:
+      - ./volume/graylog-config:/usr/share/graylog/config
+      - ./volume/graylog-journal:/usr/share/graylog/data/journal
+    networks:
+      - graylog-net
+
+networks:
+  graylog-net:
+    driver: bridge
