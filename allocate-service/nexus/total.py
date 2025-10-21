@@ -35,14 +35,27 @@ merge_gap : timedelta
 
 # === Функции ===
 def parse_log_line(line: str):
-    """Безопасный парсинг одной строки JSONL"""
+    """Безопасный парсинг одной строки JSONL, игнорирует служебные *TASK-записи"""
     try:
         d = json.loads(line)
+
+        initiator = d.get("initiator", "")
+        # Пропускаем системные задания Nexus (*TASK, system, scheduled и т.п.)
+        if isinstance(initiator, str) and "task" in initiator.lower():
+            return None
+        if d.get("domain") == "tasks" or d.get("type") == "scheduled":
+            return None
+
+        repo_name = d.get("attributes", {}).get("repository.name") or d.get(
+            "attributes", {}
+        ).get("repositoryName")
+
         return {
             "timestamp": d.get("timestamp"),
-            "initiator": d.get("initiator", ""),
-            "repo": d.get("attributes", {}).get("repository.name"),
+            "initiator": initiator,
+            "repo": repo_name,
         }
+
     except json.JSONDecodeError:
         return None
 
@@ -134,6 +147,7 @@ repo_stats = (
     .reset_index()
 )
 
+
 # === 6. Пользователи по каждому репозиторию ===
 def combine_users_with_ips(group):
     mapping = {}
@@ -188,6 +202,7 @@ for col in ["start_time", "end_time"]:
 # === 8. Формирование Excel ===
 output_file = "nexus_report.xlsx"
 
+
 def prepend_instruction(df, text_lines):
     """Добавляет строки-инструкции перед таблицей, без смещения столбцов"""
     blank_row = {col: None for col in df.columns}
@@ -205,7 +220,7 @@ with pd.ExcelWriter(output_file, engine="xlsxwriter") as writer:
     text_repo = [
         "Эта таблица показывает, сколько обращений было к каждому репозиторию.",
         "Поля: total_requests — количество обращений, total_users — уникальных пользователей.",
-        ""
+        "",
     ]
     df_repo = prepend_instruction(repo_stats, text_repo)
     df_repo.to_excel(writer, sheet_name="Сводка по репозиториям", index=False)
@@ -214,24 +229,23 @@ with pd.ExcelWriter(output_file, engine="xlsxwriter") as writer:
     text_repo_users = [
         "Здесь видно, кто именно обращался к каждому репозиторию.",
         "Формат: username (ip). Если только IP — пользователь анонимный.",
-        ""
+        "",
     ]
     df_repo_users = prepend_instruction(repo_users, text_repo_users)
-    df_repo_users.to_excel(writer, sheet_name="Пользователи по репозиторию", index=False)
+    df_repo_users.to_excel(
+        writer, sheet_name="Пользователи по репозиторию", index=False
+    )
 
     # --- 3. Обычные пользователи ---
     text_normal = [
         "Список зарегистрированных пользователей и IP-адресов, с которых они подключались.",
-        ""
+        "",
     ]
     df_normal = prepend_instruction(users_normal, text_normal)
     df_normal.to_excel(writer, sheet_name="Обычные пользователи", index=False)
 
     # --- 4. Анонимные пользователи ---
-    text_anon = [
-        "Анонимные подключения без логина. Каждый IP — отдельная строка.",
-        ""
-    ]
+    text_anon = ["Анонимные подключения без логина. Каждый IP — отдельная строка.", ""]
     df_anon = prepend_instruction(users_anonymous_flat, text_anon)
     df_anon.to_excel(writer, sheet_name="Анонимные пользователи", index=False)
 
