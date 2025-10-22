@@ -46,29 +46,47 @@ def vault_request(method: str, path: str):
 # 🔹 1. Алиасы (все пользователи / сервисы)
 # ============================================================
 def get_aliases():
-    data = vault_request("GET", "identity/alias/id")
-    key_info = (data.get("data") or {}).get("key_info", {}) or {}
-    aliases = []
+    """Возвращает всех пользователей/сервисы и статистику по типу логина."""
+    resp = vault_request("LIST", "identity/alias/id")
+    key_info = (resp.get("data") or {}).get("key_info", {})
+    if not key_info:
+        print("⚠️ Alias-ов не найдено (key_info пуст).")
+        return [], []
 
-    for alias_id, info in key_info.items():
+    rows = []
+    stats = {}
+
+    for aid, info in key_info.items():
         meta = info.get("metadata", {}) or {}
-        aliases.append(
+        mount_type = (info.get("mount_type") or "").lower().strip()
+        username = (
+            meta.get("effectiveUsername")
+            or meta.get("service_account_name")
+            or meta.get("name")
+            or info.get("name")
+        )
+
+        rows.append(
             {
-                "alias_id": alias_id,
-                "entity_id": info.get("canonical_id"),
+                "canonical_id": info.get("canonical_id"),
                 "name": info.get("name"),
-                "mount_type": info.get("mount_type"),
-                "mount_path": info.get("mount_path"),
-                "effective_username": meta.get("effectiveUsername")
-                or meta.get("service_account_name")
-                or meta.get("rawUsername")
-                or meta.get("name"),
+                "mount_type": mount_type,
+                "effective_username": username,
                 "namespace": meta.get("service_account_namespace", ""),
             }
         )
 
-    print(f"🔹 Найдено пользователей (aliases): {len(aliases)}")
-    return aliases
+        # статистика по mount_type
+        stats[mount_type] = stats.get(mount_type, 0) + 1
+
+    print(f"🔹 Найдено alias-ов: {len(rows)}")
+    print("📊 Типы аутентификации:")
+    for k, v in stats.items():
+        print(f"   {k:<15} → {v}")
+
+    # Преобразуем статистику в таблицу для Excel
+    stats_rows = [{"auth_type": k, "count": v} for k, v in sorted(stats.items())]
+    return rows, stats_rows
 
 
 # ============================================================
