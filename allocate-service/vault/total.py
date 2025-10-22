@@ -1,11 +1,10 @@
 import os
-import json
 import pandas as pd
 from pathlib import Path
 from dotenv import load_dotenv
 import hvac
 
-# === Загрузка конфигурации ===
+# === Загрузка переменных окружения ===
 load_dotenv()
 
 VAULT_ADDR = os.getenv("VAULT_ADDR")
@@ -21,70 +20,98 @@ if not client.is_authenticated():
 
 print(f"✅ Подключено к Vault: {VAULT_ADDR}")
 
-# === Утилита LIST ===
-def vault_list(path):
+# ============================================================
+# 🔧 Универсальная функция Vault API (только GET и LIST)
+# ============================================================
+def vault_request(method: str, path: str):
+    """Выполняет GET или LIST-запрос к Vault и возвращает JSON."""
+    method = method.upper()
+    if not path.startswith("/v1/"):
+        path = f"/v1/{path.lstrip('/')}"
     try:
-        resp = client.adapter.request("LIST", path)
-        data = resp if isinstance(resp, dict) else resp.json()
-        return (data.get("data") or {}).get("keys", [])
-    except Exception:
-        try:
-            resp = client.adapter.get(path, headers={"X-HTTP-Method-Override": "LIST"})
-            if hasattr(resp, "status_code") and resp.status_code == 404:
-                return []
-            data = resp if isinstance(resp, dict) else resp.json()
-            return (data.get("data") or {}).get("keys", [])
-        except Exception:
-            return []
+        if method == "LIST":
+            resp = client.adapter.request("LIST", path)
+        elif method == "GET":
+            resp = client.adapter.get(path)
+        else:
+            raise ValueError(f"Метод {method} не разрешён (только GET/LIST).")
+        return resp.json() if hasattr(resp, "json") else resp
+    except Exception as e:
+        print(f"⚠️ Ошибка при запросе {method} {path}: {e}")
+        return {}
 
-# === 1️⃣ LDAP группы из Vault ===
-ldap_groups = vault_list("/v1/auth/ldap/groups") or []
-df_groups = pd.DataFrame({"Vault LDAP Groups": ldap_groups})
-print(f"🔹 Найдено LDAP-групп в Vault: {len(ldap_groups)}")
+# ============================================================
+# 🔹 1. LDAP-группы, подключённые к Vault
+# ============================================================
+def get_vault_ldap_groups():
+    auths = vault_request("GET", "sys/auth").get("data", {})
+    ldap_path = next((p for p, meta in auths.items() if meta.get("type") == "ldap"), "auth/ldap/")
+    resp = vault_request("LIST", f"{ldap_path}groups")
+    groups = (resp.get("data") or {}).get("keys", [])
+    print(f"🔹 LDAP-групп в Vault: {len(groups)} ({ldap_path})")
+    return pd.DataFrame({"Vault LDAP Groups": groups}), ldap_path
 
-# === 2️⃣ Получаем accessor всех auth backend'ов ===
-auths = client.sys.list_auth_methods()["data"]
-backend_map = {meta["accessor"]: path for path, meta in auths.items()}
-ldap_accessor = next((a for a, p in backend_map.items() if p == "auth/ldap/"), None)
+# ============================================================
+# 🔸 2. Алиасы пользователей (тип логина, backend)
+# ============================================================
+def get_vault_aliases():
+    alias_ids = (vault_request("LIST", "identity/alias/id").get("data") or {}).get("keys", [])
+    print(f"🔸 Найдено alias ID: {len(alias_ids)}")
 
-# === 3️⃣ Получаем пользователей (entities) ===
-entities = vault_list("/v1/identity/entity/id") or []
-entity_data = []
+    rows = []
+    for aid in alias_ids:
+        data = (vault_request("GET", f"identity/alias/id/{aid}").get("data") or {})
+        meta = data.get("metadata", {}) or {}
+        rows.append({
+            "alias_id": data.get("id"),
+            "name": data.get("name"),
+            "mount_type": data.get("mount_type"),
+            "mount_path": data.get("mount_path"),
+            "entity_id": data.get("canonical_id"),
+            "effective_username": meta.get("effectiveUsername")
+                or meta.get("service_account_name")
+                or meta.get("name"),
+            "namespace": meta.get("service_account_namespace", ""),
+        })
+    df = pd.DataFrame(rows)
+    print(f"✅ Получено алиасов: {len(df)}")
 
-for eid in entities:
-    try:
-        resp = client.adapter.get(f"/v1/identity/entity/id/{eid}")
-        e = resp.json().get("data", {})
-        if not e:
-            continue
+    # Сводка по типам авторизации
+    summary = df["mount_type"].value_counts().reset_index()
+    summary.columns = ["auth_type", "users_count"]
+    return df, summary
 
-        aliases = e.get("aliases", [])
-        for a in aliases:
-            login_backend = backend_map.get(a.get("mount_accessor"), "unknown")
-            entity_data.append({
-                "entity_id": eid,
-                "name": e.get("name"),
-                "email": e.get("metadata", {}).get("email", ""),
-                "login_type": login_backend,
-                "alias_name": a.get("name"),
-                "policies": ", ".join(e.get("policies", [])),
-            })
-    except Exception:
-        continue
+# ============================================================
+# 🔑 3. Подсчёт активных токенов
+# ============================================================
+def get_vault_token_stats():
+    resp = vault_request("LIST", "auth/token/accessors")
+    tokens = (resp.get("data") or {}).get("keys", [])
+    total = len(tokens)
+    print(f"🔑 Активных токенов: {total}")
+    df = pd.DataFrame([{"Active Tokens": total}])
+    return df
 
-df_users = pd.DataFrame(entity_data)
-print(f"🔸 Реальных пользователей Vault: {len(df_users)}")
+# ============================================================
+# 📊 4. Сборка Excel-отчёта
+# ============================================================
+def create_excel_report(df_groups, df_aliases, df_summary, df_tokens):
+    output = Path("vault_usage_report.xlsx")
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        df_groups.to_excel(writer, index=False, sheet_name="Vault LDAP Groups")
+        df_aliases.to_excel(writer, index=False, sheet_name="Vault Users")
+        df_summary.to_excel(writer, index=False, sheet_name="Auth Types Summary")
+        df_tokens.to_excel(writer, index=False, sheet_name="Token Stats")
+    print(f"\n📁 Отчёт готов: {output.resolve()}")
 
-# === 4️⃣ Подсчёт токенов ===
-tokens = vault_list("/v1/auth/token/accessors") or []
-df_tokens = pd.DataFrame([{"Active Tokens": len(tokens)}])
-print(f"🔑 Активных токенов: {len(tokens)}")
+# ============================================================
+# 🚀 Основной запуск
+# ============================================================
+def main():
+    df_groups, ldap_path = get_vault_ldap_groups()
+    df_aliases, df_summary = get_vault_aliases()
+    df_tokens = get_vault_token_stats()
+    create_excel_report(df_groups, df_aliases, df_summary, df_tokens)
 
-# === 5️⃣ Создаём Excel отчёт ===
-output_file = Path("vault_usage_report.xlsx")
-with pd.ExcelWriter(output_file, engine="xlsxwriter") as writer:
-    df_groups.to_excel(writer, index=False, sheet_name="Vault LDAP Groups")
-    df_users.to_excel(writer, index=False, sheet_name="Vault Users")
-    df_tokens.to_excel(writer, index=False, sheet_name="Token Stats")
-
-print(f"\n📊 Отчёт готов: {output_file.resolve()}")
+if __name__ == "__main__":
+    main()
