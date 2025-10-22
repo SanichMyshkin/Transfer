@@ -1,5 +1,4 @@
 import os
-import json
 from pathlib import Path
 from dotenv import load_dotenv
 import hvac
@@ -21,8 +20,9 @@ if not client.is_authenticated():
 
 print(f"✅ Подключено к Vault: {VAULT_ADDR}")
 
+
 # ============================================================
-# 🔧 Универсальная функция (только GET/LIST)
+# 🔧 Универсальная функция Vault API (только GET/LIST)
 # ============================================================
 def vault_request(method: str, path: str):
     """Безопасный read-only запрос к Vault API."""
@@ -41,11 +41,12 @@ def vault_request(method: str, path: str):
         print(f"⚠️ Ошибка при запросе {method} {path}: {e}")
         return {}
 
+
 # ============================================================
-# 🔹 1. Алиасы пользователей (кто и через что заходит)
+# 🔹 1. Алиасы пользователей (все пользователи / сервисы)
 # ============================================================
 def get_aliases():
-    """Возвращает всех пользователей/сервисы и статистику по типам логина."""
+    """Возвращает всех пользователей/сервисы и статистику по типу логина."""
     resp = vault_request("GET", "identity/alias/id")
     key_info = (resp.get("data") or {}).get("key_info", {})
     if not key_info:
@@ -72,7 +73,7 @@ def get_aliases():
             "mount_type": mount_type,
             "mount_path": info.get("mount_path"),
             "effective_username": username,
-            "namespace": meta.get("service_account_namespace", "")
+            "namespace": meta.get("service_account_namespace", ""),
         }
         rows.append(row)
         stats[mount_type] = stats.get(mount_type, 0) + 1
@@ -85,6 +86,7 @@ def get_aliases():
     stats_rows = [{"auth_type": k, "count": v} for k, v in sorted(stats.items())]
     return rows, stats_rows
 
+
 # ============================================================
 # 🔸 2. LDAP-группы
 # ============================================================
@@ -94,8 +96,9 @@ def get_ldap_groups():
     print(f"🔸 LDAP-групп в Vault: {len(groups)}")
     return [{"ldap_group": g} for g in groups]
 
+
 # ============================================================
-# 🗄 3. KV-монты
+# 🗄 3. KV-хранилища
 # ============================================================
 def get_kv_mounts():
     mounts = vault_request("GET", "sys/mounts").get("data", {})
@@ -103,12 +106,10 @@ def get_kv_mounts():
     for mpath, meta in mounts.items():
         if meta.get("type") == "kv" and mpath.endswith("/"):
             v = (meta.get("options", {}) or {}).get("version")
-            result.append({
-                "mount": mpath,
-                "engine": "kv v2" if v == "2" else "kv v1"
-            })
+            result.append({"mount": mpath, "engine": "kv v2" if v == "2" else "kv v1"})
     print(f"🗄 Найдено KV-монтов: {len(result)}")
     return result
+
 
 # ============================================================
 # 🔑 4. Активные токены
@@ -119,6 +120,7 @@ def get_token_stats():
     total = len(tokens)
     print(f"🔑 Активных токенов: {total}")
     return [{"active_tokens": total}]
+
 
 # ============================================================
 # 📊 5. Формирование Excel-отчёта
@@ -133,10 +135,16 @@ def write_excel(filename, aliases, groups, kvs, tokens, alias_stats):
         if not data:
             ws.write(0, 0, "Нет данных")
             return
-        if not isinstance(data[0], dict):
-            ws.write(0, 0, f"Ошибка: ожидались dict, получен {type(data[0])}")
-            ws.write(1, 0, str(data))
+
+        # Безопасная проверка структуры
+        if not isinstance(data, list):
+            ws.write(0, 0, f"Ошибка: ожидался list, получен {type(data)}")
             return
+        if not isinstance(data[0], dict):
+            ws.write(0, 0, f"Ошибка: элементы не dict, а {type(data[0])}")
+            ws.write(1, 0, str(data[0]))
+            return
+
         headers = list(data[0].keys())
         for col, h in enumerate(headers):
             ws.write(0, col, h, bold)
@@ -144,12 +152,14 @@ def write_excel(filename, aliases, groups, kvs, tokens, alias_stats):
             for col, h in enumerate(headers):
                 ws.write(row_idx, col, str(item.get(h, "")))
 
+    # Пишем все листы
     write_sheet("Aliases", aliases)
     write_sheet("Auth Types Summary", alias_stats)
     write_sheet("LDAP Groups", groups)
     write_sheet("KV Mounts", kvs)
     write_sheet("Token Stats", tokens)
 
+    # Сводка
     summary = workbook.add_worksheet("Summary")
     summary.write("A1", "Vault Address", bold)
     summary.write("B1", VAULT_ADDR)
@@ -165,6 +175,7 @@ def write_excel(filename, aliases, groups, kvs, tokens, alias_stats):
     workbook.close()
     print(f"\n📁 Отчёт готов: {out.resolve()}")
 
+
 # ============================================================
 # 🚀 Основной запуск
 # ============================================================
@@ -174,6 +185,7 @@ def main():
     kvs = get_kv_mounts()
     tokens = get_token_stats()
     write_excel("vault_usage_report.xlsx", aliases, groups, kvs, tokens, alias_stats)
+
 
 if __name__ == "__main__":
     main()
