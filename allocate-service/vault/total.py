@@ -66,27 +66,20 @@ def get_aliases():
             or info.get("name")
         )
 
-        rows.append(
-            {
-                "canonical_id": info.get("canonical_id"),
-                "name": info.get("name"),
-                "mount_type": mount_type,
-                "effective_username": username,
-                "namespace": meta.get("service_account_namespace", ""),
-            }
-        )
-
-        # статистика по mount_type
+        row = {
+            "alias_id": aid,
+            "canonical_id": info.get("canonical_id"),
+            "name": info.get("name"),
+            "mount_type": mount_type,
+            "mount_path": info.get("mount_path"),
+            "effective_username": username,
+            "namespace": meta.get("service_account_namespace", ""),
+        }
+        rows.append(row)
         stats[mount_type] = stats.get(mount_type, 0) + 1
 
     print(f"🔹 Найдено alias-ов: {len(rows)}")
-    print("📊 Типы аутентификации:")
-    for k, v in stats.items():
-        print(f"   {k:<15} → {v}")
-
-    # Преобразуем статистику в таблицу для Excel
-    stats_rows = [{"auth_type": k, "count": v} for k, v in sorted(stats.items())]
-    return rows, stats_rows
+    return rows, [{"auth_type": k, "count": v} for k, v in sorted(stats.items())]
 
 
 # ============================================================
