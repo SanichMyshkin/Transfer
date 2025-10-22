@@ -20,6 +20,7 @@ if not client.is_authenticated():
 
 print(f"✅ Подключено к Vault: {VAULT_ADDR}")
 
+
 # ============================================================
 # 🔧 Универсальный read-only запрос
 # ============================================================
@@ -40,14 +41,35 @@ def vault_request(method: str, path: str):
         print(f"⚠️ Ошибка при запросе {method} {path}: {e}")
         return {}
 
+
 # ============================================================
 # 🔹 1. Алиасы (все пользователи / сервисы)
 # ============================================================
 def get_aliases():
-    data = vault_request("LIST", "identity/alias/id")
-    aliases = (data.get("data") or {}).get("keys", [])
-    print(f"🔹 Найдено записей alias: {len(aliases)}")
-    return [{"alias_id": a} for a in aliases]
+    data = vault_request("GET", "identity/alias/id")
+    key_info = (data.get("data") or {}).get("key_info", {}) or {}
+    aliases = []
+
+    for alias_id, info in key_info.items():
+        meta = info.get("metadata", {}) or {}
+        aliases.append(
+            {
+                "alias_id": alias_id,
+                "entity_id": info.get("canonical_id"),
+                "name": info.get("name"),
+                "mount_type": info.get("mount_type"),
+                "mount_path": info.get("mount_path"),
+                "effective_username": meta.get("effectiveUsername")
+                or meta.get("service_account_name")
+                or meta.get("rawUsername")
+                or meta.get("name"),
+                "namespace": meta.get("service_account_namespace", ""),
+            }
+        )
+
+    print(f"🔹 Найдено пользователей (aliases): {len(aliases)}")
+    return aliases
+
 
 # ============================================================
 # 🔸 2. LDAP-группы (команды)
@@ -58,6 +80,7 @@ def get_ldap_groups():
     print(f"🔸 LDAP-групп в Vault: {len(groups)}")
     return [{"ldap_group": g} for g in groups]
 
+
 # ============================================================
 # 🔑 3. KV хранилища
 # ============================================================
@@ -67,12 +90,10 @@ def get_kv_mounts():
     for mpath, meta in mounts.items():
         if meta.get("type") == "kv" and mpath.endswith("/"):
             v = (meta.get("options", {}) or {}).get("version")
-            result.append({
-                "mount": mpath,
-                "engine": "kv v2" if v == "2" else "kv v1"
-            })
+            result.append({"mount": mpath, "engine": "kv v2" if v == "2" else "kv v1"})
     print(f"🗄 Найдено KV-монтов: {len(result)}")
     return result
+
 
 # ============================================================
 # 🔐 4. Активные токены
@@ -83,6 +104,7 @@ def get_token_stats():
     total = len(tokens)
     print(f"🔑 Активных токенов: {total}")
     return [{"active_tokens": total}]
+
 
 # ============================================================
 # 📊 5. Формирование Excel
@@ -125,6 +147,7 @@ def write_excel(filename, aliases, groups, kvs, tokens):
     workbook.close()
     print(f"\n📁 Отчёт готов: {out.resolve()}")
 
+
 # ============================================================
 # 🚀 Основной запуск
 # ============================================================
@@ -134,6 +157,7 @@ def main():
     kvs = get_kv_mounts()
     tokens = get_token_stats()
     write_excel("vault_usage_report.xlsx", aliases, groups, kvs, tokens)
+
 
 if __name__ == "__main__":
     main()
