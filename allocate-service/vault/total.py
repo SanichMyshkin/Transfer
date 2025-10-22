@@ -67,11 +67,11 @@ def get_aliases():
         )
 
         row = {
-            "alias_id": aid,
-            "canonical_id": info.get("canonical_id"),
+
+
             "name": info.get("name"),
             "mount_type": mount_type,
-            "mount_path": info.get("mount_path"),
+
             "effective_username": username,
             "namespace": meta.get("service_account_namespace", ""),
         }
@@ -105,8 +105,7 @@ def get_kv_mounts():
     result = []
     for mpath, meta in mounts.items():
         if meta.get("type") == "kv" and mpath.endswith("/"):
-            v = (meta.get("options", {}) or {}).get("version")
-            result.append({"mount": mpath, "engine": "kv v2" if v == "2" else "kv v1"})
+            result.append({"mount": mpath})
     print(f"🗄 Найдено KV-монтов: {len(result)}")
     return result
 
