@@ -28,21 +28,31 @@ print(f"✅ Подключено к Vault: {VAULT_ADDR}")
 # 🔧 Универсальная функция Vault API (только GET/LIST)
 # ============================================================
 def vault_request(method: str, path: str):
-    """Безопасный read-only запрос к Vault API."""
-    if not path.startswith("/v1/"):
-        path = f"/v1/{path.lstrip('/')}"
+    """Безопасный read-only запрос к Vault API (через hvac.Client)."""
+    if not path.startswith("v1/"):
+        path = f"v1/{path.lstrip('/')}"
+
     method = method.upper()
+
     try:
         if method == "LIST":
-            resp = client.adapter.request("LIST", path)
+            resp = client.list(path)
         elif method == "GET":
-            resp = client.adapter.get(path)
+            resp = client.read(path)
         else:
             raise ValueError(f"Метод {method} не разрешён (только GET/LIST)")
-        return resp.json() if hasattr(resp, "json") else resp
+
+        if not resp:
+            print(f"⚠️ Пустой ответ от Vault на {method} {path}")
+            return {}
+
+        # hvac возвращает dict вида {"data": {...}}, уже готовый к использованию
+        return resp
+
     except Exception as e:
         print(f"⚠️ Ошибка при запросе {method} {path}: {e}")
         return {}
+
 
 
 # ============================================================
