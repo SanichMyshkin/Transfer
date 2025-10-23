@@ -3,6 +3,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 import hvac
 import xlsxwriter
+import requests
 
 
 # === Инициализация ===
@@ -25,11 +26,15 @@ print(f"✅ Подключено к Vault: {VAULT_ADDR}")
 # ============================================================
 # 🔧 Универсальная функция Vault API (только GET/LIST)
 # ============================================================
-def vault_request(method: str, path: str):
-    """Безопасный read-only запрос к Vault API."""
+def vault_request(method: str, path: str, raw: bool = False):
+    """
+    Безопасный read-only запрос к Vault API.
+    Если raw=True — возвращает text (например, для /metrics)
+    """
     if not path.startswith("/v1/"):
         path = f"/v1/{path.lstrip('/')}"
     method = method.upper()
+
     try:
         if method == "LIST":
             resp = client.adapter.request("LIST", path)
@@ -37,10 +42,50 @@ def vault_request(method: str, path: str):
             resp = client.adapter.get(path)
         else:
             raise ValueError(f"Метод {method} не разрешён (только GET/LIST)")
-        return resp.json() if hasattr(resp, "json") else resp
+
+        # если ожидаем "сырой" формат (например, Prometheus metrics)
+        if raw:
+            return resp.text
+
+        # пробуем вернуть JSON
+        try:
+            return resp.json()
+        except Exception:
+            return {"raw": resp.text}
+
     except Exception as e:
         print(f"⚠️ Ошибка при запросе {method} {path}: {e}")
         return {}
+
+
+# ============================================================
+# 🧮  Доп. функция: получить метрики Vault
+# ============================================================
+def get_vault_metrics(format: str = "prometheus", use_api: bool = True, include_token: bool = False):
+    """
+    Возвращает метрики Vault.
+    format: "prometheus" или "json"
+    use_api=True → /v1/sys/metrics
+    use_api=False → /metrics (telemetry endpoint)
+    include_token=True → добавить X-Vault-Token (⚠️ урезает метрики)
+    """
+    session = requests.Session()
+    headers = {}
+    if include_token:
+        headers["X-Vault-Token"] = VAULT_TOKEN
+
+    if use_api:
+        url = f"{VAULT_ADDR}/v1/sys/metrics?format={format}"
+    else:
+        url = f"{VAULT_ADDR}/metrics"
+
+    try:
+        r = session.get(url, headers=headers, verify=CA_CERT, timeout=10)
+        r.raise_for_status()
+        return r.text if format == "prometheus" else r.json()
+    except Exception as e:
+        print(f"⚠️ Ошибка при получении метрик с {url}: {e}")
+        return None
 
 
 # ============================================================
@@ -154,7 +199,6 @@ def get_unique_users(alias_rows):
             continue
         key = normalize_name(eff_name)
 
-        # если нет в словаре — создаем новую запись
         if key not in unique:
             unique[key] = {
                 "unique_user": eff_name,
@@ -163,7 +207,6 @@ def get_unique_users(alias_rows):
                 "namespaces": set(),
             }
         else:
-            # если встретился LDAP, обновляем приоритетное имя
             if r["mount_type"] == "ldap" and not unique[key]["has_ldap"]:
                 unique[key]["unique_user"] = eff_name
                 unique[key]["has_ldap"] = True
@@ -219,7 +262,6 @@ def write_excel(filename, aliases, groups, kvs, tokens, alias_stats, unique_user
                 ws.write(row_idx, col, str(item.get(h, "")))
         ws.set_column(0, len(headers) - 1, 25)
 
-    # Пишем все листы
     write_sheet("Aliases", aliases)
     write_sheet("Unique Users", unique_users)
     write_sheet("Auth Types Summary", alias_stats)
@@ -227,7 +269,6 @@ def write_excel(filename, aliases, groups, kvs, tokens, alias_stats, unique_user
     write_sheet("KV Mounts", kvs)
     write_sheet("Token Stats", tokens)
 
-    # Сводка
     summary = workbook.add_worksheet("Summary")
     summary.write("A1", "Vault Address", bold)
     summary.write("B1", VAULT_ADDR)
@@ -254,8 +295,18 @@ def main():
     groups = get_ldap_groups()
     kvs = get_kv_mounts()
     tokens = get_token_stats()
-
     unique_users = get_unique_users(aliases)
+
+    # пример вызова новой функции — просто показать метрики
+    print("\n📈 Часть метрик Vault (через API):")
+    metrics_api = get_vault_metrics(format="prometheus", use_api=True)
+    if metrics_api:
+        print(metrics_api[:500], "...\n")
+
+    print("📈 Часть метрик Vault (через /metrics):")
+    metrics_direct = get_vault_metrics(format="prometheus", use_api=False)
+    if metrics_direct:
+        print(metrics_direct[:500], "...\n")
 
     write_excel(
         "vault_usage_report.xlsx",
