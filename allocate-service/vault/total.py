@@ -29,8 +29,6 @@ print(f"✅ Подключено к Vault: {VAULT_ADDR}")
 # ============================================================
 def vault_request(method: str, path: str):
     """Безопасный read-only запрос к Vault API (через hvac.Client)."""
-    if not path.startswith("v1/"):
-        path = f"v1/{path.lstrip('/')}"
 
     method = method.upper()
 
@@ -141,7 +139,6 @@ def get_aliases():
         row = {
             "name": name,
             "mount_type": mount_type,
-            "effective_username": effective_username,
             "namespace": meta.get("service_account_namespace", ""),
         }
         rows.append(row)
