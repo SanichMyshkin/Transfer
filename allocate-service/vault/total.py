@@ -44,7 +44,7 @@ def vault_request(method: str, path: str):
 
 
 # ============================================================
-# 🔹 1. Алиасы пользователей (все пользователи / сервисы)
+# 🔹 1. Алиасы пользователей
 # ============================================================
 def get_aliases():
     """Возвращает всех пользователей/сервисы и статистику по типу логина."""
@@ -60,17 +60,23 @@ def get_aliases():
     for aid, info in key_info.items():
         meta = info.get("metadata", {}) or {}
         mount_type = (info.get("mount_type") or "").lower().strip()
-        username = (
+        effective_username = (
             meta.get("effectiveUsername")
             or meta.get("service_account_name")
             or meta.get("name")
             or info.get("name")
         )
 
+        # ✅ Правильная логика формирования поля "name"
+        if mount_type == "kubernetes":
+            name = effective_username
+        else:
+            name = info.get("name")
+
         row = {
-            "name": info.get("name"),
+            "name": name,
             "mount_type": mount_type,
-            "effective_username": username,
+            "effective_username": effective_username,
             "namespace": meta.get("service_account_namespace", ""),
         }
         rows.append(row)
@@ -137,6 +143,7 @@ def get_unique_users(alias_rows):
     """
     Группирует алиасы в уникальных пользователей.
     Исключает типы userpass и approle.
+    Приоритет имени — LDAP.
     """
     filtered = [r for r in alias_rows if r["mount_type"] not in ("userpass", "approle")]
 
@@ -147,12 +154,19 @@ def get_unique_users(alias_rows):
             continue
         key = normalize_name(eff_name)
 
+        # если нет в словаре — создаем новую запись
         if key not in unique:
             unique[key] = {
                 "unique_user": eff_name,
+                "has_ldap": (r["mount_type"] == "ldap"),
                 "all_logins": set(),
                 "namespaces": set(),
             }
+        else:
+            # если встретился LDAP, обновляем приоритетное имя
+            if r["mount_type"] == "ldap" and not unique[key]["has_ldap"]:
+                unique[key]["unique_user"] = eff_name
+                unique[key]["has_ldap"] = True
 
         login_info = f"{r['mount_type']}:{r['name']}"
         unique[key]["all_logins"].add(login_info)
