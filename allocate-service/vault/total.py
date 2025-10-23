@@ -1,4 +1,5 @@
 import os
+import re
 from pathlib import Path
 from dotenv import load_dotenv
 import hvac
@@ -27,10 +28,7 @@ print(f"✅ Подключено к Vault: {VAULT_ADDR}")
 # 🔧 Универсальная функция Vault API (только GET/LIST)
 # ============================================================
 def vault_request(method: str, path: str, raw: bool = False):
-    """
-    Безопасный read-only запрос к Vault API.
-    Если raw=True — возвращает text (например, для /metrics)
-    """
+    """Безопасный read-only запрос к Vault API."""
     if not path.startswith("/v1/"):
         path = f"/v1/{path.lstrip('/')}"
     method = method.upper()
@@ -43,11 +41,9 @@ def vault_request(method: str, path: str, raw: bool = False):
         else:
             raise ValueError(f"Метод {method} не разрешён (только GET/LIST)")
 
-        # если ожидаем "сырой" формат (например, Prometheus metrics)
         if raw:
             return resp.text
 
-        # пробуем вернуть JSON
         try:
             return resp.json()
         except Exception:
@@ -59,16 +55,10 @@ def vault_request(method: str, path: str, raw: bool = False):
 
 
 # ============================================================
-# 🧮  Доп. функция: получить метрики Vault
+# 🧮  Метрики Vault (Prometheus)
 # ============================================================
 def get_vault_metrics(format: str = "prometheus", use_api: bool = True, include_token: bool = False):
-    """
-    Возвращает метрики Vault.
-    format: "prometheus" или "json"
-    use_api=True → /v1/sys/metrics
-    use_api=False → /metrics (telemetry endpoint)
-    include_token=True → добавить X-Vault-Token (⚠️ урезает метрики)
-    """
+    """Возвращает метрики Vault."""
     session = requests.Session()
     headers = {}
     if include_token:
@@ -80,7 +70,7 @@ def get_vault_metrics(format: str = "prometheus", use_api: bool = True, include_
         url = f"{VAULT_ADDR}/metrics"
 
     try:
-        r = session.get(url, headers=headers, verify=CA_CERT, timeout=10)
+        r = session.get(url, headers=headers, verify=CA_CERT, timeout=15)
         r.raise_for_status()
         return r.text if format == "prometheus" else r.json()
     except Exception as e:
@@ -89,10 +79,38 @@ def get_vault_metrics(format: str = "prometheus", use_api: bool = True, include_
 
 
 # ============================================================
-# 🔹 1. Алиасы пользователей
+# 📊 Парсинг метрик vault_secret_kv_count
+# ============================================================
+def parse_kv_metrics(metrics_text: str):
+    """
+    Извлекает mount_point и count из строк формата:
+    vault_secret_kv_count{cluster="...", mount_point="kv-xxx/", namespace="root"} 7
+    """
+    pattern = re.compile(
+        r'vault[_\s]*secret[_\s]*kv[_\s]*count\s*\{[^}]*mount_point="([^"]+)"[^}]*\}\s+(\d+)',
+        re.IGNORECASE,
+    )
+
+    results = []
+    total_count = 0
+
+    for match in pattern.finditer(metrics_text):
+        mount_point = match.group(1)
+        try:
+            count = int(match.group(2))
+        except ValueError:
+            count = 0
+        results.append({"mount_point": mount_point, "count": count})
+        total_count += count
+
+    print(f"📦 Найдено KV-монтов: {len(results)}, всего секретов: {total_count}")
+    return results, total_count
+
+
+# ============================================================
+# 🔹 Алиасы пользователей
 # ============================================================
 def get_aliases():
-    """Возвращает всех пользователей/сервисы и статистику по типу логина."""
     resp = vault_request("LIST", "identity/alias/id")
     key_info = (resp.get("data") or {}).get("key_info", {})
     if not key_info:
@@ -112,7 +130,6 @@ def get_aliases():
             or info.get("name")
         )
 
-        # ✅ Правильная логика формирования поля "name"
         if mount_type == "kubernetes":
             name = effective_username
         else:
@@ -128,16 +145,12 @@ def get_aliases():
         stats[mount_type] = stats.get(mount_type, 0) + 1
 
     print(f"🔹 Найдено alias-ов: {len(rows)}")
-    print("📊 Типы аутентификации:")
-    for k, v in stats.items():
-        print(f"   {k:<15} → {v}")
-
     stats_rows = [{"auth_type": k, "count": v} for k, v in sorted(stats.items())]
     return rows, stats_rows
 
 
 # ============================================================
-# 🔸 2. LDAP-группы
+# 🔸 LDAP-группы
 # ============================================================
 def get_ldap_groups():
     resp = vault_request("LIST", "auth/ldap/groups")
@@ -147,20 +160,7 @@ def get_ldap_groups():
 
 
 # ============================================================
-# 🗄 3. KV-хранилища
-# ============================================================
-def get_kv_mounts():
-    mounts = vault_request("GET", "sys/mounts").get("data", {})
-    result = []
-    for mpath, meta in mounts.items():
-        if meta.get("type") in ("kv", "kv-v2") and mpath.endswith("/"):
-            result.append({"mount": mpath})
-    print(f"🗄 Найдено KV-монтов: {len(result)}")
-    return result
-
-
-# ============================================================
-# 🔑 4. Активные токены
+# 🔑 Активные токены
 # ============================================================
 def get_token_stats():
     resp = vault_request("LIST", "auth/token/accessors")
@@ -171,10 +171,9 @@ def get_token_stats():
 
 
 # ============================================================
-# 👤 5. Уникальные пользователи
+# 👤 Уникальные пользователи
 # ============================================================
 def normalize_name(name: str) -> str:
-    """Простая нормализация имени: без домена, точек и в нижнем регистре."""
     if not name:
         return ""
     name = name.strip().lower()
@@ -185,11 +184,6 @@ def normalize_name(name: str) -> str:
 
 
 def get_unique_users(alias_rows):
-    """
-    Группирует алиасы в уникальных пользователей.
-    Исключает типы userpass и approle.
-    Приоритет имени — LDAP.
-    """
     filtered = [r for r in alias_rows if r["mount_type"] not in ("userpass", "approle")]
 
     unique = {}
@@ -222,9 +216,7 @@ def get_unique_users(alias_rows):
             {
                 "unique_user": u["unique_user"],
                 "all_logins": ", ".join(sorted(u["all_logins"])),
-                "namespaces": ", ".join(sorted(u["namespaces"]))
-                if u["namespaces"]
-                else "",
+                "namespaces": ", ".join(sorted(u["namespaces"])) if u["namespaces"] else "",
             }
         )
 
@@ -233,9 +225,9 @@ def get_unique_users(alias_rows):
 
 
 # ============================================================
-# 📊 6. Формирование Excel-отчёта
+# 📊 Формирование Excel-отчёта
 # ============================================================
-def write_excel(filename, aliases, groups, kvs, tokens, alias_stats, unique_users):
+def write_excel(filename, aliases, groups, tokens, alias_stats, unique_users, kv_stats, kv_total):
     out = Path(filename)
     workbook = xlsxwriter.Workbook(out)
     bold = workbook.add_format({"bold": True, "bg_color": "#F0F0F0"})
@@ -246,28 +238,20 @@ def write_excel(filename, aliases, groups, kvs, tokens, alias_stats, unique_user
             ws.write(0, 0, "Нет данных")
             return
 
-        if not isinstance(data, list):
-            ws.write(0, 0, f"Ошибка: ожидался list, получен {type(data)}")
-            return
-        if not isinstance(data[0], dict):
-            ws.write(0, 0, f"Ошибка: элементы не dict, а {type(data[0])}")
-            ws.write(1, 0, str(data[0]))
-            return
-
         headers = list(data[0].keys())
         for col, h in enumerate(headers):
             ws.write(0, col, h, bold)
         for row_idx, item in enumerate(data, start=1):
             for col, h in enumerate(headers):
                 ws.write(row_idx, col, str(item.get(h, "")))
-        ws.set_column(0, len(headers) - 1, 25)
+        ws.set_column(0, len(headers) - 1, 30)
 
     write_sheet("Aliases", aliases)
     write_sheet("Unique Users", unique_users)
     write_sheet("Auth Types Summary", alias_stats)
     write_sheet("LDAP Groups", groups)
-    write_sheet("KV Mounts", kvs)
     write_sheet("Token Stats", tokens)
+    write_sheet("KV Mounts", kv_stats)
 
     summary = workbook.add_worksheet("Summary")
     summary.write("A1", "Vault Address", bold)
@@ -278,10 +262,12 @@ def write_excel(filename, aliases, groups, kvs, tokens, alias_stats, unique_user
     summary.write("B3", len(unique_users))
     summary.write("A4", "LDAP групп")
     summary.write("B4", len(groups))
-    summary.write("A5", "KV Mounts")
-    summary.write("B5", len(kvs))
-    summary.write("A6", "Активных токенов")
-    summary.write("B6", tokens[0]["active_tokens"] if tokens else 0)
+    summary.write("A5", "Активных токенов")
+    summary.write("B5", tokens[0]["active_tokens"] if tokens else 0)
+    summary.write("A6", "KV mount points")
+    summary.write("B6", len(kv_stats))
+    summary.write("A7", "Секретов всего")
+    summary.write("B7", kv_total)
 
     workbook.close()
     print(f"\n📁 Отчёт готов: {out.resolve()}")
@@ -293,29 +279,24 @@ def write_excel(filename, aliases, groups, kvs, tokens, alias_stats, unique_user
 def main():
     aliases, alias_stats = get_aliases()
     groups = get_ldap_groups()
-    kvs = get_kv_mounts()
     tokens = get_token_stats()
     unique_users = get_unique_users(aliases)
 
-    # пример вызова новой функции — просто показать метрики
-    print("\n📈 Часть метрик Vault (через API):")
-    metrics_api = get_vault_metrics(format="prometheus", use_api=True)
-    if metrics_api:
-        print(metrics_api[:500], "...\n")
-
-    print("📈 Часть метрик Vault (через /metrics):")
-    metrics_direct = get_vault_metrics(format="prometheus", use_api=False)
-    if metrics_direct:
-        print(metrics_direct[:500], "...\n")
+    print("\n📈 Получаем метрики Vault...")
+    metrics_text = get_vault_metrics(format="prometheus", use_api=True)
+    kv_stats, kv_total = ([], 0)
+    if metrics_text:
+        kv_stats, kv_total = parse_kv_metrics(metrics_text)
 
     write_excel(
         "vault_usage_report.xlsx",
         aliases,
         groups,
-        kvs,
         tokens,
         alias_stats,
         unique_users,
+        kv_stats,
+        kv_total,
     )
 
 
