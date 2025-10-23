@@ -27,12 +27,11 @@ print(f"✅ Подключено к Vault: {VAULT_ADDR}")
 # ============================================================
 # 🔧 Универсальная функция Vault API (только GET/LIST)
 # ============================================================
-def vault_request(method: str, path: str, raw: bool = False):
+def vault_request(method: str, path: str):
     """Безопасный read-only запрос к Vault API."""
     if not path.startswith("/v1/"):
         path = f"/v1/{path.lstrip('/')}"
     method = method.upper()
-
     try:
         if method == "LIST":
             resp = client.adapter.request("LIST", path)
@@ -40,15 +39,7 @@ def vault_request(method: str, path: str, raw: bool = False):
             resp = client.adapter.get(path)
         else:
             raise ValueError(f"Метод {method} не разрешён (только GET/LIST)")
-
-        if raw:
-            return resp.text
-
-        try:
-            return resp.json()
-        except Exception:
-            return {"raw": resp.text}
-
+        return resp.json() if hasattr(resp, "json") else resp
     except Exception as e:
         print(f"⚠️ Ошибка при запросе {method} {path}: {e}")
         return {}
@@ -57,7 +48,9 @@ def vault_request(method: str, path: str, raw: bool = False):
 # ============================================================
 # 🧮  Метрики Vault (Prometheus)
 # ============================================================
-def get_vault_metrics(format: str = "prometheus", use_api: bool = True, include_token: bool = False):
+def get_vault_metrics(
+    format: str = "prometheus", use_api: bool = True, include_token: bool = False
+):
     """Возвращает метрики Vault."""
     session = requests.Session()
     headers = {}
@@ -216,7 +209,9 @@ def get_unique_users(alias_rows):
             {
                 "unique_user": u["unique_user"],
                 "all_logins": ", ".join(sorted(u["all_logins"])),
-                "namespaces": ", ".join(sorted(u["namespaces"])) if u["namespaces"] else "",
+                "namespaces": ", ".join(sorted(u["namespaces"]))
+                if u["namespaces"]
+                else "",
             }
         )
 
@@ -227,7 +222,9 @@ def get_unique_users(alias_rows):
 # ============================================================
 # 📊 Формирование Excel-отчёта
 # ============================================================
-def write_excel(filename, aliases, groups, tokens, alias_stats, unique_users, kv_stats, kv_total):
+def write_excel(
+    filename, aliases, groups, tokens, alias_stats, unique_users, kv_stats, kv_total
+):
     out = Path(filename)
     workbook = xlsxwriter.Workbook(out)
     bold = workbook.add_format({"bold": True, "bg_color": "#F0F0F0"})
