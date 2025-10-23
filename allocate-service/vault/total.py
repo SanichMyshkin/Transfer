@@ -4,6 +4,7 @@ from dotenv import load_dotenv
 import hvac
 import xlsxwriter
 
+
 # === Инициализация ===
 load_dotenv()
 
@@ -47,7 +48,7 @@ def vault_request(method: str, path: str):
 # ============================================================
 def get_aliases():
     """Возвращает всех пользователей/сервисы и статистику по типу логина."""
-    resp = vault_request("GET", "identity/alias/id")
+    resp = vault_request("LIST", "identity/alias/id")
     key_info = (resp.get("data") or {}).get("key_info", {})
     if not key_info:
         print("⚠️ Alias-ов не найдено (key_info пуст).")
@@ -67,11 +68,8 @@ def get_aliases():
         )
 
         row = {
-
-
             "name": info.get("name"),
             "mount_type": mount_type,
-
             "effective_username": username,
             "namespace": meta.get("service_account_namespace", ""),
         }
@@ -104,7 +102,7 @@ def get_kv_mounts():
     mounts = vault_request("GET", "sys/mounts").get("data", {})
     result = []
     for mpath, meta in mounts.items():
-        if meta.get("type") == "kv" and mpath.endswith("/"):
+        if meta.get("type") in ("kv", "kv-v2") and mpath.endswith("/"):
             result.append({"mount": mpath})
     print(f"🗄 Найдено KV-монтов: {len(result)}")
     return result
@@ -122,9 +120,65 @@ def get_token_stats():
 
 
 # ============================================================
-# 📊 5. Формирование Excel-отчёта
+# 👤 5. Уникальные пользователи
 # ============================================================
-def write_excel(filename, aliases, groups, kvs, tokens, alias_stats):
+def normalize_name(name: str) -> str:
+    """Простая нормализация имени: без домена, точек и в нижнем регистре."""
+    if not name:
+        return ""
+    name = name.strip().lower()
+    if "@" in name:
+        name = name.split("@")[0]
+    name = name.replace(".", "").replace("-", "")
+    return name
+
+
+def get_unique_users(alias_rows):
+    """
+    Группирует алиасы в уникальных пользователей.
+    Исключает типы userpass и approle.
+    """
+    filtered = [r for r in alias_rows if r["mount_type"] not in ("userpass", "approle")]
+
+    unique = {}
+    for r in filtered:
+        eff_name = (r.get("effective_username") or r.get("name") or "").strip()
+        if not eff_name:
+            continue
+        key = normalize_name(eff_name)
+
+        if key not in unique:
+            unique[key] = {
+                "unique_user": eff_name,
+                "all_logins": set(),
+                "namespaces": set(),
+            }
+
+        login_info = f"{r['mount_type']}:{r['name']}"
+        unique[key]["all_logins"].add(login_info)
+        if r.get("namespace"):
+            unique[key]["namespaces"].add(r["namespace"])
+
+    result = []
+    for u in unique.values():
+        result.append(
+            {
+                "unique_user": u["unique_user"],
+                "all_logins": ", ".join(sorted(u["all_logins"])),
+                "namespaces": ", ".join(sorted(u["namespaces"]))
+                if u["namespaces"]
+                else "",
+            }
+        )
+
+    print(f"👤 Уникальных пользователей: {len(result)}")
+    return result
+
+
+# ============================================================
+# 📊 6. Формирование Excel-отчёта
+# ============================================================
+def write_excel(filename, aliases, groups, kvs, tokens, alias_stats, unique_users):
     out = Path(filename)
     workbook = xlsxwriter.Workbook(out)
     bold = workbook.add_format({"bold": True, "bg_color": "#F0F0F0"})
@@ -135,7 +189,6 @@ def write_excel(filename, aliases, groups, kvs, tokens, alias_stats):
             ws.write(0, 0, "Нет данных")
             return
 
-        # Безопасная проверка структуры
         if not isinstance(data, list):
             ws.write(0, 0, f"Ошибка: ожидался list, получен {type(data)}")
             return
@@ -150,9 +203,11 @@ def write_excel(filename, aliases, groups, kvs, tokens, alias_stats):
         for row_idx, item in enumerate(data, start=1):
             for col, h in enumerate(headers):
                 ws.write(row_idx, col, str(item.get(h, "")))
+        ws.set_column(0, len(headers) - 1, 25)
 
     # Пишем все листы
     write_sheet("Aliases", aliases)
+    write_sheet("Unique Users", unique_users)
     write_sheet("Auth Types Summary", alias_stats)
     write_sheet("LDAP Groups", groups)
     write_sheet("KV Mounts", kvs)
@@ -162,14 +217,16 @@ def write_excel(filename, aliases, groups, kvs, tokens, alias_stats):
     summary = workbook.add_worksheet("Summary")
     summary.write("A1", "Vault Address", bold)
     summary.write("B1", VAULT_ADDR)
-    summary.write("A2", "Всего пользователей")
+    summary.write("A2", "Всего алиасов")
     summary.write("B2", len(aliases))
-    summary.write("A3", "LDAP групп")
-    summary.write("B3", len(groups))
-    summary.write("A4", "KV Mounts")
-    summary.write("B4", len(kvs))
-    summary.write("A5", "Активных токенов")
-    summary.write("B5", tokens[0]["active_tokens"] if tokens else 0)
+    summary.write("A3", "Уникальных пользователей")
+    summary.write("B3", len(unique_users))
+    summary.write("A4", "LDAP групп")
+    summary.write("B4", len(groups))
+    summary.write("A5", "KV Mounts")
+    summary.write("B5", len(kvs))
+    summary.write("A6", "Активных токенов")
+    summary.write("B6", tokens[0]["active_tokens"] if tokens else 0)
 
     workbook.close()
     print(f"\n📁 Отчёт готов: {out.resolve()}")
@@ -183,7 +240,18 @@ def main():
     groups = get_ldap_groups()
     kvs = get_kv_mounts()
     tokens = get_token_stats()
-    write_excel("vault_usage_report.xlsx", aliases, groups, kvs, tokens, alias_stats)
+
+    unique_users = get_unique_users(aliases)
+
+    write_excel(
+        "vault_usage_report.xlsx",
+        aliases,
+        groups,
+        kvs,
+        tokens,
+        alias_stats,
+        unique_users,
+    )
 
 
 if __name__ == "__main__":
