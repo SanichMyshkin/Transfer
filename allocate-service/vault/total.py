@@ -13,7 +13,7 @@ from ldap3.utils.conv import escape_filter_chars
 
 
 # ============================================================
-# ⚙️  Настройки и инициализация
+# ⚙️ Настройки и инициализация
 # ============================================================
 load_dotenv()
 
@@ -112,7 +112,7 @@ def parse_kv_metrics(metrics_text: str):
 
 
 # ============================================================
-# 🔹 Алиасы, группы и токены
+# 🔹 Алиасы, токены и аутентификация
 # ============================================================
 def get_aliases():
     resp = vault_request("LIST", "identity/alias/id")
@@ -124,15 +124,8 @@ def get_aliases():
     for aid, info in key_info.items():
         meta = info.get("metadata", {}) or {}
         mount_type = (info.get("mount_type") or "").lower().strip()
-        effective_username = (
-            meta.get("effectiveUsername")
-            or meta.get("service_account_name")
-            or meta.get("name")
-            or info.get("name")
-        )
         row = {
             "name": info.get("name"),
-            "effective_username": effective_username,
             "mount_type": mount_type,
             "namespace": meta.get("service_account_namespace", ""),
         }
@@ -174,7 +167,7 @@ def get_unique_users(alias_rows):
     filtered = [r for r in alias_rows if r["mount_type"] not in ("userpass", "approle")]
     unique = {}
     for r in filtered:
-        eff_name = (r.get("effective_username") or r.get("name") or "").strip()
+        eff_name = (r.get("name") or "").strip()
         if not eff_name:
             continue
         key = normalize_name(eff_name)
@@ -211,6 +204,7 @@ def paged_search(conn, **kwargs):
 
 
 def get_ad_group_members(conn, group_name, include_nested=True):
+    """Возвращает пользователей конкретной AD-группы"""
     name_esc = escape_filter_chars(group_name)
     group_filter = f"(&(objectClass=group)(|(cn={name_esc})(sAMAccountName={name_esc})(name={name_esc})))"
     groups = paged_search(
@@ -222,6 +216,7 @@ def get_ad_group_members(conn, group_name, include_nested=True):
     )
     if not groups:
         return {"group": group_name, "members": [], "found": False}
+
     group_dn = groups[0]["attributes"]["distinguishedName"]
     group_created = str(groups[0]["attributes"].get("whenCreated", ""))
     group_dn_esc = escape_filter_chars(group_dn)
@@ -230,6 +225,7 @@ def get_ad_group_members(conn, group_name, include_nested=True):
         if include_nested
         else f"(memberOf={group_dn_esc})"
     )
+
     user_filter = f"(&(objectClass=user)(!(objectClass=computer)){member_clause})"
     users = paged_search(
         conn,
@@ -238,6 +234,7 @@ def get_ad_group_members(conn, group_name, include_nested=True):
         search_scope=SUBTREE,
         attributes=["sAMAccountName", "displayName", "mail", "whenCreated", "distinguishedName"],
     )
+
     members = []
     for u in users:
         a = u["attributes"]
@@ -251,13 +248,20 @@ def get_ad_group_members(conn, group_name, include_nested=True):
                 "user_created": str(a.get("whenCreated", "")),
             }
         )
-    return {"group": group_name, "group_dn": group_dn, "group_created": group_created, "found": True, "members": members}
+
+    return {
+        "group": group_name,
+        "group_dn": group_dn,
+        "group_created": group_created,
+        "found": True,
+        "members": members,
+    }
 
 
 # ============================================================
 # 📊 Excel отчёт
 # ============================================================
-def write_excel(filename, aliases, groups, tokens, alias_stats, unique_users, kv_stats, kv_total, ad_full_list):
+def write_excel(filename, aliases, tokens, alias_stats, unique_users, kv_stats, kv_total, ad_full_list):
     out = Path(filename)
     workbook = xlsxwriter.Workbook(out)
     bold = workbook.add_format({"bold": True, "bg_color": "#F0F0F0"})
@@ -279,7 +283,6 @@ def write_excel(filename, aliases, groups, tokens, alias_stats, unique_users, kv
     write_sheet("Aliases", aliases)
     write_sheet("Unique Users", unique_users)
     write_sheet("Auth Types Summary", alias_stats)
-    write_sheet("LDAP Groups", groups)
     write_sheet("Token Stats", tokens)
     write_sheet("KV Mounts", kv_stats)
     write_sheet("AD Group Members", ad_full_list)
@@ -299,12 +302,11 @@ def write_excel(filename, aliases, groups, tokens, alias_stats, unique_users, kv
     summary.write("B1", VAULT_ADDR)
     summary.write("A2", "Алиасов"); summary.write("B2", len(aliases))
     summary.write("A3", "Уникальных пользователей"); summary.write("B3", len(unique_users))
-    summary.write("A4", "LDAP групп"); summary.write("B4", len(groups))
-    summary.write("A5", "Активных токенов"); summary.write("B5", tokens[0]["active_tokens"] if tokens else 0)
-    summary.write("A6", "KV mount points"); summary.write("B6", len(kv_stats))
-    summary.write("A7", "Секретов всего"); summary.write("B7", kv_total)
-    summary.write("A8", "Командных KV"); summary.write("B8", len(kv_team))
-    summary.write("A9", "AD пользователей (всего)"); summary.write("B9", len(ad_full_list))
+    summary.write("A4", "Активных токенов"); summary.write("B4", tokens[0]["active_tokens"] if tokens else 0)
+    summary.write("A5", "KV mount points"); summary.write("B5", len(kv_stats))
+    summary.write("A6", "Секретов всего"); summary.write("B6", kv_total)
+    summary.write("A7", "Командных KV"); summary.write("B7", len(kv_team))
+    summary.write("A8", "AD пользователей (всего)"); summary.write("B8", len(ad_full_list))
 
     workbook.close()
     log.info(f"📁 Отчёт готов: {out.resolve()}")
@@ -315,7 +317,6 @@ def write_excel(filename, aliases, groups, tokens, alias_stats, unique_users, kv
 # ============================================================
 def main():
     aliases, alias_stats = get_aliases()
-    groups = get_ldap_groups()
     tokens = get_token_stats()
     unique_users = get_unique_users(aliases)
 
@@ -329,6 +330,9 @@ def main():
     tls = Tls(validate=ssl.CERT_REQUIRED, ca_certs_file=CA_CERT)
     server = Server(AD_SERVER, use_ssl=True, get_info=ALL, tls=tls)
     conn = Connection(server, AD_USER, AD_PASSWORD, auto_bind=True)
+
+    # Получаем список групп из Vault API
+    groups = get_ldap_groups()
 
     log.info("📘 Получаем пользователей из AD-групп...")
     ad_full_list = []
@@ -359,7 +363,7 @@ def main():
     total_time = time.perf_counter() - start_all
     log.info(f"🎯 Всего пользователей из всех AD-групп: {len(ad_full_list)}. Время: {total_time:.1f} сек.")
 
-    write_excel("vault_usage_report.xlsx", aliases, groups, tokens,
+    write_excel("vault_usage_report.xlsx", aliases, tokens,
                 alias_stats, unique_users, kv_stats, kv_total, ad_full_list)
 
 
