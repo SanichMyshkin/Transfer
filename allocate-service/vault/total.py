@@ -124,24 +124,37 @@ def get_aliases():
     if not key_info:
         log.warning("⚠️ Alias-ов не найдено.")
         return [], []
-    rows, stats = [], {}
+    rows, stats = {}, {}
+    rows = []
+    stats = {}
+
     for aid, info in key_info.items():
         meta = info.get("metadata", {}) or {}
         mount_type = (info.get("mount_type") or "").lower().strip()
+
+        # вычисляем "эффективное имя" (важно для Kubernetes)
         effective_username = (
             meta.get("effectiveUsername")
             or meta.get("service_account_name")
             or meta.get("name")
             or info.get("name")
         )
+
+        # имя, которое попадёт в таблицу — зависит от типа аутентификации
+        if mount_type == "kubernetes":
+            name_for_excel = effective_username
+        else:
+            name_for_excel = info.get("name")
+
         row = {
-            "name": info.get("name"),
-            "effective_username": effective_username,  # оставляем для внутренних вычислений
+            "name": name_for_excel,
+            "effective_username": effective_username,  # внутреннее поле
             "mount_type": mount_type,
             "namespace": meta.get("service_account_namespace", ""),
         }
         rows.append(row)
         stats[mount_type] = stats.get(mount_type, 0) + 1
+
     log.info(f"🔹 Найдено alias-ов: {len(rows)}")
     stats_rows = [{"auth_type": k, "count": v} for k, v in sorted(stats.items())]
     return rows, stats_rows
