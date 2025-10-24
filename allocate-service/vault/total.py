@@ -4,7 +4,6 @@ import ssl
 import time
 import logging
 from pathlib import Path
-from datetime import datetime
 from dotenv import load_dotenv
 import hvac
 import requests
@@ -160,7 +159,7 @@ def get_token_stats():
 
 
 # ============================================================
-# 👤 Уникальные пользователи
+# 👤 Уникальные пользователи (Vault)
 # ============================================================
 def normalize_name(name: str) -> str:
     if not name:
@@ -212,6 +211,7 @@ def paged_search(conn, **kwargs):
 
 
 def get_ad_group_members(conn, group_name, include_nested=True):
+    """Возвращает пользователей конкретной AD-группы"""
     name_esc = escape_filter_chars(group_name)
     group_filter = f"(&(objectClass=group)(|(cn={name_esc})(sAMAccountName={name_esc})(name={name_esc})))"
     groups = paged_search(
@@ -223,6 +223,7 @@ def get_ad_group_members(conn, group_name, include_nested=True):
     )
     if not groups:
         return {"group": group_name, "members": [], "found": False}
+
     group_dn = groups[0]["attributes"]["distinguishedName"]
     group_created = str(groups[0]["attributes"].get("whenCreated", ""))
     group_dn_esc = escape_filter_chars(group_dn)
@@ -231,6 +232,7 @@ def get_ad_group_members(conn, group_name, include_nested=True):
         if include_nested
         else f"(memberOf={group_dn_esc})"
     )
+
     user_filter = f"(&(objectClass=user)(!(objectClass=computer)){member_clause})"
     users = paged_search(
         conn,
@@ -239,11 +241,13 @@ def get_ad_group_members(conn, group_name, include_nested=True):
         search_scope=SUBTREE,
         attributes=["sAMAccountName", "displayName", "mail", "whenCreated", "distinguishedName"],
     )
+
     members = []
     for u in users:
         a = u["attributes"]
         members.append(
             {
+                "ad_group": group_name,
                 "user": a.get("sAMAccountName", ""),
                 "displayName": a.get("displayName", ""),
                 "mail": a.get("mail", ""),
@@ -251,13 +255,20 @@ def get_ad_group_members(conn, group_name, include_nested=True):
                 "user_created": str(a.get("whenCreated", "")),
             }
         )
-    return {"group": group_name, "group_dn": group_dn, "group_created": group_created, "found": True, "members": members}
+
+    return {
+        "group": group_name,
+        "group_dn": group_dn,
+        "group_created": group_created,
+        "found": True,
+        "members": members,
+    }
 
 
 # ============================================================
 # 📊 Excel отчёт
 # ============================================================
-def write_excel(filename, aliases, groups, token_count, alias_stats, unique_users, kv_stats, kv_total, ad_compare):
+def write_excel(filename, aliases, groups, token_count, alias_stats, unique_users, kv_stats, kv_total, ad_full_list):
     out = Path(filename)
     workbook = xlsxwriter.Workbook(out)
     bold = workbook.add_format({"bold": True, "bg_color": "#F0F0F0"})
@@ -280,7 +291,7 @@ def write_excel(filename, aliases, groups, token_count, alias_stats, unique_user
     write_sheet("Auth Types", alias_stats)
     write_sheet("LDAP Groups", groups)
     write_sheet("KV Mounts", kv_stats)
-    write_sheet("AD vs Vault Users", ad_compare)
+    write_sheet("AD Group Members", ad_full_list)
 
     summary = workbook.add_worksheet("Summary")
     summary.write("A1", "Vault Address", bold)
@@ -291,7 +302,7 @@ def write_excel(filename, aliases, groups, token_count, alias_stats, unique_user
     summary.write("A5", "Активных токенов"); summary.write("B5", token_count)
     summary.write("A6", "KV mounts"); summary.write("B6", len(kv_stats))
     summary.write("A7", "Секретов всего"); summary.write("B7", kv_total)
-    summary.write("A8", "AD пользователей"); summary.write("B8", len(ad_compare))
+    summary.write("A8", "AD пользователей (всего)"); summary.write("B8", len(ad_full_list))
 
     workbook.close()
     log.info(f"📁 Отчёт готов: {out.resolve()}")
@@ -317,9 +328,8 @@ def main():
     server = Server(AD_SERVER, use_ssl=True, get_info=ALL, tls=tls)
     conn = Connection(server, AD_USER, AD_PASSWORD, auto_bind=True)
 
-    log.info("📘 Начинаем сопоставление AD ↔ Vault пользователей...")
-    vault_usernames = {normalize_name(u["unique_user"]) for u in unique_users}
-    ad_compare = []
+    log.info("📘 Получаем пользователей из AD-групп...")
+    ad_full_list = []
     start_all = time.perf_counter()
     total_groups = len(groups)
 
@@ -339,44 +349,15 @@ def main():
             continue
 
         members = group_data["members"]
-        group_dn = group_data["group_dn"]
-        log.info(f"🔍 Группа {group_name}: DN={group_dn}, пользователей={len(members)}")
-
-        added_count = 0
-        in_vault_count = 0
-        not_in_vault_count = 0
-
-        for m in members:
-            user_key = normalize_name(m["user"])
-            in_vault = user_key in vault_usernames
-            if in_vault:
-                in_vault_count += 1
-            else:
-                not_in_vault_count += 1
-
-            ad_compare.append({
-                "vault_group": group_name,
-                "ad_user": m["user"],
-                "displayName": m["displayName"],
-                "mail": m["mail"],
-                "in_vault": "✅" if in_vault else "❌",
-            })
-            added_count += 1
-
-            if added_count % 20 == 0:
-                log.info(f"   → обработано {added_count}/{len(members)} пользователей группы {group_name}...")
-
+        ad_full_list.extend(members)
         elapsed = time.perf_counter() - start
-        log.info(f"✅ Группа {group_name} завершена: всего {len(members)}, "
-                 f"в Vault={in_vault_count}, отсутствуют={not_in_vault_count}, "
-                 f"время={elapsed:.2f} сек.\n")
+        log.info(f"✅ Группа {group_name}: найдено {len(members)} пользователей, время {elapsed:.2f} сек.\n")
 
     conn.unbind()
     total_time = time.perf_counter() - start_all
-    log.info(f"🎯 Сопоставление завершено. Всего пользователей: {len(ad_compare)}. Время: {total_time:.1f} сек.")
+    log.info(f"🎯 Всего пользователей из всех AD-групп: {len(ad_full_list)}. Время: {total_time:.1f} сек.")
 
-    write_excel("vault_usage_report.xlsx", aliases, groups, token_count,
-                alias_stats, unique_users, kv_stats, kv_total, ad_compare)
+    write_excel("vault_usage_report.xlsx", aliases, groups, token_count, alias_stats, unique_users, kv_stats, kv_total, ad_full_list)
 
 
 if __name__ == "__main__":
