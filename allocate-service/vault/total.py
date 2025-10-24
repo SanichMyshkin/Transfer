@@ -1,17 +1,21 @@
 import os
 import re
 import ssl
-import json
+import time
+import logging
 from pathlib import Path
+from datetime import datetime
 from dotenv import load_dotenv
 import hvac
-import xlsxwriter
 import requests
+import xlsxwriter
 from ldap3 import Server, Connection, ALL, SUBTREE, Tls
 from ldap3.utils.conv import escape_filter_chars
 
 
-# === Инициализация окружения ===
+# ============================================================
+# ⚙️  Настройки и инициализация
+# ============================================================
 load_dotenv()
 
 VAULT_ADDR = os.getenv("VAULT_ADDR")
@@ -25,14 +29,33 @@ GROUP_SEARCH_BASE = os.getenv("AD_GROUP_SEARCH_BASE")
 PEOPLE_SEARCH_BASE = os.getenv("AD_PEOPLE_SEARCH_BASE")
 INCLUDE_NESTED = True
 
+# === Логирование ===
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler("vault_ad_sync.log", encoding="utf-8"),
+        logging.StreamHandler()
+    ]
+)
+log = logging.getLogger("vault_ad")
+
+log.info("🚀 Запуск скрипта Vault + AD отчёт")
+
 if not VAULT_ADDR or not VAULT_TOKEN:
-    raise SystemExit("❌ Не заданы VAULT_ADDR или VAULT_TOKEN")
+    log.error("❌ Не заданы VAULT_ADDR или VAULT_TOKEN")
+    raise SystemExit(1)
+
+if not GROUP_SEARCH_BASE or not PEOPLE_SEARCH_BASE:
+    log.warning("⚠️ Не заданы AD_*_SEARCH_BASE, применяю дефолтные значения.")
+    GROUP_SEARCH_BASE = "OU=URALSIB,DC=fc,DC=uralsibbank,DC=ru"
+    PEOPLE_SEARCH_BASE = "DC=fc,DC=uralsibbank,DC=ru"
 
 client = hvac.Client(url=VAULT_ADDR, token=VAULT_TOKEN, verify=CA_CERT)
 if not client.is_authenticated():
-    raise SystemExit("❌ Не удалось аутентифицироваться в Vault")
-
-print(f"✅ Подключено к Vault: {VAULT_ADDR}")
+    log.error("❌ Не удалось аутентифицироваться в Vault")
+    raise SystemExit(1)
+log.info(f"✅ Подключено к Vault: {VAULT_ADDR}")
 
 
 # ============================================================
@@ -48,34 +71,26 @@ def vault_request(method: str, path: str):
         else:
             raise ValueError(f"Метод {method} не разрешён (только GET/LIST)")
         if not resp:
-            print(f"⚠️ Пустой ответ от Vault на {method} {path}")
+            log.warning(f"⚠️ Пустой ответ от Vault на {method} {path}")
             return {}
         return resp
     except Exception as e:
-        print(f"⚠️ Ошибка при запросе {method} {path}: {e}")
+        log.error(f"⚠️ Ошибка при запросе {method} {path}: {e}")
         return {}
 
 
 # ============================================================
 # 🧮 Метрики Vault
 # ============================================================
-def get_vault_metrics(format="prometheus", use_api=True, include_token=False):
+def get_vault_metrics(format="prometheus", use_api=True):
     session = requests.Session()
-    headers = {}
-    if include_token:
-        headers["X-Vault-Token"] = VAULT_TOKEN
-
-    url = (
-        f"{VAULT_ADDR}/v1/sys/metrics?format={format}"
-        if use_api
-        else f"{VAULT_ADDR}/metrics"
-    )
+    url = f"{VAULT_ADDR}/v1/sys/metrics?format={format}" if use_api else f"{VAULT_ADDR}/metrics"
     try:
-        r = session.get(url, headers=headers, verify=CA_CERT, timeout=15)
+        r = session.get(url, verify=CA_CERT, timeout=15)
         r.raise_for_status()
         return r.text if format == "prometheus" else r.json()
     except Exception as e:
-        print(f"⚠️ Ошибка при получении метрик с {url}: {e}")
+        log.error(f"⚠️ Ошибка при получении метрик: {e}")
         return None
 
 
@@ -93,7 +108,7 @@ def parse_kv_metrics(metrics_text: str):
             count = 0
         results.append({"mount_point": mount_point, "count": count})
         total_count += count
-    print(f"📦 Найдено KV-монтов: {len(results)}, всего секретов: {total_count}")
+    log.info(f"📦 Найдено KV-монтов: {len(results)}, всего секретов: {total_count}")
     return results, total_count
 
 
@@ -104,7 +119,7 @@ def get_aliases():
     resp = vault_request("LIST", "identity/alias/id")
     key_info = (resp.get("data") or {}).get("key_info", {})
     if not key_info:
-        print("⚠️ Alias-ов не найдено.")
+        log.warning("⚠️ Alias-ов не найдено.")
         return [], []
     rows, stats = [], {}
     for aid, info in key_info.items():
@@ -124,7 +139,7 @@ def get_aliases():
         }
         rows.append(row)
         stats[mount_type] = stats.get(mount_type, 0) + 1
-    print(f"🔹 Найдено alias-ов: {len(rows)}")
+    log.info(f"🔹 Найдено alias-ов: {len(rows)}")
     stats_rows = [{"auth_type": k, "count": v} for k, v in sorted(stats.items())]
     return rows, stats_rows
 
@@ -132,7 +147,7 @@ def get_aliases():
 def get_ldap_groups():
     resp = vault_request("LIST", "auth/ldap/groups")
     groups = (resp.get("data") or {}).get("keys", [])
-    print(f"🔸 LDAP-групп в Vault: {len(groups)}")
+    log.info(f"🔸 LDAP-групп в Vault: {len(groups)}")
     return [{"ldap_group": g} for g in groups]
 
 
@@ -140,7 +155,7 @@ def get_token_stats():
     resp = vault_request("LIST", "auth/token/accessors")
     tokens = (resp.get("data") or {}).get("keys", [])
     total = len(tokens)
-    print(f"🔑 Активных токенов: {total}")
+    log.info(f"🔑 Активных токенов: {total}")
     return total
 
 
@@ -181,7 +196,7 @@ def get_unique_users(alias_rows):
         }
         for u in unique.values()
     ]
-    print(f"👤 Уникальных пользователей: {len(result)}")
+    log.info(f"👤 Уникальных пользователей: {len(result)}")
     return result
 
 
@@ -190,9 +205,7 @@ def get_unique_users(alias_rows):
 # ============================================================
 def paged_search(conn, **kwargs):
     entries = []
-    for item in conn.extend.standard.paged_search(
-        generator=True, paged_size=1000, **kwargs
-    ):
+    for item in conn.extend.standard.paged_search(generator=True, paged_size=1000, **kwargs):
         if item.get("type") == "searchResEntry":
             entries.append(item)
     return entries
@@ -224,13 +237,7 @@ def get_ad_group_members(conn, group_name, include_nested=True):
         search_base=PEOPLE_SEARCH_BASE,
         search_filter=user_filter,
         search_scope=SUBTREE,
-        attributes=[
-            "sAMAccountName",
-            "displayName",
-            "mail",
-            "whenCreated",
-            "distinguishedName",
-        ],
+        attributes=["sAMAccountName", "displayName", "mail", "whenCreated", "distinguishedName"],
     )
     members = []
     for u in users:
@@ -244,35 +251,19 @@ def get_ad_group_members(conn, group_name, include_nested=True):
                 "user_created": str(a.get("whenCreated", "")),
             }
         )
-    return {
-        "group": group_name,
-        "group_dn": group_dn,
-        "group_created": group_created,
-        "found": True,
-        "members": members,
-    }
+    return {"group": group_name, "group_dn": group_dn, "group_created": group_created, "found": True, "members": members}
 
 
 # ============================================================
 # 📊 Excel отчёт
 # ============================================================
-def write_excel(
-    filename,
-    aliases,
-    groups,
-    token_count,
-    alias_stats,
-    unique_users,
-    kv_stats,
-    kv_total,
-    ad_compare,
-):
+def write_excel(filename, aliases, groups, token_count, alias_stats, unique_users, kv_stats, kv_total, ad_compare):
     out = Path(filename)
     workbook = xlsxwriter.Workbook(out)
     bold = workbook.add_format({"bold": True, "bg_color": "#F0F0F0"})
 
     def write_sheet(ws_name, data):
-        ws = workbook.add_worksheet(ws_name[:31])  # Excel limit
+        ws = workbook.add_worksheet(ws_name[:31])
         if not data:
             ws.write(0, 0, "Нет данных")
             return
@@ -284,43 +275,26 @@ def write_excel(
                 ws.write(row_idx, col, str(item.get(h, "")))
         ws.set_column(0, len(headers) - 1, 30)
 
-    kv_team = []
-    for kv in kv_stats:
-        mount = kv["mount_point"].rstrip("/")
-        match = re.match(r"^kv-([a-z0-9_-]+)$", mount, re.IGNORECASE)
-        if match:
-            kv_team.append({"team_kv": match.group(1)})
-
     write_sheet("Aliases", aliases)
     write_sheet("Unique Users", unique_users)
     write_sheet("Auth Types", alias_stats)
     write_sheet("LDAP Groups", groups)
     write_sheet("KV Mounts", kv_stats)
-    write_sheet("Team KV", kv_team)
     write_sheet("AD vs Vault Users", ad_compare)
 
     summary = workbook.add_worksheet("Summary")
     summary.write("A1", "Vault Address", bold)
     summary.write("B1", VAULT_ADDR)
-    summary.write("A2", "Алиасов")
-    summary.write("B2", len(aliases))
-    summary.write("A3", "Уникальных пользователей")
-    summary.write("B3", len(unique_users))
-    summary.write("A4", "LDAP групп")
-    summary.write("B4", len(groups))
-    summary.write("A5", "Активных токенов")
-    summary.write("B5", token_count)
-    summary.write("A6", "KV mount points")
-    summary.write("B6", len(kv_stats))
-    summary.write("A7", "Секретов всего")
-    summary.write("B7", kv_total)
-    summary.write("A8", "Командных KV")
-    summary.write("B8", len(kv_team))
-    summary.write("A9", "AD пользователей")
-    summary.write("B9", len(ad_compare))
+    summary.write("A2", "Алиасов"); summary.write("B2", len(aliases))
+    summary.write("A3", "Уникальных пользователей"); summary.write("B3", len(unique_users))
+    summary.write("A4", "LDAP групп"); summary.write("B4", len(groups))
+    summary.write("A5", "Активных токенов"); summary.write("B5", token_count)
+    summary.write("A6", "KV mounts"); summary.write("B6", len(kv_stats))
+    summary.write("A7", "Секретов всего"); summary.write("B7", kv_total)
+    summary.write("A8", "AD пользователей"); summary.write("B8", len(ad_compare))
 
     workbook.close()
-    print(f"\n📁 Отчёт готов: {out.resolve()}")
+    log.info(f"📁 Отчёт готов: {out.resolve()}")
 
 
 # ============================================================
@@ -332,53 +306,77 @@ def main():
     token_count = get_token_stats()
     unique_users = get_unique_users(aliases)
 
-    print("\n📈 Получаем метрики Vault...")
+    log.info("📈 Получаем метрики Vault...")
     metrics_text = get_vault_metrics(format="prometheus", use_api=True)
     kv_stats, kv_total = ([], 0)
     if metrics_text:
         kv_stats, kv_total = parse_kv_metrics(metrics_text)
 
-    print("\n🔍 Подключаемся к Active Directory...")
+    log.info("🔍 Подключаемся к Active Directory...")
     tls = Tls(validate=ssl.CERT_REQUIRED, ca_certs_file=CA_CERT)
     server = Server(AD_SERVER, use_ssl=True, get_info=ALL, tls=tls)
     conn = Connection(server, AD_USER, AD_PASSWORD, auto_bind=True)
 
-    print("📘 Сопоставляем AD ↔ Vault пользователей...")
+    log.info("📘 Начинаем сопоставление AD ↔ Vault пользователей...")
     vault_usernames = {normalize_name(u["unique_user"]) for u in unique_users}
     ad_compare = []
-    for g in groups:
+    start_all = time.perf_counter()
+    total_groups = len(groups)
+
+    for idx, g in enumerate(groups, start=1):
         group_name = g["ldap_group"]
-        group_data = get_ad_group_members(
-            conn, group_name, include_nested=INCLUDE_NESTED
-        )
-        if not group_data["found"]:
-            print(f"⚠️ Группа {group_name} не найдена в AD")
+        start = time.perf_counter()
+        log.info(f"[{idx}/{total_groups}] ▶️ Обработка группы: {group_name}")
+
+        try:
+            group_data = get_ad_group_members(conn, group_name, include_nested=INCLUDE_NESTED)
+        except Exception as e:
+            log.error(f"❌ Ошибка при запросе группы {group_name}: {e}")
             continue
-        for m in group_data["members"]:
+
+        if not group_data["found"]:
+            log.warning(f"⚠️ Группа {group_name} не найдена в AD.")
+            continue
+
+        members = group_data["members"]
+        group_dn = group_data["group_dn"]
+        log.info(f"🔍 Группа {group_name}: DN={group_dn}, пользователей={len(members)}")
+
+        added_count = 0
+        in_vault_count = 0
+        not_in_vault_count = 0
+
+        for m in members:
             user_key = normalize_name(m["user"])
-            ad_compare.append(
-                {
-                    "vault_group": group_name,
-                    "ad_user": m["user"],
-                    "displayName": m["displayName"],
-                    "mail": m["mail"],
-                    "in_vault": "✅" if user_key in vault_usernames else "❌",
-                }
-            )
+            in_vault = user_key in vault_usernames
+            if in_vault:
+                in_vault_count += 1
+            else:
+                not_in_vault_count += 1
+
+            ad_compare.append({
+                "vault_group": group_name,
+                "ad_user": m["user"],
+                "displayName": m["displayName"],
+                "mail": m["mail"],
+                "in_vault": "✅" if in_vault else "❌",
+            })
+            added_count += 1
+
+            if added_count % 20 == 0:
+                log.info(f"   → обработано {added_count}/{len(members)} пользователей группы {group_name}...")
+
+        elapsed = time.perf_counter() - start
+        log.info(f"✅ Группа {group_name} завершена: всего {len(members)}, "
+                 f"в Vault={in_vault_count}, отсутствуют={not_in_vault_count}, "
+                 f"время={elapsed:.2f} сек.\n")
 
     conn.unbind()
+    total_time = time.perf_counter() - start_all
+    log.info(f"🎯 Сопоставление завершено. Всего пользователей: {len(ad_compare)}. Время: {total_time:.1f} сек.")
 
-    write_excel(
-        "vault_usage_report.xlsx",
-        aliases,
-        groups,
-        token_count,
-        alias_stats,
-        unique_users,
-        kv_stats,
-        kv_total,
-        ad_compare,
-    )
+    write_excel("vault_usage_report.xlsx", aliases, groups, token_count,
+                alias_stats, unique_users, kv_stats, kv_total, ad_compare)
 
 
 if __name__ == "__main__":
