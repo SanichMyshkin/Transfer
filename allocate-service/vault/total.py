@@ -246,13 +246,19 @@ def write_excel(
             for col, h in enumerate(headers):
                 ws.write(row_idx, col, str(item.get(h, "")))
         ws.set_column(0, len(headers) - 1, 30)
-
-    kv_team_pattern = re.compile(r"^kv-([a-z0-9]+-\d+)$", re.IGNORECASE)
+        
+    # === фильтруем только kv-name-code и убираем "kv-" ===
     kv_team = []
     for kv in kv_stats:
-        m = kv_team_pattern.match(kv["mount_point"])
-        if m:
-            kv_team.append({"team_kv": m.group(1)})
+        # убираем возможный завершающий слеш
+        mount = kv["mount_point"].rstrip("/")
+
+        # ищем шаблон kv-имя-код, где код из цифр
+        match = re.match(r"^kv-([a-z0-9]+-\d+)$", mount, re.IGNORECASE)
+        if match:
+            name_code = match.group(1)  # только "имя-код"
+            kv_team.append({"team_kv": name_code})
+
 
 
     # === записываем листы ===
