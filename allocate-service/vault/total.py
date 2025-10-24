@@ -247,13 +247,13 @@ def write_excel(
                 ws.write(row_idx, col, str(item.get(h, "")))
         ws.set_column(0, len(headers) - 1, 30)
 
-    # === фильтруем только kv-name-code ===
-    kv_team_pattern = re.compile(r"^kv-[a-z0-9]+-\d+$", re.IGNORECASE)
-    kv_team = [
-        {"team_kv": kv["mount_point"]}
-        for kv in kv_stats
-        if kv_team_pattern.match(kv["mount_point"])
-    ]
+    kv_team_pattern = re.compile(r"^kv-([a-z0-9]+-\d+)$", re.IGNORECASE)
+    kv_team = []
+    for kv in kv_stats:
+        m = kv_team_pattern.match(kv["mount_point"])
+        if m:
+            kv_team.append({"team_kv": m.group(1)})
+
 
     # === записываем листы ===
     write_sheet("Aliases", aliases)
@@ -267,7 +267,6 @@ def write_excel(
     # === Summary ===
     summary = workbook.add_worksheet("Summary")
     summary.write("A1", "Vault Address", bold)
-    summary.write("B1", VAULT_ADDR)
     summary.write("A2", "Всего алиасов")
     summary.write("B2", len(aliases))
     summary.write("A3", "Уникальных пользователей")
