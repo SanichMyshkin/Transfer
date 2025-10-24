@@ -1,4 +1,17 @@
 services:
+  haproxy:
+    image: haproxy:latest
+    restart: always
+    volumes:
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    ports:
+      - "8200:9100"
+      - "8201:9101"
+    depends_on:
+      - minio-single
+    networks:
+      - minio-net
+
   nexus:
     image: sonatype/nexus3:3.83.2
     restart: unless-stopped
@@ -7,6 +20,7 @@ services:
       - ./volume/nexus-data:/nexus-data
     ports:
       - "9090:8081"
+      - "5001-5030:5001-5030"
     environment:
       - INSTALL4J_ADD_VM_PARAMS=-Xms512m -Xmx1024m -XX:MaxDirectMemorySize=2g -Djava.util.prefs.userRoot=/nexus-data
     networks:

@@ -44,7 +44,6 @@ def vault_request(method: str, path: str):
             print(f"⚠️ Пустой ответ от Vault на {method} {path}")
             return {}
 
-        # hvac возвращает dict вида {"data": {...}}, уже готовый к использованию
         return resp
 
     except Exception as e:
@@ -95,7 +94,7 @@ def parse_kv_metrics(metrics_text: str):
     total_count = 0
 
     for match in pattern.finditer(metrics_text):
-        mount_point = match.group(1)
+        mount_point = match.group(1).rstrip("/")  # убираем /
         try:
             count = int(match.group(2))
         except ValueError:
@@ -240,7 +239,6 @@ def write_excel(
         if not data:
             ws.write(0, 0, "Нет данных")
             return
-
         headers = list(data[0].keys())
         for col, h in enumerate(headers):
             ws.write(0, col, h, bold)
@@ -249,13 +247,24 @@ def write_excel(
                 ws.write(row_idx, col, str(item.get(h, "")))
         ws.set_column(0, len(headers) - 1, 30)
 
+    # === фильтруем только kv-name-code ===
+    kv_team_pattern = re.compile(r"^kv-[a-z0-9]+-\d+$", re.IGNORECASE)
+    kv_team = [
+        {"team_kv": kv["mount_point"]}
+        for kv in kv_stats
+        if kv_team_pattern.match(kv["mount_point"])
+    ]
+
+    # === записываем листы ===
     write_sheet("Aliases", aliases)
     write_sheet("Unique Users", unique_users)
     write_sheet("Auth Types Summary", alias_stats)
     write_sheet("LDAP Groups", groups)
     write_sheet("Token Stats", tokens)
     write_sheet("KV Mounts", kv_stats)
+    write_sheet("Team KV", kv_team)  # <-- новый лист с командными kv
 
+    # === Summary ===
     summary = workbook.add_worksheet("Summary")
     summary.write("A1", "Vault Address", bold)
     summary.write("B1", VAULT_ADDR)
@@ -271,6 +280,8 @@ def write_excel(
     summary.write("B6", len(kv_stats))
     summary.write("A7", "Секретов всего")
     summary.write("B7", kv_total)
+    summary.write("A8", "Командных KV (kv-name-code)")
+    summary.write("B8", len(kv_team))
 
     workbook.close()
     print(f"\n📁 Отчёт готов: {out.resolve()}")
