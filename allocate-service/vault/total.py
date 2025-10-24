@@ -155,7 +155,7 @@ def get_token_stats():
     tokens = (resp.get("data") or {}).get("keys", [])
     total = len(tokens)
     log.info(f"🔑 Активных токенов: {total}")
-    return total
+    return [{"active_tokens": total}]
 
 
 # ============================================================
@@ -211,7 +211,6 @@ def paged_search(conn, **kwargs):
 
 
 def get_ad_group_members(conn, group_name, include_nested=True):
-    """Возвращает пользователей конкретной AD-группы"""
     name_esc = escape_filter_chars(group_name)
     group_filter = f"(&(objectClass=group)(|(cn={name_esc})(sAMAccountName={name_esc})(name={name_esc})))"
     groups = paged_search(
@@ -223,7 +222,6 @@ def get_ad_group_members(conn, group_name, include_nested=True):
     )
     if not groups:
         return {"group": group_name, "members": [], "found": False}
-
     group_dn = groups[0]["attributes"]["distinguishedName"]
     group_created = str(groups[0]["attributes"].get("whenCreated", ""))
     group_dn_esc = escape_filter_chars(group_dn)
@@ -232,7 +230,6 @@ def get_ad_group_members(conn, group_name, include_nested=True):
         if include_nested
         else f"(memberOf={group_dn_esc})"
     )
-
     user_filter = f"(&(objectClass=user)(!(objectClass=computer)){member_clause})"
     users = paged_search(
         conn,
@@ -241,7 +238,6 @@ def get_ad_group_members(conn, group_name, include_nested=True):
         search_scope=SUBTREE,
         attributes=["sAMAccountName", "displayName", "mail", "whenCreated", "distinguishedName"],
     )
-
     members = []
     for u in users:
         a = u["attributes"]
@@ -255,20 +251,13 @@ def get_ad_group_members(conn, group_name, include_nested=True):
                 "user_created": str(a.get("whenCreated", "")),
             }
         )
-
-    return {
-        "group": group_name,
-        "group_dn": group_dn,
-        "group_created": group_created,
-        "found": True,
-        "members": members,
-    }
+    return {"group": group_name, "group_dn": group_dn, "group_created": group_created, "found": True, "members": members}
 
 
 # ============================================================
 # 📊 Excel отчёт
 # ============================================================
-def write_excel(filename, aliases, groups, token_count, alias_stats, unique_users, kv_stats, kv_total, ad_full_list):
+def write_excel(filename, aliases, groups, tokens, alias_stats, unique_users, kv_stats, kv_total, ad_full_list):
     out = Path(filename)
     workbook = xlsxwriter.Workbook(out)
     bold = workbook.add_format({"bold": True, "bg_color": "#F0F0F0"})
@@ -286,23 +275,36 @@ def write_excel(filename, aliases, groups, token_count, alias_stats, unique_user
                 ws.write(row_idx, col, str(item.get(h, "")))
         ws.set_column(0, len(headers) - 1, 30)
 
+    # 🧾 Листы
     write_sheet("Aliases", aliases)
     write_sheet("Unique Users", unique_users)
-    write_sheet("Auth Types", alias_stats)
+    write_sheet("Auth Types Summary", alias_stats)
     write_sheet("LDAP Groups", groups)
+    write_sheet("Token Stats", tokens)
     write_sheet("KV Mounts", kv_stats)
     write_sheet("AD Group Members", ad_full_list)
 
+    # Team KV (kv-name-code)
+    kv_team = []
+    for kv in kv_stats:
+        mount = kv["mount_point"].rstrip("/")
+        match = re.match(r"^kv-([a-z0-9]+-\d+)$", mount, re.IGNORECASE)
+        if match:
+            kv_team.append({"team_kv": match.group(1)})
+    write_sheet("Team KV", kv_team)
+
+    # Summary
     summary = workbook.add_worksheet("Summary")
     summary.write("A1", "Vault Address", bold)
     summary.write("B1", VAULT_ADDR)
     summary.write("A2", "Алиасов"); summary.write("B2", len(aliases))
     summary.write("A3", "Уникальных пользователей"); summary.write("B3", len(unique_users))
     summary.write("A4", "LDAP групп"); summary.write("B4", len(groups))
-    summary.write("A5", "Активных токенов"); summary.write("B5", token_count)
-    summary.write("A6", "KV mounts"); summary.write("B6", len(kv_stats))
+    summary.write("A5", "Активных токенов"); summary.write("B5", tokens[0]["active_tokens"] if tokens else 0)
+    summary.write("A6", "KV mount points"); summary.write("B6", len(kv_stats))
     summary.write("A7", "Секретов всего"); summary.write("B7", kv_total)
-    summary.write("A8", "AD пользователей (всего)"); summary.write("B8", len(ad_full_list))
+    summary.write("A8", "Командных KV"); summary.write("B8", len(kv_team))
+    summary.write("A9", "AD пользователей (всего)"); summary.write("B9", len(ad_full_list))
 
     workbook.close()
     log.info(f"📁 Отчёт готов: {out.resolve()}")
@@ -314,7 +316,7 @@ def write_excel(filename, aliases, groups, token_count, alias_stats, unique_user
 def main():
     aliases, alias_stats = get_aliases()
     groups = get_ldap_groups()
-    token_count = get_token_stats()
+    tokens = get_token_stats()
     unique_users = get_unique_users(aliases)
 
     log.info("📈 Получаем метрики Vault...")
@@ -357,7 +359,8 @@ def main():
     total_time = time.perf_counter() - start_all
     log.info(f"🎯 Всего пользователей из всех AD-групп: {len(ad_full_list)}. Время: {total_time:.1f} сек.")
 
-    write_excel("vault_usage_report.xlsx", aliases, groups, token_count, alias_stats, unique_users, kv_stats, kv_total, ad_full_list)
+    write_excel("vault_usage_report.xlsx", aliases, groups, tokens,
+                alias_stats, unique_users, kv_stats, kv_total, ad_full_list)
 
 
 if __name__ == "__main__":
