@@ -1,0 +1,46 @@
+- name: Загрузка конфигов для автоочистки Nexus
+  hosts: all
+  become: true
+  gather_facts: false
+
+  vars:
+    group_id: "3514"
+    gitlab_url: "https://gitlab.fc.uralsibbank.ru"
+    gitlab_token: "{{ gitlab_token }}"
+    branch: "main"
+    file_path: "nexus/cleaner"
+    dest_path: "/wdata/nexus/nexus-cleaner/configs"
+    allowed_extensions:
+      - ".yaml"
+      - ".yml"
+
+  tasks:
+    - name: Получаем все страницы с проектами GitLab
+      vars:
+        page: 1
+        all_projects: []
+      block:
+        - name: Загружаем страницу
+          uri:
+            url: "{{ gitlab_url }}/api/v4/groups/{{ group_id }}/projects?per_page=100&page={{ page }}"
+            headers:
+              PRIVATE-TOKEN: "{{ gitlab_token }}"
+            return_content: true
+          register: api_response
+          until: api_response.json | length == 0
+          retries: 50
+          delay: 0
+          loop: "{{ range(1, 1000) | list }}"
+          loop_control:
+            loop_var: page
+          when: api_response.json | length > 0
+          set_fact:
+            all_projects: "{{ all_projects + api_response.json }}"
+
+    - name: Показываем статистику
+      debug:
+        msg: "Всего проектов: {{ all_projects | length }}"
+
+    - name: Выводим несколько примеров
+      debug:
+        msg: "{{ all_projects[:3] | to_nice_json }}"
