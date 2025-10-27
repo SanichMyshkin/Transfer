@@ -7,40 +7,36 @@
     group_id: "3514"
     gitlab_url: "https://gitlab.fc.uralsibbank.ru"
     gitlab_token: "{{ gitlab_token }}"
-    branch: "main"
-    file_path: "nexus/cleaner"
-    dest_path: "/wdata/nexus/nexus-cleaner/configs"
-    allowed_extensions:
-      - ".yaml"
-      - ".yml"
+    max_pages: 20  # ограничение для пагинации
 
   tasks:
-    - name: Получаем все проекты с пагинацией
-      vars:
+    - name: Инициализация списка проектов
+      set_fact:
         all_projects: []
-      block:
-        - name: Загружаем страницы с проектами
-          uri:
-            url: "{{ gitlab_url }}/api/v4/groups/{{ group_id }}/projects?per_page=100&page={{ item }}"
-            headers:
-              PRIVATE-TOKEN: "{{ gitlab_token }}"
-            return_content: true
-          register: page_result
-          loop: "{{ range(1, 20) | list }}"  # ограничим 20 страниц для безопасности
-          until: page_result.json | length == 0
-          retries: 1
-          delay: 0
 
-        - name: Объединяем результаты всех страниц
-          set_fact:
-            all_projects: "{{ all_projects + item.json }}"
-          loop: "{{ page_result.results }}"
-          when: item.json | length > 0
+    - name: Загружаем проекты постранично
+      uri:
+        url: "{{ gitlab_url }}/api/v4/groups/{{ group_id }}/projects?per_page=100&page={{ item }}"
+        method: GET
+        headers:
+          PRIVATE-TOKEN: "{{ gitlab_token }}"
+        return_content: true
+      register: gitlab_page
+      loop: "{{ range(1, max_pages + 1) | list }}"
+      until: gitlab_page.json | length == 0
+      retries: 1
+      delay: 0
 
-    - name: Показать общее количество проектов
+    - name: Объединяем все страницы в один список
+      set_fact:
+        all_projects: "{{ all_projects + item.json }}"
+      loop: "{{ gitlab_page.results }}"
+      when: item.json | length > 0
+
+    - name: Показать количество найденных проектов
       debug:
         msg: "Всего проектов: {{ all_projects | length }}"
 
-    - name: Показать первые 3 проекта
+    - name: Показать примеры проектов
       debug:
         msg: "{{ all_projects[:3] | to_nice_json }}"
