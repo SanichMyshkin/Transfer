@@ -7,36 +7,63 @@
     group_id: "3514"
     gitlab_url: "https://gitlab.fc.uralsibbank.ru"
     gitlab_token: "{{ gitlab_token }}"
-    max_pages: 20  # ограничение для пагинации
+    branch: "main"
+    file_path: "nexus/cleaner"
+    dest_path: "/wdata/nexus/nexus-cleaner/configs"
+    allowed_extensions:
+      - ".yaml"
+      - ".yml"
 
   tasks:
-    - name: Инициализация списка проектов
-      set_fact:
-        all_projects: []
+    - name: Получаем первую страницу с заголовками и данными через curl
+      shell: >
+        curl -s -i -H "PRIVATE-TOKEN: {{ gitlab_token }}" 
+        "{{ gitlab_url }}/api/v4/groups/{{ group_id }}/projects?per_page=100&page=1"
+      register: curl_response
 
-    - name: Загружаем проекты постранично
-      uri:
-        url: "{{ gitlab_url }}/api/v4/groups/{{ group_id }}/projects?per_page=100&page={{ item }}"
-        method: GET
-        headers:
-          PRIVATE-TOKEN: "{{ gitlab_token }}"
-        return_content: true
-      register: gitlab_page
-      loop: "{{ range(1, max_pages + 1) | list }}"
-      until: gitlab_page.json | length == 0
-      retries: 1
+    - name: Разделяем заголовки и тело ответа
+      set_fact:
+        raw_headers: "{{ curl_response.stdout.split('\r\n\r\n')[0].split('\n') }}"
+        raw_body: "{{ curl_response.stdout.split('\r\n\r\n')[-1] }}"
+
+    - name: Извлекаем ссылку на следующую страницу (если есть)
+      set_fact:
+        next_page_url: "{{ raw_headers | join('\n') | regex_search('Link: <(.*?)>; rel=\"next\"', '\\1') | default('') }}"
+
+    - name: Преобразуем тело первой страницы в JSON
+      set_fact:
+        projects_data: "{{ raw_body | from_json }}"
+        all_projects: "{{ raw_body | from_json }}"
+
+    - name: Показать количество и первую страницу проектов
+      debug:
+        msg: "Получено {{ projects_data | length }} проектов. Следующая страница: {{ next_page_url | default('нет') }}"
+
+    - name: Загружаем оставшиеся страницы через uri
+      vars:
+        current_url: "{{ next_page_url }}"
+      until: current_url == ''
+      retries: 50
       delay: 0
+      block:
+        - name: Запрашиваем следующую страницу
+          uri:
+            url: "{{ current_url }}"
+            method: GET
+            headers:
+              PRIVATE-TOKEN: "{{ gitlab_token }}"
+            return_content: true
+          register: api_response
 
-    - name: Объединяем все страницы в один список
-      set_fact:
-        all_projects: "{{ all_projects + item.json }}"
-      loop: "{{ gitlab_page.results }}"
-      when: item.json | length > 0
+        - name: Добавляем проекты из следующей страницы
+          set_fact:
+            all_projects: "{{ all_projects + api_response.json }}"
 
-    - name: Показать количество найденных проектов
+        - name: Проверяем есть ли следующая ссылка
+          set_fact:
+            current_url: "{{ api_response.headers.Link | regex_search('<(.*?)>', '\\1') | default('') }}"
+
+    - name: Выводим список всех проектов
       debug:
-        msg: "Всего проектов: {{ all_projects | length }}"
-
-    - name: Показать примеры проектов
-      debug:
-        msg: "{{ all_projects[:3] | to_nice_json }}"
+        msg: "Проект: {{ item.name }} (ID: {{ item.id }})"
+      loop: "{{ all_projects }}"
