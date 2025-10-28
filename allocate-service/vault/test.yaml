@@ -7,39 +7,29 @@
     group_id: "3514"
     gitlab_token: "{{ gitlab_token }}"
     per_page: 100
+    current_page: 1
+    all_projects: []
 
   tasks:
-    - name: Инициализируем список всех проектов
-      set_fact:
-        all_projects: []
-        current_page: 1
-        next_page: true
-
-    - name: Загружаем страницы GitLab API
-      until: not next_page
+    - name: Загружаем страницу {{ current_page }}
+      uri:
+        url: "{{ gitlab_url }}/api/v4/groups/{{ group_id }}/projects?per_page={{ per_page }}&page={{ current_page }}"
+        method: GET
+        headers:
+          PRIVATE-TOKEN: "{{ gitlab_token }}"
+        return_content: true
+      register: page_response
+      until: page_response.json | length == 0
       retries: 50
       delay: 0
-      block:
-        - name: Запрашиваем страницу {{ current_page }}
-          uri:
-            url: "{{ gitlab_url }}/api/v4/groups/{{ group_id }}/projects?per_page={{ per_page }}&page={{ current_page }}"
-            method: GET
-            headers:
-              PRIVATE-TOKEN: "{{ gitlab_token }}"
-            return_content: true
-          register: page_response
 
-        - name: Добавляем проекты в общий список
-          set_fact:
-            all_projects: "{{ all_projects + page_response.json }}"
+    - name: Добавляем все страницы в список
+      set_fact:
+        all_projects: "{{ all_projects + item.json }}"
+      loop: "{{ page_response.results | default([]) }}"
+      when: item.json | length > 0
 
-        - name: Проверяем, есть ли следующая страница
-          set_fact:
-            next_page: "{{ page_response.json | length == per_page }}"
-            current_page: "{{ current_page + 1 }}"
-      when: next_page | bool
-
-    - name: Показать количество проектов
+    - name: Показать общее количество проектов
       debug:
         msg: "Всего проектов: {{ all_projects | length }}"
 
