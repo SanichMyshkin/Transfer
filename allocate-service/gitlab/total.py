@@ -3,10 +3,9 @@ import os
 from dotenv import load_dotenv
 import urllib3
 import xlsxwriter
-from datetime import datetime
 from pathlib import Path
 
-# Отключаем ворнинги SSL (если GitLab с самоподписанным сертификатом)
+# Отключаем предупреждения SSL (если GitLab с самоподписанным сертификатом)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Загружаем переменные окружения
@@ -35,6 +34,14 @@ def get_users(gl: gitlab.Gitlab):
     result = []
 
     for u in users:
+        # Извлекаем extern_uid из identities, если есть
+        extern_uid = ""
+        identities = getattr(u, "identities", [])
+        if identities and isinstance(identities, list):
+            extern_uid = ", ".join(
+                i.get("extern_uid", "") for i in identities if isinstance(i, dict)
+            )
+
         result.append(
             {
                 "id": u.id,
@@ -43,7 +50,7 @@ def get_users(gl: gitlab.Gitlab):
                 "name": u.name,
                 "last_sign_in_at": getattr(u, "last_sign_in_at", ""),
                 "last_activity_on": getattr(u, "last_activity_on", ""),
-                "identities": ", ".join(map(str, getattr(u, "identities", []) or [])),
+                "extern_uid": extern_uid,
             }
         )
 
@@ -57,7 +64,6 @@ def get_stat(gl: gitlab.Gitlab):
     """Получение общей статистики GitLab (всё плоско, без рекурсии)"""
     stats = gl.statistics.get()
 
-    # GitLab возвращает объект ApplicationStatistics, содержащий простые поля
     stats_dict = {
         "forks": stats.forks,
         "issues": stats.issues,
@@ -72,7 +78,7 @@ def get_stat(gl: gitlab.Gitlab):
         "active_users": stats.active_users,
     }
 
-    # Конвертируем строковые числа в int
+    # Преобразуем строковые числа в int, если это возможно
     for k, v in stats_dict.items():
         if isinstance(v, str):
             value = v.replace(",", "").strip()
@@ -85,12 +91,8 @@ def get_stat(gl: gitlab.Gitlab):
 # ======================
 # 📘 Запись данных в Excel
 # ======================
-def write_to_excel(users_data, statistics_data, filename=None):
+def write_to_excel(users_data, statistics_data, filename="gitlab_report.xlsx"):
     """Создание Excel-отчёта"""
-    if filename is None:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"gitlab_report_{timestamp}.xlsx"
-
     filename = str(Path(filename).resolve())
     workbook = xlsxwriter.Workbook(filename)
 
@@ -108,7 +110,7 @@ def write_to_excel(users_data, statistics_data, filename=None):
         "Name",
         "Last Sign In",
         "Last Activity",
-        "Identities",
+        "Extern UID",
     ]
 
     for col, header in enumerate(user_headers):
@@ -121,7 +123,7 @@ def write_to_excel(users_data, statistics_data, filename=None):
         users_sheet.write(row, 3, user["name"], cell_format)
         users_sheet.write(row, 4, user["last_sign_in_at"], cell_format)
         users_sheet.write(row, 5, user["last_activity_on"], cell_format)
-        users_sheet.write(row, 6, user["identities"], cell_format)
+        users_sheet.write(row, 6, user["extern_uid"], cell_format)
 
     for col in range(len(user_headers)):
         users_sheet.set_column(col, col, 20)
