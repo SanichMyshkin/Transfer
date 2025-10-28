@@ -1,0 +1,58 @@
+- name: Получаем все проекты из GitLab группы
+  hosts: all
+  gather_facts: false
+
+  vars:
+    gitlab_url: "https://gitlab.ru"
+    group_id: "3514"
+    gitlab_token: "{{ gitlab_token }}"
+    per_page: 10
+
+  tasks:
+    - name: Инициализация списка всех проектов
+      set_fact:
+        all_projects: []
+
+    - name: Загружаем первую страницу
+      uri:
+        url: "{{ gitlab_url }}/api/v4/groups/{{ group_id }}/projects?per_page={{ per_page }}&page=1"
+        method: GET
+        headers:
+          PRIVATE-TOKEN: "{{ gitlab_token }}"
+        return_content: true
+      register: gitlab_page
+
+    - name: Сохраняем первую страницу
+      set_fact:
+        all_projects: "{{ gitlab_page.json }}"
+        next_page_url: "{{ gitlab_page.headers.Link | default('') | regex_search('<(.*?)>; rel=\"next\"', '\\1') | default('') }}"
+
+    - name: Загружаем остальные страницы
+      vars:
+        current_url: "{{ next_page_url }}"
+      while: current_url != ""
+      do:
+        - name: Загружаем следующую страницу GitLab API
+          uri:
+            url: "{{ current_url }}"
+            method: GET
+            headers:
+              PRIVATE-TOKEN: "{{ gitlab_token }}"
+            return_content: true
+          register: next_page_response
+
+        - name: Добавляем проекты из страницы
+          set_fact:
+            all_projects: "{{ all_projects + next_page_response.json }}"
+
+        - name: Обновляем ссылку на следующую страницу
+          set_fact:
+            current_url: "{{ next_page_response.headers.Link | default('') | regex_search('<(.*?)>; rel=\"next\"', '\\1') | default('') }}"
+
+    - name: Показать количество проектов
+      debug:
+        msg: "Всего проектов: {{ all_projects | length }}"
+
+    - name: Показать первые 3 проекта
+      debug:
+        msg: "{{ all_projects[:3] | to_nice_json }}"
