@@ -5,9 +5,11 @@ import urllib3
 import xlsxwriter
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any, List
 
+# Отключаем ворнинги SSL (если GitLab с самоподписанным сертификатом)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# Загружаем переменные окружения
 load_dotenv()
 
 GITLAB_URL = os.getenv("GITLAB_URL")
@@ -27,84 +29,114 @@ def get_gitlab_connection(url: str, token: str) -> gitlab.Gitlab:
 # ======================
 # 👥 Получение пользователей
 # ======================
-def get_users(gl: gitlab.Gitlab) -> List[Dict[str, Any]]:
+def get_users(gl: gitlab.Gitlab):
     """Возвращает список пользователей GitLab"""
     users = gl.users.list(all=True, iterator=True)
-    return [
-        {
-            "id": u.id,
-            "username": u.username,
-            "email": getattr(u, "email", ""),
-            "name": u.name,
-            "last_sign_in_at": getattr(u, "last_sign_in_at", ""),
-            "last_activity_on": getattr(u, "last_activity_on", ""),
-            "identities": ", ".join(map(str, getattr(u, "identities", []) or []))
-        }
-        for u in users
-    ]
+    result = []
+
+    for u in users:
+        result.append(
+            {
+                "id": u.id,
+                "username": u.username,
+                "email": getattr(u, "email", ""),
+                "name": u.name,
+                "last_sign_in_at": getattr(u, "last_sign_in_at", ""),
+                "last_activity_on": getattr(u, "last_activity_on", ""),
+                "identities": ", ".join(map(str, getattr(u, "identities", []) or [])),
+            }
+        )
+
+    return result
 
 
 # ======================
 # 📊 Получение статистики
 # ======================
-def flatten_object(obj: Any, prefix: str = "") -> Dict[str, Any]:
-    """Рекурсивное преобразование объекта в словарь простых типов"""
-    result = {}
-    if isinstance(obj, (int, float, str, bool, type(None))):
-        return {prefix.strip("_"): obj}
-
-    if hasattr(obj, "__dict__"):
-        for k, v in vars(obj).items():
-            result.update(flatten_object(v, f"{prefix}_{k}"))
-    elif isinstance(obj, dict):
-        for k, v in obj.items():
-            result.update(flatten_object(v, f"{prefix}_{k}"))
-    return result
-
-
-def get_stat(gl: gitlab.Gitlab) -> Dict[str, Any]:
-    """Получает статистику GitLab в виде простого словаря"""
+def get_stat(gl: gitlab.Gitlab):
+    """Получение общей статистики GitLab (всё плоско, без рекурсии)"""
     stats = gl.statistics.get()
-    return flatten_object(stats)
+
+    # GitLab возвращает объект ApplicationStatistics, содержащий простые поля
+    stats_dict = {
+        "forks": stats.forks,
+        "issues": stats.issues,
+        "merge_requests": stats.merge_requests,
+        "notes": stats.notes,
+        "snippets": stats.snippets,
+        "ssh_keys": stats.ssh_keys,
+        "milestones": stats.milestones,
+        "users": stats.users,
+        "projects": stats.projects,
+        "groups": stats.groups,
+        "active_users": stats.active_users,
+    }
+
+    # Конвертируем строковые числа в int
+    for k, v in stats_dict.items():
+        if isinstance(v, str):
+            value = v.replace(",", "").strip()
+            if value.isdigit():
+                stats_dict[k] = int(value)
+
+    return stats_dict
 
 
 # ======================
-# 📘 Работа с Excel
+# 📘 Запись данных в Excel
 # ======================
-def write_to_excel(users: List[Dict[str, Any]], stats: Dict[str, Any], filename: str = None) -> str:
-    """Создаёт Excel-отчёт"""
-    filename = filename or f"gitlab_report_{datetime.now():%Y%m%d_%H%M%S}.xlsx"
+def write_to_excel(users_data, statistics_data, filename=None):
+    """Создание Excel-отчёта"""
+    if filename is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"gitlab_report_{timestamp}.xlsx"
+
     filename = str(Path(filename).resolve())
-
     workbook = xlsxwriter.Workbook(filename)
-    header_fmt = workbook.add_format({'bold': True, 'bg_color': '#D3D3D3', 'border': 1})
-    cell_fmt = workbook.add_format({'border': 1})
 
-    # --- Пользователи ---
-    sheet_users = workbook.add_worksheet("Пользователи")
-    headers = ["ID", "Username", "Email", "Name", "Last Sign In", "Last Activity", "Identities"]
+    header_format = workbook.add_format(
+        {"bold": True, "bg_color": "#D3D3D3", "border": 1}
+    )
+    cell_format = workbook.add_format({"border": 1})
 
-    for col, header in enumerate(headers):
-        sheet_users.write(0, col, header, header_fmt)
+    # --- Лист с пользователями ---
+    users_sheet = workbook.add_worksheet("Пользователи")
+    user_headers = [
+        "ID",
+        "Username",
+        "Email",
+        "Name",
+        "Last Sign In",
+        "Last Activity",
+        "Identities",
+    ]
 
-    for row, user in enumerate(users, start=1):
-        for col, key in enumerate(["id", "username", "email", "name", "last_sign_in_at", "last_activity_on", "identities"]):
-            sheet_users.write(row, col, user.get(key, ""), cell_fmt)
+    for col, header in enumerate(user_headers):
+        users_sheet.write(0, col, header, header_format)
 
-    for col in range(len(headers)):
-        sheet_users.set_column(col, col, 20)
+    for row, user in enumerate(users_data, start=1):
+        users_sheet.write(row, 0, user["id"], cell_format)
+        users_sheet.write(row, 1, user["username"], cell_format)
+        users_sheet.write(row, 2, user["email"], cell_format)
+        users_sheet.write(row, 3, user["name"], cell_format)
+        users_sheet.write(row, 4, user["last_sign_in_at"], cell_format)
+        users_sheet.write(row, 5, user["last_activity_on"], cell_format)
+        users_sheet.write(row, 6, user["identities"], cell_format)
 
-    # --- Статистика ---
-    sheet_stats = workbook.add_worksheet("Статистика")
-    sheet_stats.write(0, 0, "Показатель", header_fmt)
-    sheet_stats.write(0, 1, "Значение", header_fmt)
+    for col in range(len(user_headers)):
+        users_sheet.set_column(col, col, 20)
 
-    for row, (key, value) in enumerate(stats.items(), start=1):
-        sheet_stats.write(row, 0, key.replace("_", " ").title(), cell_fmt)
-        sheet_stats.write(row, 1, str(value), cell_fmt)
+    # --- Лист со статистикой ---
+    stats_sheet = workbook.add_worksheet("Статистика")
+    stats_sheet.write(0, 0, "Показатель", header_format)
+    stats_sheet.write(0, 1, "Значение", header_format)
 
-    sheet_stats.set_column(0, 0, 40)
-    sheet_stats.set_column(1, 1, 30)
+    for row, (key, value) in enumerate(statistics_data.items(), start=1):
+        stats_sheet.write(row, 0, key.replace("_", " ").title(), cell_format)
+        stats_sheet.write(row, 1, value, cell_format)
+
+    stats_sheet.set_column(0, 0, 30)
+    stats_sheet.set_column(1, 1, 20)
 
     workbook.close()
     print(f"✅ Отчёт сохранён: {filename}")
@@ -120,14 +152,17 @@ def main():
         print("🔗 Успешное подключение к GitLab")
 
         print("📥 Получаем пользователей...")
-        users = get_users(gl)
-        print(f"Найдено пользователей: {len(users)}")
+        users_data = get_users(gl)
+        print(f"Найдено пользователей: {len(users_data)}")
 
         print("📈 Получаем статистику...")
-        stats = get_stat(gl)
-        print(f"Показателей статистики: {len(stats)}")
+        statistics_data = get_stat(gl)
+        print("Статистика GitLab:")
+        for k, v in statistics_data.items():
+            print(f"  {k}: {v}")
 
-        write_to_excel(users, stats)
+        write_to_excel(users_data, statistics_data)
+
     except Exception as e:
         print(f"❌ Ошибка: {e}")
 
