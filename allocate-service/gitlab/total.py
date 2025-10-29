@@ -5,7 +5,6 @@ from dotenv import load_dotenv
 import urllib3
 import xlsxwriter
 from pathlib import Path
-from datetime import datetime
 
 # ======================
 # ⚙️ Настройки окружения
@@ -19,12 +18,13 @@ GITLAB_TOKEN = os.getenv("GITLAB_TOKEN")
 # ======================
 # 🧠 Настройка логирования
 # ======================
-log_filename = f"gitlab_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+LOG_FILE = "gitlab_report.log"
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.FileHandler(log_filename, encoding="utf-8"),
+        logging.FileHandler(LOG_FILE, mode="a", encoding="utf-8"),  # ⬅️ дозапись
         logging.StreamHandler()
     ]
 )
@@ -115,7 +115,7 @@ def get_projects_stats(gl: gitlab.Gitlab):
 
     for idx, p in enumerate(projects, start=1):
         try:
-            logger.debug(f"[{idx}] Обработка проекта: {p.path_with_namespace}")
+            logger.info(f"[{idx}] Обработка проекта: {p.path_with_namespace}")
             project = gl.projects.get(p.id, statistics=True)
             stats = getattr(project, "statistics", {}) or {}
 
@@ -237,6 +237,7 @@ def write_to_excel(users_data, statistics_data, projects_data, filename="gitlab_
 # ======================
 def main():
     try:
+        logger.info("========== ЗАПУСК ОТЧЁТА GitLab ==========")
         gl = get_gitlab_connection(GITLAB_URL, GITLAB_TOKEN)
 
         users_data = get_users(gl)
@@ -244,9 +245,7 @@ def main():
         projects_data = get_projects_stats(gl)
 
         write_to_excel(users_data, statistics_data, projects_data)
-
-        logger.info("✅ Работа успешно завершена.")
-        logger.info(f"📄 Лог сохранён: {log_filename}")
+        logger.info("✅ Работа успешно завершена.\n")
 
     except Exception as e:
         logger.exception(f"❌ Ошибка выполнения: {e}")
