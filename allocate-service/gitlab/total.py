@@ -1,3 +1,4 @@
+import requests
 import gitlab
 import os
 import logging
@@ -5,6 +6,7 @@ from dotenv import load_dotenv
 import urllib3
 import xlsxwriter
 from pathlib import Path
+
 
 # ======================
 # ⚙️ Настройки окружения
@@ -114,21 +116,25 @@ def get_stat(gl: gitlab.Gitlab):
 # ======================
 # ⚡ Быстрый подсчёт коммитов (через X-Total)
 # ======================
-def get_commit_count(gl, project_id):
-    """Получает количество коммитов через заголовок X-Total"""
+def get_commit_count(project_id):
+    """Быстро получает количество коммитов через API-заголовок X-Total"""
     try:
-        _, response = gl.http_request(
-            "GET",
-            f"/projects/{project_id}/repository/commits",
-            query_parameters={"per_page": 1},
-        )
-        total = response.headers.get("X-Total")
-        return int(total) if total and total.isdigit() else 0
+        url = f"{GITLAB_URL}/api/v4/projects/{project_id}/repository/commits"
+        headers = {"PRIVATE-TOKEN": GITLAB_TOKEN}
+        params = {"per_page": 1}
+        response = requests.get(url, headers=headers, params=params, verify=False, timeout=20)
+
+        if response.status_code == 200:
+            total = response.headers.get("X-Total")
+            return int(total) if total and total.isdigit() else 0
+        else:
+            logger.warning(f"GitLab API вернул статус {response.status_code} для проекта {project_id}")
+            return "N/A"
+
     except Exception as e:
-        logger.warning(
-            f"Не удалось получить количество коммитов для проекта {project_id}: {e}"
-        )
+        logger.warning(f"Не удалось получить количество коммитов для проекта {project_id}: {e}")
         return "N/A"
+
 
 
 # ======================
