@@ -5,6 +5,7 @@ from dotenv import load_dotenv
 import urllib3
 import xlsxwriter
 from pathlib import Path
+import time
 
 # ======================
 # ⚙️ Настройки окружения
@@ -15,16 +16,16 @@ load_dotenv()
 GITLAB_URL = os.getenv("GITLAB_URL")
 GITLAB_TOKEN = os.getenv("GITLAB_TOKEN")
 
-LOG_FILE = "gitlab_report.log"  # 📜 Единый лог-файл, дозаписывается
+LOG_FILE = "gitlab_report.log"
 
 # ======================
-# 🧠 Настройка логирования
+# 🧠 Логирование
 # ======================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.FileHandler(LOG_FILE, mode="a", encoding="utf-8"),  # дозапись
+        logging.FileHandler(LOG_FILE, mode="a", encoding="utf-8"),
         logging.StreamHandler()
     ]
 )
@@ -43,10 +44,10 @@ def get_gitlab_connection(url: str, token: str) -> gitlab.Gitlab:
 
 
 # ======================
-# 👥 Получение пользователей
+# 👥 Пользователи
 # ======================
 def get_users(gl: gitlab.Gitlab):
-    logger.info("Получаем список пользователей...")
+    logger.info("Получаем пользователей...")
     users = gl.users.list(all=True, iterator=True)
     result = []
 
@@ -106,34 +107,38 @@ def get_stat(gl: gitlab.Gitlab):
 
 
 # ======================
-# 📁 Статистика по проектам
+# 📁 Проекты с детализацией
 # ======================
 def get_projects_stats(gl: gitlab.Gitlab):
-    logger.info("Начинаем сбор статистики по проектам (без коммитов)...")
-
-    # ⚡ Загружаем проекты сразу со статистикой
-    projects = gl.projects.list(all=True, iterator=True, statistics=True)
+    logger.info("Начинаем сбор статистики по проектам...")
+    projects = gl.projects.list(all=True, iterator=True)
     result = []
 
     for idx, project in enumerate(projects, start=1):
         try:
-            stats = getattr(project, "statistics", {}) or {}
+            # Получаем полную информацию о проекте с актуальной статистикой
+            full_proj = gl.projects.get(project.id, statistics=True)
+            stats = getattr(full_proj, "statistics", {}) or {}
+
             project_data = {
-                "id": project.id,
-                "name": project.name,
-                "path_with_namespace": project.path_with_namespace,
+                "id": full_proj.id,
+                "name": full_proj.name,
+                "path_with_namespace": full_proj.path_with_namespace,
                 "repository_size_mb": round(stats.get("repository_size", 0) / 1024 / 1024, 2),
                 "lfs_objects_size_mb": round(stats.get("lfs_objects_size", 0) / 1024 / 1024, 2),
                 "job_artifacts_size_mb": round(stats.get("job_artifacts_size", 0) / 1024 / 1024, 2),
                 "storage_size_mb": round(stats.get("storage_size", 0) / 1024 / 1024, 2),
-                "last_activity_at": project.last_activity_at,
-                "visibility": project.visibility,
+                "commit_count": stats.get("commit_count", 0),
+                "last_activity_at": full_proj.last_activity_at,
+                "visibility": full_proj.visibility,
             }
 
             result.append(project_data)
 
             if idx % 50 == 0:
                 logger.info(f"Обработано проектов: {idx}")
+
+            time.sleep(0.05)  # лёгкий троттлинг для API
 
         except Exception as e:
             logger.warning(f"Ошибка при обработке проекта {getattr(project, 'path_with_namespace', project.id)}: {e}")
@@ -147,7 +152,7 @@ def get_projects_stats(gl: gitlab.Gitlab):
 
 
 # ======================
-# 📘 Запись отчёта в Excel
+# 📘 Запись отчёта
 # ======================
 def write_to_excel(users_data, statistics_data, projects_data, filename="gitlab_report.xlsx"):
     filename = str(Path(filename).resolve())
@@ -173,8 +178,6 @@ def write_to_excel(users_data, statistics_data, projects_data, filename="gitlab_
         users_sheet.write(row, 5, user["last_activity_on"], cell_format)
         users_sheet.write(row, 6, user["extern_uid"], cell_format)
 
-    users_sheet.set_column(0, len(user_headers) - 1, 20)
-
     # --- Общая статистика ---
     stats_sheet = workbook.add_worksheet("Статистика")
     stats_sheet.write(0, 0, "Показатель", header_format)
@@ -184,15 +187,13 @@ def write_to_excel(users_data, statistics_data, projects_data, filename="gitlab_
         stats_sheet.write(row, 0, key.replace("_", " ").title(), cell_format)
         stats_sheet.write(row, 1, value, cell_format)
 
-    stats_sheet.set_column(0, 0, 30)
-    stats_sheet.set_column(1, 1, 20)
-
     # --- Проекты ---
     projects_sheet = workbook.add_worksheet("Проекты")
     proj_headers = [
         "ID", "Project Name", "Namespace Path",
-        "Repo Size (MB)", "LFS Size (MB)", "Artifacts Size (MB)",
-        "Total Storage (MB)", "Last Activity", "Visibility"
+        "Repo Size (MB)", "LFS Size (MB)",
+        "Artifacts Size (MB)", "Total Storage (MB)",
+        "Commits", "Last Activity", "Visibility"
     ]
 
     for col, header in enumerate(proj_headers):
@@ -206,10 +207,9 @@ def write_to_excel(users_data, statistics_data, projects_data, filename="gitlab_
         projects_sheet.write(row, 4, p["lfs_objects_size_mb"], cell_format)
         projects_sheet.write(row, 5, p["job_artifacts_size_mb"], cell_format)
         projects_sheet.write(row, 6, p["storage_size_mb"], cell_format)
-        projects_sheet.write(row, 7, p["last_activity_at"], cell_format)
-        projects_sheet.write(row, 8, p["visibility"], cell_format)
-
-    projects_sheet.set_column(0, len(proj_headers) - 1, 20)
+        projects_sheet.write(row, 7, p["commit_count"], cell_format)
+        projects_sheet.write(row, 8, p["last_activity_at"], cell_format)
+        projects_sheet.write(row, 9, p["visibility"], cell_format)
 
     workbook.close()
     logger.info(f"Отчёт успешно сохранён: {filename}")
