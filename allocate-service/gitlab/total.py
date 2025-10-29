@@ -1,12 +1,14 @@
 import gitlab
 import os
+import logging
 from dotenv import load_dotenv
 import urllib3
 import xlsxwriter
 from pathlib import Path
+from datetime import datetime
 
 # ======================
-# ⚙️ Настройки
+# ⚙️ Настройки окружения
 # ======================
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 load_dotenv()
@@ -14,20 +16,37 @@ load_dotenv()
 GITLAB_URL = os.getenv("GITLAB_URL")
 GITLAB_TOKEN = os.getenv("GITLAB_TOKEN")
 
+# ======================
+# 🧠 Настройка логирования
+# ======================
+log_filename = f"gitlab_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(log_filename, encoding="utf-8"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
 
 # ======================
-# 🔗 Подключение
+# 🔗 Подключение к GitLab
 # ======================
 def get_gitlab_connection(url: str, token: str) -> gitlab.Gitlab:
+    logger.info("Подключаемся к GitLab...")
     gl = gitlab.Gitlab(url, private_token=token, ssl_verify=False, timeout=60)
     gl.auth()
+    logger.info("Успешное подключение к GitLab")
     return gl
 
 
 # ======================
-# 👥 Пользователи
+# 👥 Получение пользователей
 # ======================
 def get_users(gl: gitlab.Gitlab):
+    logger.info("Получаем список пользователей...")
     users = gl.users.list(all=True, iterator=True)
     result = []
 
@@ -51,13 +70,15 @@ def get_users(gl: gitlab.Gitlab):
             }
         )
 
+    logger.info(f"Пользователей получено: {len(result)}")
     return result
 
 
 # ======================
-# 📊 Общая статистика
+# 📊 Общая статистика GitLab
 # ======================
 def get_stat(gl: gitlab.Gitlab):
+    logger.info("Получаем общую статистику GitLab...")
     stats = gl.statistics.get()
 
     stats_dict = {
@@ -80,6 +101,7 @@ def get_stat(gl: gitlab.Gitlab):
             if value.isdigit():
                 stats_dict[k] = int(value)
 
+    logger.info("Общая статистика успешно получена.")
     return stats_dict
 
 
@@ -87,12 +109,13 @@ def get_stat(gl: gitlab.Gitlab):
 # 📁 Статистика по проектам
 # ======================
 def get_projects_stats(gl: gitlab.Gitlab):
-    """Возвращает список проектов с метриками"""
+    logger.info("Начинаем сбор статистики по проектам...")
     projects = gl.projects.list(all=True, iterator=True)
     result = []
 
-    for p in projects:
+    for idx, p in enumerate(projects, start=1):
         try:
+            logger.debug(f"[{idx}] Обработка проекта: {p.path_with_namespace}")
             project = gl.projects.get(p.id, statistics=True)
             stats = getattr(project, "statistics", {}) or {}
 
@@ -114,62 +137,42 @@ def get_projects_stats(gl: gitlab.Gitlab):
             except Exception:
                 tags_count = "N/A"
 
-            result.append(
-                {
-                    "id": project.id,
-                    "name": project.name,
-                    "path_with_namespace": project.path_with_namespace,
-                    "repository_size_mb": round(
-                        stats.get("repository_size", 0) / 1024 / 1024, 2
-                    ),
-                    "lfs_objects_size_mb": round(
-                        stats.get("lfs_objects_size", 0) / 1024 / 1024, 2
-                    ),
-                    "job_artifacts_size_mb": round(
-                        stats.get("job_artifacts_size", 0) / 1024 / 1024, 2
-                    ),
-                    "storage_size_mb": round(
-                        stats.get("storage_size", 0) / 1024 / 1024, 2
-                    ),
-                    "commit_count": commits_count,
-                    "branches_count": branches_count,
-                    "tags_count": tags_count,
-                    "last_activity_at": project.last_activity_at,
-                    "visibility": project.visibility,
-                }
-            )
+            result.append({
+                "id": project.id,
+                "name": project.name,
+                "path_with_namespace": project.path_with_namespace,
+                "repository_size_mb": round(stats.get("repository_size", 0) / 1024 / 1024, 2),
+                "lfs_objects_size_mb": round(stats.get("lfs_objects_size", 0) / 1024 / 1024, 2),
+                "job_artifacts_size_mb": round(stats.get("job_artifacts_size", 0) / 1024 / 1024, 2),
+                "storage_size_mb": round(stats.get("storage_size", 0) / 1024 / 1024, 2),
+                "commit_count": commits_count,
+                "branches_count": branches_count,
+                "tags_count": tags_count,
+                "last_activity_at": project.last_activity_at,
+                "visibility": project.visibility,
+            })
         except Exception as e:
-            print(f"⚠️ Ошибка при обработке проекта {p.path_with_namespace}: {e}")
+            logger.warning(f"Ошибка при обработке проекта {p.path_with_namespace}: {e}")
             continue
 
+    logger.info(f"Статистика собрана для {len(result)} проектов.")
     return result
 
 
 # ======================
-# 📘 Excel отчёт
+# 📘 Запись отчёта в Excel
 # ======================
-def write_to_excel(
-    users_data, statistics_data, projects_data, filename="gitlab_report.xlsx"
-):
+def write_to_excel(users_data, statistics_data, projects_data, filename="gitlab_report.xlsx"):
     filename = str(Path(filename).resolve())
-    workbook = xlsxwriter.Workbook(filename)
+    logger.info(f"Создаём Excel-отчёт: {filename}")
 
-    header_format = workbook.add_format(
-        {"bold": True, "bg_color": "#D3D3D3", "border": 1}
-    )
+    workbook = xlsxwriter.Workbook(filename)
+    header_format = workbook.add_format({"bold": True, "bg_color": "#D3D3D3", "border": 1})
     cell_format = workbook.add_format({"border": 1})
 
     # --- Пользователи ---
     users_sheet = workbook.add_worksheet("Пользователи")
-    user_headers = [
-        "ID",
-        "Username",
-        "Email",
-        "Name",
-        "Last Sign In",
-        "Last Activity",
-        "Extern UID",
-    ]
+    user_headers = ["ID", "Username", "Email", "Name", "Last Sign In", "Last Activity", "Extern UID"]
 
     for col, header in enumerate(user_headers):
         users_sheet.write(0, col, header, header_format)
@@ -200,18 +203,9 @@ def write_to_excel(
     # --- Проекты ---
     projects_sheet = workbook.add_worksheet("Проекты")
     proj_headers = [
-        "ID",
-        "Project Name",
-        "Namespace Path",
-        "Repo Size (MB)",
-        "LFS Size (MB)",
-        "Artifacts Size (MB)",
-        "Total Storage (MB)",
-        "Commits",
-        "Branches",
-        "Tags",
-        "Last Activity",
-        "Visibility",
+        "ID", "Project Name", "Namespace Path", "Repo Size (MB)", "LFS Size (MB)",
+        "Artifacts Size (MB)", "Total Storage (MB)", "Commits", "Branches", "Tags",
+        "Last Activity", "Visibility"
     ]
 
     for col, header in enumerate(proj_headers):
@@ -234,7 +228,7 @@ def write_to_excel(
     projects_sheet.set_column(0, len(proj_headers) - 1, 20)
 
     workbook.close()
-    print(f"✅ Отчёт сохранён: {filename}")
+    logger.info(f"Отчёт успешно сохранён: {filename}")
     return filename
 
 
@@ -244,23 +238,18 @@ def write_to_excel(
 def main():
     try:
         gl = get_gitlab_connection(GITLAB_URL, GITLAB_TOKEN)
-        print("🔗 Успешное подключение к GitLab")
 
-        print("📥 Получаем пользователей...")
         users_data = get_users(gl)
-        print(f"Найдено пользователей: {len(users_data)}")
-
-        print("📊 Получаем общую статистику...")
         statistics_data = get_stat(gl)
-
-        print("📁 Получаем статистику по проектам...")
         projects_data = get_projects_stats(gl)
-        print(f"Найдено проектов: {len(projects_data)}")
 
         write_to_excel(users_data, statistics_data, projects_data)
 
+        logger.info("✅ Работа успешно завершена.")
+        logger.info(f"📄 Лог сохранён: {log_filename}")
+
     except Exception as e:
-        print(f"❌ Ошибка: {e}")
+        logger.exception(f"❌ Ошибка выполнения: {e}")
 
 
 if __name__ == "__main__":
