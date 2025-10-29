@@ -1,7 +1,6 @@
 import gitlab
 import os
 import logging
-import requests
 from dotenv import load_dotenv
 import urllib3
 import xlsxwriter
@@ -16,10 +15,6 @@ load_dotenv()
 GITLAB_URL = os.getenv("GITLAB_URL")
 GITLAB_TOKEN = os.getenv("GITLAB_TOKEN")
 
-# ======================
-# ⚙️ Пользовательские параметры
-# ======================
-COUNT_COMMITS = True  # 🔧 ВКЛ/ВЫКЛ подсчёт количества коммитов (через X-Total, 1 запрос)
 LOG_FILE = "gitlab_report.log"  # 📜 Единый лог-файл, дозаписывается
 
 # ======================
@@ -111,39 +106,12 @@ def get_stat(gl: gitlab.Gitlab):
 
 
 # ======================
-# ⚡ Быстрый подсчёт коммитов (через requests и X-Total)
-# ======================
-def get_commit_count(project_id):
-    """Быстро получает количество коммитов через API-заголовок X-Total"""
-    try:
-        url = f"{GITLAB_URL}/api/v4/projects/{project_id}/repository/commits"
-        headers = {"PRIVATE-TOKEN": GITLAB_TOKEN}
-        params = {"per_page": 1}
-        response = requests.get(url, headers=headers, params=params, verify=False, timeout=20)
-
-        if response.status_code == 200:
-            total = response.headers.get("X-Total")
-            return int(total) if total and total.isdigit() else 0
-        else:
-            logger.warning(f"GitLab API вернул статус {response.status_code} для проекта {project_id}")
-            return "N/A"
-
-    except Exception as e:
-        logger.warning(f"Не удалось получить количество коммитов для проекта {project_id}: {e}")
-        return "N/A"
-
-
-# ======================
 # 📁 Статистика по проектам
 # ======================
 def get_projects_stats(gl: gitlab.Gitlab):
-    logger.info("Начинаем сбор статистики по проектам...")
-    if COUNT_COMMITS:
-        logger.info("Подсчёт количества коммитов включён (через X-Total, быстро).")
-    else:
-        logger.info("Подсчёт количества коммитов отключён (ещё быстрее).")
+    logger.info("Начинаем сбор статистики по проектам (без коммитов)...")
 
-    # ⚡ Загружаем проекты сразу со статистикой, без отдельных .get()
+    # ⚡ Загружаем проекты сразу со статистикой
     projects = gl.projects.list(all=True, iterator=True, statistics=True)
     result = []
 
@@ -162,11 +130,6 @@ def get_projects_stats(gl: gitlab.Gitlab):
                 "visibility": project.visibility,
             }
 
-            if COUNT_COMMITS:
-                project_data["commit_count"] = get_commit_count(project.id)
-            else:
-                project_data["commit_count"] = "—"
-
             result.append(project_data)
 
             if idx % 50 == 0:
@@ -175,6 +138,9 @@ def get_projects_stats(gl: gitlab.Gitlab):
         except Exception as e:
             logger.warning(f"Ошибка при обработке проекта {getattr(project, 'path_with_namespace', project.id)}: {e}")
             continue
+
+    # 📊 Сортировка по размеру (по убыванию)
+    result.sort(key=lambda x: x.get("storage_size_mb", 0), reverse=True)
 
     logger.info(f"✅ Сбор статистики завершён: всего проектов — {len(result)}.")
     return result
@@ -224,9 +190,9 @@ def write_to_excel(users_data, statistics_data, projects_data, filename="gitlab_
     # --- Проекты ---
     projects_sheet = workbook.add_worksheet("Проекты")
     proj_headers = [
-        "ID", "Project Name", "Namespace Path", "Repo Size (MB)", "LFS Size (MB)",
-        "Artifacts Size (MB)", "Total Storage (MB)", "Commits",
-        "Last Activity", "Visibility"
+        "ID", "Project Name", "Namespace Path",
+        "Repo Size (MB)", "LFS Size (MB)", "Artifacts Size (MB)",
+        "Total Storage (MB)", "Last Activity", "Visibility"
     ]
 
     for col, header in enumerate(proj_headers):
@@ -240,9 +206,8 @@ def write_to_excel(users_data, statistics_data, projects_data, filename="gitlab_
         projects_sheet.write(row, 4, p["lfs_objects_size_mb"], cell_format)
         projects_sheet.write(row, 5, p["job_artifacts_size_mb"], cell_format)
         projects_sheet.write(row, 6, p["storage_size_mb"], cell_format)
-        projects_sheet.write(row, 7, p["commit_count"], cell_format)
-        projects_sheet.write(row, 8, p["last_activity_at"], cell_format)
-        projects_sheet.write(row, 9, p["visibility"], cell_format)
+        projects_sheet.write(row, 7, p["last_activity_at"], cell_format)
+        projects_sheet.write(row, 8, p["visibility"], cell_format)
 
     projects_sheet.set_column(0, len(proj_headers) - 1, 20)
 
