@@ -113,12 +113,17 @@ def get_projects_stats(gl: gitlab.Gitlab):
     logger.info("Начинаем сбор статистики по проектам...")
     projects = gl.projects.list(all=True, iterator=True)
     result = []
+    total_commits = 0
 
     for idx, project in enumerate(projects, start=1):
         try:
-            # Получаем полную информацию о проекте с актуальной статистикой
+            # Получаем полную информацию по каждому проекту
             full_proj = gl.projects.get(project.id, statistics=True)
             stats = getattr(full_proj, "statistics", {}) or {}
+
+            commit_count = stats.get("commit_count", 0)
+            if isinstance(commit_count, int):
+                total_commits += commit_count
 
             project_data = {
                 "id": full_proj.id,
@@ -128,7 +133,7 @@ def get_projects_stats(gl: gitlab.Gitlab):
                 "lfs_objects_size_mb": round(stats.get("lfs_objects_size", 0) / 1024 / 1024, 2),
                 "job_artifacts_size_mb": round(stats.get("job_artifacts_size", 0) / 1024 / 1024, 2),
                 "storage_size_mb": round(stats.get("storage_size", 0) / 1024 / 1024, 2),
-                "commit_count": stats.get("commit_count", 0),
+                "commit_count": commit_count,
                 "last_activity_at": full_proj.last_activity_at,
                 "visibility": full_proj.visibility,
             }
@@ -138,17 +143,16 @@ def get_projects_stats(gl: gitlab.Gitlab):
             if idx % 50 == 0:
                 logger.info(f"Обработано проектов: {idx}")
 
-            time.sleep(0.05)  # лёгкий троттлинг для API
+            time.sleep(0.05)
 
         except Exception as e:
             logger.warning(f"Ошибка при обработке проекта {getattr(project, 'path_with_namespace', project.id)}: {e}")
             continue
 
-    # 📊 Сортировка по размеру (по убыванию)
     result.sort(key=lambda x: x.get("storage_size_mb", 0), reverse=True)
 
-    logger.info(f"✅ Сбор статистики завершён: всего проектов — {len(result)}.")
-    return result
+    logger.info(f"✅ Сбор статистики завершён: всего проектов — {len(result)}, всего коммитов — {total_commits}")
+    return result, total_commits
 
 
 # ======================
@@ -226,7 +230,9 @@ def main():
 
         users_data = get_users(gl)
         statistics_data = get_stat(gl)
-        projects_data = get_projects_stats(gl)
+        projects_data, total_commits = get_projects_stats(gl)
+
+        statistics_data["total_commits"] = total_commits  # добавляем общие коммиты
 
         write_to_excel(users_data, statistics_data, projects_data)
         logger.info("✅ Работа успешно завершена.\n")
