@@ -16,17 +16,21 @@ GITLAB_URL = os.getenv("GITLAB_URL")
 GITLAB_TOKEN = os.getenv("GITLAB_TOKEN")
 
 # ======================
+# ⚙️ Пользовательские параметры
+# ======================
+COUNT_COMMITS = False  # 🔧 ВКЛ/ВЫКЛ подсчёт количества коммитов (True = медленнее)
+LOG_FILE = "gitlab_report.log"  # 📜 Единый лог-файл, дозаписывается
+
+# ======================
 # 🧠 Настройка логирования
 # ======================
-LOG_FILE = "gitlab_report.log"
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.FileHandler(LOG_FILE, mode="a", encoding="utf-8"),  # ⬅️ дозапись
-        logging.StreamHandler()
-    ]
+        logging.FileHandler(LOG_FILE, mode="a", encoding="utf-8"),  # дозапись
+        logging.StreamHandler(),
+    ],
 )
 logger = logging.getLogger(__name__)
 
@@ -110,69 +114,89 @@ def get_stat(gl: gitlab.Gitlab):
 # ======================
 def get_projects_stats(gl: gitlab.Gitlab):
     logger.info("Начинаем сбор статистики по проектам...")
-    projects = gl.projects.list(all=True, iterator=True)
+    if COUNT_COMMITS:
+        logger.info("Подсчёт количества коммитов включён (может быть медленно).")
+    else:
+        logger.info("Подсчёт количества коммитов отключён (работаем быстро).")
+
+    # ⚡ Загружаем проекты сразу со статистикой, без отдельных .get()
+    projects = gl.projects.list(all=True, iterator=True, statistics=True)
     result = []
 
-    for idx, p in enumerate(projects, start=1):
+    for idx, project in enumerate(projects, start=1):
         try:
-            logger.info(f"[{idx}] Обработка проекта: {p.path_with_namespace}")
-            project = gl.projects.get(p.id, statistics=True)
             stats = getattr(project, "statistics", {}) or {}
-
-            # Кол-во коммитов
-            try:
-                commits_count = len(project.commits.list(all=True))
-            except Exception:
-                commits_count = "N/A"
-
-            # Кол-во веток
-            try:
-                branches_count = len(project.branches.list(all=True))
-            except Exception:
-                branches_count = "N/A"
-
-            # Кол-во тегов
-            try:
-                tags_count = len(project.tags.list(all=True))
-            except Exception:
-                tags_count = "N/A"
-
-            result.append({
+            project_data = {
                 "id": project.id,
                 "name": project.name,
                 "path_with_namespace": project.path_with_namespace,
-                "repository_size_mb": round(stats.get("repository_size", 0) / 1024 / 1024, 2),
-                "lfs_objects_size_mb": round(stats.get("lfs_objects_size", 0) / 1024 / 1024, 2),
-                "job_artifacts_size_mb": round(stats.get("job_artifacts_size", 0) / 1024 / 1024, 2),
+                "repository_size_mb": round(
+                    stats.get("repository_size", 0) / 1024 / 1024, 2
+                ),
+                "lfs_objects_size_mb": round(
+                    stats.get("lfs_objects_size", 0) / 1024 / 1024, 2
+                ),
+                "job_artifacts_size_mb": round(
+                    stats.get("job_artifacts_size", 0) / 1024 / 1024, 2
+                ),
                 "storage_size_mb": round(stats.get("storage_size", 0) / 1024 / 1024, 2),
-                "commit_count": commits_count,
-                "branches_count": branches_count,
-                "tags_count": tags_count,
                 "last_activity_at": project.last_activity_at,
                 "visibility": project.visibility,
-            })
+            }
+
+            if COUNT_COMMITS:
+                try:
+                    commits_count = len(project.commits.list(all=True))
+                    project_data["commit_count"] = commits_count
+                except Exception as e:
+                    logger.warning(
+                        f"Не удалось получить коммиты для {project.path_with_namespace}: {e}"
+                    )
+                    project_data["commit_count"] = "N/A"
+            else:
+                project_data["commit_count"] = "—"
+
+            result.append(project_data)
+
+            if idx % 50 == 0:
+                logger.info(f"Обработано проектов: {idx}")
+
         except Exception as e:
-            logger.warning(f"Ошибка при обработке проекта {p.path_with_namespace}: {e}")
+            logger.warning(
+                f"Ошибка при обработке проекта {getattr(project, 'path_with_namespace', project.id)}: {e}"
+            )
             continue
 
-    logger.info(f"Статистика собрана для {len(result)} проектов.")
+    logger.info(f"✅ Сбор статистики завершён: всего проектов — {len(result)}.")
     return result
 
 
 # ======================
 # 📘 Запись отчёта в Excel
 # ======================
-def write_to_excel(users_data, statistics_data, projects_data, filename="gitlab_report.xlsx"):
+def write_to_excel(
+    users_data, statistics_data, projects_data, filename="gitlab_report.xlsx"
+):
     filename = str(Path(filename).resolve())
     logger.info(f"Создаём Excel-отчёт: {filename}")
 
     workbook = xlsxwriter.Workbook(filename)
-    header_format = workbook.add_format({"bold": True, "bg_color": "#D3D3D3", "border": 1})
+    header_format = workbook.add_format(
+        {"bold": True, "bg_color": "#D3D3D3", "border": 1}
+    )
     cell_format = workbook.add_format({"border": 1})
 
     # --- Пользователи ---
     users_sheet = workbook.add_worksheet("Пользователи")
-    user_headers = ["ID", "Username", "Email", "Name", "Last Sign In", "Last Activity", "Extern UID"]
+    user_headers = [
+        "ID",
+        "Username",
+        "Email",
+        "Name",
+        "Last Sign In",
+        "Last Activity",
+        "Extern UID",
+    ]
 
     for col, header in enumerate(user_headers):
         users_sheet.write(0, col, header, header_format)
@@ -203,9 +227,16 @@ def write_to_excel(users_data, statistics_data, projects_data, filename="gitlab_
     # --- Проекты ---
     projects_sheet = workbook.add_worksheet("Проекты")
     proj_headers = [
-        "ID", "Project Name", "Namespace Path", "Repo Size (MB)", "LFS Size (MB)",
-        "Artifacts Size (MB)", "Total Storage (MB)", "Commits", "Branches", "Tags",
-        "Last Activity", "Visibility"
+        "ID",
+        "Project Name",
+        "Namespace Path",
+        "Repo Size (MB)",
+        "LFS Size (MB)",
+        "Artifacts Size (MB)",
+        "Total Storage (MB)",
+        "Commits",
+        "Last Activity",
+        "Visibility",
     ]
 
     for col, header in enumerate(proj_headers):
@@ -220,10 +251,8 @@ def write_to_excel(users_data, statistics_data, projects_data, filename="gitlab_
         projects_sheet.write(row, 5, p["job_artifacts_size_mb"], cell_format)
         projects_sheet.write(row, 6, p["storage_size_mb"], cell_format)
         projects_sheet.write(row, 7, p["commit_count"], cell_format)
-        projects_sheet.write(row, 8, p["branches_count"], cell_format)
-        projects_sheet.write(row, 9, p["tags_count"], cell_format)
-        projects_sheet.write(row, 10, p["last_activity_at"], cell_format)
-        projects_sheet.write(row, 11, p["visibility"], cell_format)
+        projects_sheet.write(row, 8, p["last_activity_at"], cell_format)
+        projects_sheet.write(row, 9, p["visibility"], cell_format)
 
     projects_sheet.set_column(0, len(proj_headers) - 1, 20)
 
