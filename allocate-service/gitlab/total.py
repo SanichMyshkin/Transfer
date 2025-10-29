@@ -115,12 +115,14 @@ def get_stat(gl: gitlab.Gitlab):
 # ⚡ Быстрый подсчёт коммитов (через X-Total)
 # ======================
 def get_commit_count(gl, project_id):
-    """Получает количество коммитов через X-Total из заголовков"""
+    """Получает количество коммитов через заголовок X-Total"""
     try:
-        resp = gl.http_get(
-            f"/projects/{project_id}/repository/commits", query={"per_page": 1}
+        _, response = gl.http_request(
+            "GET",
+            f"/projects/{project_id}/repository/commits",
+            query_parameters={"per_page": 1},
         )
-        total = resp.headers.get("X-Total")
+        total = response.headers.get("X-Total")
         return int(total) if total and total.isdigit() else 0
     except Exception as e:
         logger.warning(
