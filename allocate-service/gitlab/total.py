@@ -18,7 +18,9 @@ GITLAB_TOKEN = os.getenv("GITLAB_TOKEN")
 # ======================
 # ⚙️ Пользовательские параметры
 # ======================
-COUNT_COMMITS = False  # 🔧 ВКЛ/ВЫКЛ подсчёт количества коммитов (True = медленнее)
+COUNT_COMMITS = (
+    True  # 🔧 ВКЛ/ВЫКЛ подсчёт количества коммитов (True = быстро через X-Total)
+)
 LOG_FILE = "gitlab_report.log"  # 📜 Единый лог-файл, дозаписывается
 
 # ======================
@@ -110,14 +112,32 @@ def get_stat(gl: gitlab.Gitlab):
 
 
 # ======================
+# ⚡ Быстрый подсчёт коммитов (через X-Total)
+# ======================
+def get_commit_count(gl, project_id):
+    """Получает количество коммитов через X-Total из заголовков"""
+    try:
+        resp = gl.http_get(
+            f"/projects/{project_id}/repository/commits", query={"per_page": 1}
+        )
+        total = resp.headers.get("X-Total")
+        return int(total) if total and total.isdigit() else 0
+    except Exception as e:
+        logger.warning(
+            f"Не удалось получить количество коммитов для проекта {project_id}: {e}"
+        )
+        return "N/A"
+
+
+# ======================
 # 📁 Статистика по проектам
 # ======================
 def get_projects_stats(gl: gitlab.Gitlab):
     logger.info("Начинаем сбор статистики по проектам...")
     if COUNT_COMMITS:
-        logger.info("Подсчёт количества коммитов включён (может быть медленно).")
+        logger.info("Подсчёт количества коммитов включён (через X-Total, быстро).")
     else:
-        logger.info("Подсчёт количества коммитов отключён (работаем быстро).")
+        logger.info("Подсчёт количества коммитов отключён (ещё быстрее).")
 
     # ⚡ Загружаем проекты сразу со статистикой, без отдельных .get()
     projects = gl.projects.list(all=True, iterator=True, statistics=True)
@@ -144,15 +164,9 @@ def get_projects_stats(gl: gitlab.Gitlab):
                 "visibility": project.visibility,
             }
 
+            # ✅ Быстрый подсчёт коммитов
             if COUNT_COMMITS:
-                try:
-                    commits_count = len(project.commits.list(all=True))
-                    project_data["commit_count"] = commits_count
-                except Exception as e:
-                    logger.warning(
-                        f"Не удалось получить коммиты для {project.path_with_namespace}: {e}"
-                    )
-                    project_data["commit_count"] = "N/A"
+                project_data["commit_count"] = get_commit_count(gl, project.id)
             else:
                 project_data["commit_count"] = "—"
 
