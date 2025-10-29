@@ -1,12 +1,11 @@
-import requests
 import gitlab
 import os
 import logging
+import requests
 from dotenv import load_dotenv
 import urllib3
 import xlsxwriter
 from pathlib import Path
-
 
 # ======================
 # ⚙️ Настройки окружения
@@ -20,9 +19,7 @@ GITLAB_TOKEN = os.getenv("GITLAB_TOKEN")
 # ======================
 # ⚙️ Пользовательские параметры
 # ======================
-COUNT_COMMITS = (
-    True  # 🔧 ВКЛ/ВЫКЛ подсчёт количества коммитов (True = быстро через X-Total)
-)
+COUNT_COMMITS = True  # 🔧 ВКЛ/ВЫКЛ подсчёт количества коммитов (через X-Total, 1 запрос)
 LOG_FILE = "gitlab_report.log"  # 📜 Единый лог-файл, дозаписывается
 
 # ======================
@@ -33,8 +30,8 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         logging.FileHandler(LOG_FILE, mode="a", encoding="utf-8"),  # дозапись
-        logging.StreamHandler(),
-    ],
+        logging.StreamHandler()
+    ]
 )
 logger = logging.getLogger(__name__)
 
@@ -114,7 +111,7 @@ def get_stat(gl: gitlab.Gitlab):
 
 
 # ======================
-# ⚡ Быстрый подсчёт коммитов (через X-Total)
+# ⚡ Быстрый подсчёт коммитов (через requests и X-Total)
 # ======================
 def get_commit_count(project_id):
     """Быстро получает количество коммитов через API-заголовок X-Total"""
@@ -134,7 +131,6 @@ def get_commit_count(project_id):
     except Exception as e:
         logger.warning(f"Не удалось получить количество коммитов для проекта {project_id}: {e}")
         return "N/A"
-
 
 
 # ======================
@@ -158,23 +154,16 @@ def get_projects_stats(gl: gitlab.Gitlab):
                 "id": project.id,
                 "name": project.name,
                 "path_with_namespace": project.path_with_namespace,
-                "repository_size_mb": round(
-                    stats.get("repository_size", 0) / 1024 / 1024, 2
-                ),
-                "lfs_objects_size_mb": round(
-                    stats.get("lfs_objects_size", 0) / 1024 / 1024, 2
-                ),
-                "job_artifacts_size_mb": round(
-                    stats.get("job_artifacts_size", 0) / 1024 / 1024, 2
-                ),
+                "repository_size_mb": round(stats.get("repository_size", 0) / 1024 / 1024, 2),
+                "lfs_objects_size_mb": round(stats.get("lfs_objects_size", 0) / 1024 / 1024, 2),
+                "job_artifacts_size_mb": round(stats.get("job_artifacts_size", 0) / 1024 / 1024, 2),
                 "storage_size_mb": round(stats.get("storage_size", 0) / 1024 / 1024, 2),
                 "last_activity_at": project.last_activity_at,
                 "visibility": project.visibility,
             }
 
-            # ✅ Быстрый подсчёт коммитов
             if COUNT_COMMITS:
-                project_data["commit_count"] = get_commit_count(gl, project.id)
+                project_data["commit_count"] = get_commit_count(project.id)
             else:
                 project_data["commit_count"] = "—"
 
@@ -184,9 +173,7 @@ def get_projects_stats(gl: gitlab.Gitlab):
                 logger.info(f"Обработано проектов: {idx}")
 
         except Exception as e:
-            logger.warning(
-                f"Ошибка при обработке проекта {getattr(project, 'path_with_namespace', project.id)}: {e}"
-            )
+            logger.warning(f"Ошибка при обработке проекта {getattr(project, 'path_with_namespace', project.id)}: {e}")
             continue
 
     logger.info(f"✅ Сбор статистики завершён: всего проектов — {len(result)}.")
@@ -196,29 +183,17 @@ def get_projects_stats(gl: gitlab.Gitlab):
 # ======================
 # 📘 Запись отчёта в Excel
 # ======================
-def write_to_excel(
-    users_data, statistics_data, projects_data, filename="gitlab_report.xlsx"
-):
+def write_to_excel(users_data, statistics_data, projects_data, filename="gitlab_report.xlsx"):
     filename = str(Path(filename).resolve())
     logger.info(f"Создаём Excel-отчёт: {filename}")
 
     workbook = xlsxwriter.Workbook(filename)
-    header_format = workbook.add_format(
-        {"bold": True, "bg_color": "#D3D3D3", "border": 1}
-    )
+    header_format = workbook.add_format({"bold": True, "bg_color": "#D3D3D3", "border": 1})
     cell_format = workbook.add_format({"border": 1})
 
     # --- Пользователи ---
     users_sheet = workbook.add_worksheet("Пользователи")
-    user_headers = [
-        "ID",
-        "Username",
-        "Email",
-        "Name",
-        "Last Sign In",
-        "Last Activity",
-        "Extern UID",
-    ]
+    user_headers = ["ID", "Username", "Email", "Name", "Last Sign In", "Last Activity", "Extern UID"]
 
     for col, header in enumerate(user_headers):
         users_sheet.write(0, col, header, header_format)
@@ -249,16 +224,9 @@ def write_to_excel(
     # --- Проекты ---
     projects_sheet = workbook.add_worksheet("Проекты")
     proj_headers = [
-        "ID",
-        "Project Name",
-        "Namespace Path",
-        "Repo Size (MB)",
-        "LFS Size (MB)",
-        "Artifacts Size (MB)",
-        "Total Storage (MB)",
-        "Commits",
-        "Last Activity",
-        "Visibility",
+        "ID", "Project Name", "Namespace Path", "Repo Size (MB)", "LFS Size (MB)",
+        "Artifacts Size (MB)", "Total Storage (MB)", "Commits",
+        "Last Activity", "Visibility"
     ]
 
     for col, header in enumerate(proj_headers):
