@@ -6,6 +6,7 @@ import urllib3
 import xlsxwriter
 from pathlib import Path
 import time
+import requests
 
 # ======================
 # ⚙️ Настройки окружения
@@ -107,6 +108,26 @@ def get_stat(gl: gitlab.Gitlab):
 
 
 # ======================
+# 🧮 Пайплайны
+# ======================
+def get_pipeline_count(project_id: int):
+    """Возвращает количество всех пайплайнов проекта (через X-Total)."""
+    url = f"{GITLAB_URL}/api/v4/projects/{project_id}/pipelines?per_page=1"
+    headers = {"PRIVATE-TOKEN": GITLAB_TOKEN}
+    try:
+        resp = requests.get(url, headers=headers, verify=False, timeout=20)
+        if resp.status_code == 200:
+            total = resp.headers.get("X-Total")
+            return int(total) if total else 0
+        else:
+            logger.warning(f"Pipeline API вернул {resp.status_code} для проекта {project_id}")
+            return 0
+    except Exception as e:
+        logger.warning(f"Ошибка при получении пайплайнов для проекта {project_id}: {e}")
+        return 0
+
+
+# ======================
 # 📁 Проекты с детализацией
 # ======================
 def get_projects_stats(gl: gitlab.Gitlab):
@@ -114,16 +135,19 @@ def get_projects_stats(gl: gitlab.Gitlab):
     projects = gl.projects.list(all=True, iterator=True)
     result = []
     total_commits = 0
+    total_pipelines = 0
 
     for idx, project in enumerate(projects, start=1):
         try:
-            # Получаем полную информацию по каждому проекту
             full_proj = gl.projects.get(project.id, statistics=True)
             stats = getattr(full_proj, "statistics", {}) or {}
 
             commit_count = stats.get("commit_count", 0)
             if isinstance(commit_count, int):
                 total_commits += commit_count
+
+            pipeline_count = get_pipeline_count(full_proj.id)
+            total_pipelines += pipeline_count
 
             project_data = {
                 "id": full_proj.id,
@@ -134,16 +158,17 @@ def get_projects_stats(gl: gitlab.Gitlab):
                 "job_artifacts_size_mb": round(stats.get("job_artifacts_size", 0) / 1024 / 1024, 2),
                 "storage_size_mb": round(stats.get("storage_size", 0) / 1024 / 1024, 2),
                 "commit_count": commit_count,
+                "pipeline_count": pipeline_count,
                 "last_activity_at": full_proj.last_activity_at,
                 "visibility": full_proj.visibility,
             }
 
             result.append(project_data)
 
-            if idx % 50 == 0:
+            if idx % 20 == 0:
                 logger.info(f"Обработано проектов: {idx}")
 
-            time.sleep(0.05)
+            time.sleep(0.1)  # троттлинг API
 
         except Exception as e:
             logger.warning(f"Ошибка при обработке проекта {getattr(project, 'path_with_namespace', project.id)}: {e}")
@@ -151,8 +176,11 @@ def get_projects_stats(gl: gitlab.Gitlab):
 
     result.sort(key=lambda x: x.get("storage_size_mb", 0), reverse=True)
 
-    logger.info(f"✅ Сбор статистики завершён: всего проектов — {len(result)}, всего коммитов — {total_commits}")
-    return result, total_commits
+    logger.info(
+        f"✅ Сбор статистики завершён: всего проектов — {len(result)}, "
+        f"всего коммитов — {total_commits}, всего пайплайнов — {total_pipelines}"
+    )
+    return result, total_commits, total_pipelines
 
 
 # ======================
@@ -197,7 +225,7 @@ def write_to_excel(users_data, statistics_data, projects_data, filename="gitlab_
         "ID", "Project Name", "Namespace Path",
         "Repo Size (MB)", "LFS Size (MB)",
         "Artifacts Size (MB)", "Total Storage (MB)",
-        "Commits", "Last Activity", "Visibility"
+        "Commits", "Pipelines", "Last Activity", "Visibility"
     ]
 
     for col, header in enumerate(proj_headers):
@@ -212,8 +240,9 @@ def write_to_excel(users_data, statistics_data, projects_data, filename="gitlab_
         projects_sheet.write(row, 5, p["job_artifacts_size_mb"], cell_format)
         projects_sheet.write(row, 6, p["storage_size_mb"], cell_format)
         projects_sheet.write(row, 7, p["commit_count"], cell_format)
-        projects_sheet.write(row, 8, p["last_activity_at"], cell_format)
-        projects_sheet.write(row, 9, p["visibility"], cell_format)
+        projects_sheet.write(row, 8, p["pipeline_count"], cell_format)
+        projects_sheet.write(row, 9, p["last_activity_at"], cell_format)
+        projects_sheet.write(row, 10, p["visibility"], cell_format)
 
     workbook.close()
     logger.info(f"Отчёт успешно сохранён: {filename}")
@@ -230,9 +259,10 @@ def main():
 
         users_data = get_users(gl)
         statistics_data = get_stat(gl)
-        projects_data, total_commits = get_projects_stats(gl)
+        projects_data, total_commits, total_pipelines = get_projects_stats(gl)
 
-        statistics_data["total_commits"] = total_commits  # добавляем общие коммиты
+        statistics_data["total_commits"] = total_commits
+        statistics_data["total_pipelines"] = total_pipelines
 
         write_to_excel(users_data, statistics_data, projects_data)
         logger.info("✅ Работа успешно завершена.\n")
