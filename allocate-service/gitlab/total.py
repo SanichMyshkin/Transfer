@@ -182,8 +182,9 @@ def get_runners_info(gl: gitlab.Gitlab):
 
         try:
             full_runner = gl.runners.get(r.id)
-            group_path, group_name, project_path, project_name = "", "", "", ""
+            path, name = "", ""
 
+            # --- если раннер привязан к группе ---
             if full_runner.runner_type == "group_type" and hasattr(
                 full_runner, "groups"
             ):
@@ -192,9 +193,10 @@ def get_runners_info(gl: gitlab.Gitlab):
                     groups = groups_obj.list(all=True)
                     if groups:
                         g = groups[0]
-                        group_path = g.get("full_path", "")
-                        group_name = g.get("name", "")
+                        path = g.get("full_path", "")
+                        name = g.get("name", "")
 
+            # --- если раннер привязан к проекту ---
             elif full_runner.runner_type == "project_type" and hasattr(
                 full_runner, "projects"
             ):
@@ -203,8 +205,8 @@ def get_runners_info(gl: gitlab.Gitlab):
                     projects = proj_obj.list(all=True)
                     if projects:
                         p = projects[0]
-                        project_path = p.get("path_with_namespace", "")
-                        project_name = p.get("name", "")
+                        path = p.get("path_with_namespace", "")
+                        name = p.get("name", "")
 
             data.append(
                 {
@@ -215,13 +217,10 @@ def get_runners_info(gl: gitlab.Gitlab):
                     "online": getattr(full_runner, "online", None),
                     "ip_address": getattr(full_runner, "ip_address", ""),
                     "tag_list": ", ".join(getattr(full_runner, "tag_list", []) or []),
-                    "access_level": getattr(full_runner, "access_level", ""),
                     "contacted_at": getattr(full_runner, "contacted_at", ""),
                     "maintenance_note": getattr(full_runner, "maintenance_note", ""),
-                    "group_path": group_path,
-                    "group_name": group_name,
-                    "project_path": project_path,
-                    "project_name": project_name,
+                    "source_path": path,  # теперь общие поля
+                    "source_name": name,
                 }
             )
 
@@ -307,13 +306,10 @@ def write_to_excel(
         "Online",
         "IP Address",
         "Tag List",
-        "Access Level",
         "Contacted At",
         "Maintenance Note",
-        "Group Path",
-        "Group Name",
-        "Project Path",
-        "Project Name",
+        "Source Path",
+        "Source Name",
     ]
     for col, h in enumerate(runner_headers):
         runners_sheet.write(0, col, h, header_format)
