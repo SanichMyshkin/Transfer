@@ -351,18 +351,8 @@ if __name__ == "__main__":
 
 
 
-import gitlab
-import os
-from dotenv import load_dotenv
-import urllib3
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-load_dotenv()
-
-GITLAB_URL = os.getenv("GITLAB_URL")
-GITLAB_TOKEN = os.getenv("GITLAB_TOKEN")
-
-def test_runner_details(runner_id: int):
-    """Проверяет, что реально приходит в объекте раннера."""
+def test_runner_details_fixed(runner_id: int):
+    """Проверяет поля runner.groups / runner.projects (в виде обычного списка)."""
     gl = gitlab.Gitlab(GITLAB_URL, private_token=GITLAB_TOKEN, ssl_verify=False)
     gl.auth()
 
@@ -374,36 +364,25 @@ def test_runner_details(runner_id: int):
     print(f"Онлайн: {runner.online}")
     print("-----")
 
-    # Проверяем группы
-    if hasattr(runner, "groups"):
-        print("→ Есть атрибут groups")
-        try:
-            groups = runner.groups.list(all=True)
-            if groups:
-                for g in groups:
-                    print(f"  [GROUP] id={g.get('id')} name={g.get('name')} full_path={g.get('full_path')}")
-            else:
-                print("  Группы есть, но список пуст")
-        except Exception as e:
-            print(f"  Ошибка при получении groups: {e}")
+    # --- Проверка групп ---
+    groups = getattr(runner, "groups", [])
+    if isinstance(groups, list) and groups:
+        print(f"→ Найдено групп: {len(groups)}")
+        for g in groups:
+            print(f"  [GROUP] id={g.get('id')} name={g.get('name')} full_path={g.get('full_path')} web_url={g.get('web_url')}")
     else:
-        print("→ Нет атрибута groups")
+        print("→ Группы отсутствуют или пусты")
 
-    # Проверяем проекты
-    if hasattr(runner, "projects"):
-        print("→ Есть атрибут projects")
-        try:
-            projects = runner.projects.list(all=True)
-            if projects:
-                for p in projects:
-                    print(f"  [PROJECT] id={p.get('id')} name={p.get('name')} path={p.get('path_with_namespace')}")
-            else:
-                print("  Проекты есть, но список пуст")
-        except Exception as e:
-            print(f"  Ошибка при получении projects: {e}")
+    # --- Проверка проектов ---
+    projects = getattr(runner, "projects", [])
+    if isinstance(projects, list) and projects:
+        print(f"→ Найдено проектов: {len(projects)}")
+        for p in projects:
+            print(f"  [PROJECT] id={p.get('id')} name={p.get('name')} path={p.get('path_with_namespace')} web_url={p.get('web_url')}")
     else:
-        print("→ Нет атрибута projects")
+        print("→ Проекты отсутствуют или пусты")
 
-# === Пример вызова ===
-test_runner_details(6)   # групповой раннер
-test_runner_details(35)  # проектный раннер
+
+# Тестовые вызовы
+test_runner_details_fixed(6)   # group_type
+test_runner_details_fixed(35)  # project_type
