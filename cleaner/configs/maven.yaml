@@ -1,11 +1,16 @@
 repo_names:
   - maven2-test
 
-maven_rules:
-  snapshot:
-    regex_rules:
-      ".*-.*":
-        retention_days: 18
-        reserved: 2
+# maven_rules:
+#   snapshot:
+#     regex_rules:
+#       ".*-.*":
+#         retention_days: 18
+#         reserved: 2
 
-dry_run: true
+# dry_run: true
+
+
+maven_rules:
+  release:
+    no_match_reserved: 20

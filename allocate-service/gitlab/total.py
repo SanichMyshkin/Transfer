@@ -15,8 +15,10 @@ load_dotenv()
 
 GITLAB_URL = os.getenv("GITLAB_URL")
 GITLAB_TOKEN = os.getenv("GITLAB_TOKEN")
-
 LOG_FILE = "gitlab_report.log"
+
+# 🆕 Ограничение числа проектов (например, 200)
+MAX_PROJECTS = int(os.getenv("MAX_PROJECTS", 200))
 
 # ======================
 # 🧠 Логирование
@@ -31,7 +33,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
 # ======================
 # 🔗 Подключение к GitLab
 # ======================
@@ -41,7 +42,6 @@ def get_gitlab_connection(url: str, token: str) -> gitlab.Gitlab:
     gl.auth()
     logger.info("Успешное подключение к GitLab")
     return gl
-
 
 # ======================
 # 👥 Пользователи
@@ -74,7 +74,6 @@ def get_users(gl: gitlab.Gitlab):
     logger.info(f"Пользователей получено: {len(result)}")
     return result
 
-
 # ======================
 # 📊 Общая статистика GitLab
 # ======================
@@ -105,7 +104,6 @@ def get_stat(gl: gitlab.Gitlab):
     logger.info("Общая статистика успешно получена.")
     return stats_dict
 
-
 # ======================
 # 📁 Проекты с детализацией
 # ======================
@@ -116,8 +114,11 @@ def get_projects_stats(gl: gitlab.Gitlab):
     total_commits = 0
 
     for idx, project in enumerate(projects, start=1):
+        if idx > MAX_PROJECTS:  # 🆕 ограничиваем количество
+            logger.info(f"⚠️ Достигнут лимит MAX_PROJECTS={MAX_PROJECTS}, останавливаемся.")
+            break
+
         try:
-            # Получаем полную информацию по каждому проекту
             full_proj = gl.projects.get(project.id, statistics=True)
             stats = getattr(full_proj, "statistics", {}) or {}
 
@@ -139,10 +140,8 @@ def get_projects_stats(gl: gitlab.Gitlab):
             }
 
             result.append(project_data)
-
             if idx % 50 == 0:
                 logger.info(f"Обработано проектов: {idx}")
-
             time.sleep(0.05)
 
         except Exception as e:
@@ -150,15 +149,51 @@ def get_projects_stats(gl: gitlab.Gitlab):
             continue
 
     result.sort(key=lambda x: x.get("storage_size_mb", 0), reverse=True)
-
-    logger.info(f"✅ Сбор статистики завершён: всего проектов — {len(result)}, всего коммитов — {total_commits}")
+    logger.info(f"✅ Сбор статистики завершён: проектов — {len(result)}, коммитов — {total_commits}")
     return result, total_commits
 
+# ======================
+# 🆕 Информация о раннерах
+# ======================
+def get_runners_info(gl: gitlab.Gitlab):
+    logger.info("Получаем данные о раннерах (runners)...")
+    runners = gl.runners_all.list(all=True)
+    data = []
+
+    for r in runners:
+        desc = r.description or f"runner-{r.id}"
+        try:
+            groups = [g["full_path"] for g in r.groups.list(all=True)] if r.runner_type == "group_type" else []
+            projects = [p["path_with_namespace"] for p in r.projects.list(all=True)] if r.runner_type == "project_type" else []
+        except Exception as e:
+            groups, projects = [], []
+            logger.warning(f"Не удалось получить связи для runner {r.id}: {e}")
+
+        data.append({
+            "id": r.id,
+            "description": desc,
+            "runner_type": r.runner_type,
+            "is_shared": r.is_shared,
+            "active": r.active,
+            "paused": r.paused,
+            "status": getattr(r, "status", "unknown"),
+            "online": getattr(r, "online", None),
+            "executor": getattr(r, "executor", ""),
+            "ip_address": getattr(r, "ip_address", ""),
+            "version": getattr(r, "version", ""),
+            "architecture": getattr(r, "architecture", ""),
+            "platform": getattr(r, "platform", ""),
+            "groups": ", ".join(groups) if groups else "",
+            "projects": ", ".join(projects) if projects else "",
+        })
+
+    logger.info(f"✅ Всего раннеров: {len(data)}")
+    return data
 
 # ======================
 # 📘 Запись отчёта
 # ======================
-def write_to_excel(users_data, statistics_data, projects_data, filename="gitlab_report.xlsx"):
+def write_to_excel(users_data, statistics_data, projects_data, runners_data, filename="gitlab_report.xlsx"):
     filename = str(Path(filename).resolve())
     logger.info(f"Создаём Excel-отчёт: {filename}")
 
@@ -169,24 +204,15 @@ def write_to_excel(users_data, statistics_data, projects_data, filename="gitlab_
     # --- Пользователи ---
     users_sheet = workbook.add_worksheet("Пользователи")
     user_headers = ["ID", "Username", "Email", "Name", "Last Sign In", "Last Activity", "Extern UID"]
-
     for col, header in enumerate(user_headers):
         users_sheet.write(0, col, header, header_format)
-
-    for row, user in enumerate(users_data, start=1):
-        users_sheet.write(row, 0, user["id"], cell_format)
-        users_sheet.write(row, 1, user["username"], cell_format)
-        users_sheet.write(row, 2, user["email"], cell_format)
-        users_sheet.write(row, 3, user["name"], cell_format)
-        users_sheet.write(row, 4, user["last_sign_in_at"], cell_format)
-        users_sheet.write(row, 5, user["last_activity_on"], cell_format)
-        users_sheet.write(row, 6, user["extern_uid"], cell_format)
+    for row, u in enumerate(users_data, start=1):
+        users_sheet.write_row(row, 0, list(u.values()), cell_format)
 
     # --- Общая статистика ---
     stats_sheet = workbook.add_worksheet("Статистика")
     stats_sheet.write(0, 0, "Показатель", header_format)
     stats_sheet.write(0, 1, "Значение", header_format)
-
     for row, (key, value) in enumerate(statistics_data.items(), start=1):
         stats_sheet.write(row, 0, key.replace("_", " ").title(), cell_format)
         stats_sheet.write(row, 1, value, cell_format)
@@ -199,26 +225,26 @@ def write_to_excel(users_data, statistics_data, projects_data, filename="gitlab_
         "Artifacts Size (MB)", "Total Storage (MB)",
         "Commits", "Last Activity", "Visibility"
     ]
-
-    for col, header in enumerate(proj_headers):
-        projects_sheet.write(0, col, header, header_format)
-
+    for col, h in enumerate(proj_headers):
+        projects_sheet.write(0, col, h, header_format)
     for row, p in enumerate(projects_data, start=1):
-        projects_sheet.write(row, 0, p["id"], cell_format)
-        projects_sheet.write(row, 1, p["name"], cell_format)
-        projects_sheet.write(row, 2, p["path_with_namespace"], cell_format)
-        projects_sheet.write(row, 3, p["repository_size_mb"], cell_format)
-        projects_sheet.write(row, 4, p["lfs_objects_size_mb"], cell_format)
-        projects_sheet.write(row, 5, p["job_artifacts_size_mb"], cell_format)
-        projects_sheet.write(row, 6, p["storage_size_mb"], cell_format)
-        projects_sheet.write(row, 7, p["commit_count"], cell_format)
-        projects_sheet.write(row, 8, p["last_activity_at"], cell_format)
-        projects_sheet.write(row, 9, p["visibility"], cell_format)
+        projects_sheet.write_row(row, 0, list(p.values()), cell_format)
+
+    # 🆕 --- Runners ---
+    runners_sheet = workbook.add_worksheet("Раннеры")
+    runner_headers = [
+        "ID", "Description", "Runner Type", "Is Shared", "Active", "Paused",
+        "Status", "Online", "Executor", "IP Address", "Version",
+        "Architecture", "Platform", "Groups", "Projects"
+    ]
+    for col, h in enumerate(runner_headers):
+        runners_sheet.write(0, col, h, header_format)
+    for row, r in enumerate(runners_data, start=1):
+        runners_sheet.write_row(row, 0, list(r.values()), cell_format)
 
     workbook.close()
     logger.info(f"Отчёт успешно сохранён: {filename}")
     return filename
-
 
 # ======================
 # 🚀 Основной запуск
@@ -231,15 +257,16 @@ def main():
         users_data = get_users(gl)
         statistics_data = get_stat(gl)
         projects_data, total_commits = get_projects_stats(gl)
+        runners_data = get_runners_info(gl)  # 🆕 runners info
 
-        statistics_data["total_commits"] = total_commits  # добавляем общие коммиты
+        statistics_data["total_commits"] = total_commits
+        statistics_data["projects_processed"] = len(projects_data)
 
-        write_to_excel(users_data, statistics_data, projects_data)
+        write_to_excel(users_data, statistics_data, projects_data, runners_data)
         logger.info("✅ Работа успешно завершена.\n")
 
     except Exception as e:
         logger.exception(f"❌ Ошибка выполнения: {e}")
-
 
 if __name__ == "__main__":
     main()
