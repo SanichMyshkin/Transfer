@@ -162,10 +162,9 @@ def get_runners_info(gl: gitlab.Gitlab):
 
     for r in runners:
         desc = r.description or f"runner-{r.id}"
-
         try:
-            # 🆕 Получаем полную информацию по раннеру (RunnerAll → Runner)
-            full_runner = gl.runners_all.get(r.id)
+            # 🆕 Правильно: получаем runner через gl.runners.get()
+            full_runner = gl.runners.get(r.id)
 
             groups = []
             projects = []
@@ -197,10 +196,11 @@ def get_runners_info(gl: gitlab.Gitlab):
             logger.warning(f"Не удалось получить связи для runner {r.id}: {e}")
             continue
 
-        time.sleep(0.05)  # чуть замедляем, чтобы не зафлудить API
+        time.sleep(0.05)
 
     logger.info(f"✅ Всего раннеров: {len(data)}")
     return data
+
 
 
 # ======================
