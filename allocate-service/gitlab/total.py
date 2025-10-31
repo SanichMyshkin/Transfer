@@ -348,3 +348,62 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+import gitlab
+import os
+from dotenv import load_dotenv
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+load_dotenv()
+
+GITLAB_URL = os.getenv("GITLAB_URL")
+GITLAB_TOKEN = os.getenv("GITLAB_TOKEN")
+
+def test_runner_details(runner_id: int):
+    """Проверяет, что реально приходит в объекте раннера."""
+    gl = gitlab.Gitlab(GITLAB_URL, private_token=GITLAB_TOKEN, ssl_verify=False)
+    gl.auth()
+
+    print(f"\n=== Проверяем раннер ID {runner_id} ===")
+    runner = gl.runners.get(runner_id)
+    print(f"Описание: {runner.description}")
+    print(f"Тип: {runner.runner_type}")
+    print(f"Статус: {runner.status}")
+    print(f"Онлайн: {runner.online}")
+    print("-----")
+
+    # Проверяем группы
+    if hasattr(runner, "groups"):
+        print("→ Есть атрибут groups")
+        try:
+            groups = runner.groups.list(all=True)
+            if groups:
+                for g in groups:
+                    print(f"  [GROUP] id={g.get('id')} name={g.get('name')} full_path={g.get('full_path')}")
+            else:
+                print("  Группы есть, но список пуст")
+        except Exception as e:
+            print(f"  Ошибка при получении groups: {e}")
+    else:
+        print("→ Нет атрибута groups")
+
+    # Проверяем проекты
+    if hasattr(runner, "projects"):
+        print("→ Есть атрибут projects")
+        try:
+            projects = runner.projects.list(all=True)
+            if projects:
+                for p in projects:
+                    print(f"  [PROJECT] id={p.get('id')} name={p.get('name')} path={p.get('path_with_namespace')}")
+            else:
+                print("  Проекты есть, но список пуст")
+        except Exception as e:
+            print(f"  Ошибка при получении projects: {e}")
+    else:
+        print("→ Нет атрибута projects")
+
+# === Пример вызова ===
+test_runner_details(6)   # групповой раннер
+test_runner_details(35)  # проектный раннер
