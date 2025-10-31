@@ -203,16 +203,15 @@ def get_runners_info(gl: gitlab.Gitlab):
             data.append(
                 {
                     "id": full_runner.id,
-                    "description": desc,
+                    "source_name": name,
+                    "source_path": path,
                     "runner_type": full_runner.runner_type,
+                    "description": desc,
                     "status": getattr(full_runner, "status", "unknown"),
                     "online": getattr(full_runner, "online", None),
                     "ip_address": getattr(full_runner, "ip_address", ""),
                     "tag_list": ", ".join(getattr(full_runner, "tag_list", []) or []),
                     "contacted_at": getattr(full_runner, "contacted_at", ""),
-                    "maintenance_note": getattr(full_runner, "maintenance_note", ""),
-                    "source_path": path,
-                    "source_name": name,
                 }
             )
 
@@ -293,14 +292,14 @@ def write_to_excel(
     runner_headers = [
         "ID",
         "Source Name",
-        "Description",
+        "Source Path",
         "Runner Type",
+        "Description",
         "Status",
         "Online",
         "IP Address",
         "Tag List",
         "Contacted At",
-        "Source Path",
     ]
     for col, h in enumerate(runner_headers):
         runners_sheet.write(0, col, h, header_format)
