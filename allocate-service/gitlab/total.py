@@ -162,17 +162,23 @@ def get_runners_info(gl: gitlab.Gitlab):
 
     for r in runners:
         desc = r.description or f"runner-{r.id}"
+
         try:
-            # 🆕 Правильно: получаем runner через gl.runners.get()
             full_runner = gl.runners.get(r.id)
 
-            groups = []
-            projects = []
+            groups, projects = [], []
 
-            if full_runner.runner_type == "group_type":
-                groups = [g["full_path"] for g in full_runner.groups.list(all=True)]
-            elif full_runner.runner_type == "project_type":
-                projects = [p["path_with_namespace"] for p in full_runner.projects.list(all=True)]
+            # --- защищённый вызов .groups.list() ---
+            if full_runner.runner_type == "group_type" and hasattr(full_runner, "groups"):
+                groups_obj = full_runner.groups
+                if hasattr(groups_obj, "list"):
+                    groups = [g.get("full_path") or g.get("name") for g in groups_obj.list(all=True)]
+            
+            # --- защищённый вызов .projects.list() ---
+            elif full_runner.runner_type == "project_type" and hasattr(full_runner, "projects"):
+                proj_obj = full_runner.projects
+                if hasattr(proj_obj, "list"):
+                    projects = [p.get("path_with_namespace") or p.get("name") for p in proj_obj.list(all=True)]
 
             data.append({
                 "id": full_runner.id,
@@ -188,8 +194,8 @@ def get_runners_info(gl: gitlab.Gitlab):
                 "version": getattr(full_runner, "version", ""),
                 "architecture": getattr(full_runner, "architecture", ""),
                 "platform": getattr(full_runner, "platform", ""),
-                "groups": ", ".join(groups),
-                "projects": ", ".join(projects),
+                "groups": ", ".join(groups) if groups else "",
+                "projects": ", ".join(projects) if projects else "",
             })
 
         except Exception as e:
@@ -198,7 +204,7 @@ def get_runners_info(gl: gitlab.Gitlab):
 
         time.sleep(0.05)
 
-    logger.info(f"✅ Всего раннеров: {len(data)}")
+    logger.info(f"✅ Всего раннеров обработано: {len(data)}")
     return data
 
 
