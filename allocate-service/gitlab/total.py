@@ -226,7 +226,6 @@ def get_runners_info(gl: gitlab.Gitlab):
     return data, len(data)
 
 
-
 # ======================
 # 📘 Запись отчёта
 # ======================
@@ -293,6 +292,7 @@ def write_to_excel(
     runners_sheet = workbook.add_worksheet("Раннеры")
     runner_headers = [
         "ID",
+        "Source Name",
         "Description",
         "Runner Type",
         "Status",
@@ -300,9 +300,7 @@ def write_to_excel(
         "IP Address",
         "Tag List",
         "Contacted At",
-        "Maintenance Note",
         "Source Path",
-        "Source Name",
     ]
     for col, h in enumerate(runner_headers):
         runners_sheet.write(0, col, h, header_format)
