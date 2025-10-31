@@ -162,33 +162,46 @@ def get_runners_info(gl: gitlab.Gitlab):
 
     for r in runners:
         desc = r.description or f"runner-{r.id}"
-        try:
-            groups = [g["full_path"] for g in r.groups.list(all=True)] if r.runner_type == "group_type" else []
-            projects = [p["path_with_namespace"] for p in r.projects.list(all=True)] if r.runner_type == "project_type" else []
-        except Exception as e:
-            groups, projects = [], []
-            logger.warning(f"Не удалось получить связи для runner {r.id}: {e}")
 
-        data.append({
-            "id": r.id,
-            "description": desc,
-            "runner_type": r.runner_type,
-            "is_shared": r.is_shared,
-            "active": r.active,
-            "paused": r.paused,
-            "status": getattr(r, "status", "unknown"),
-            "online": getattr(r, "online", None),
-            "executor": getattr(r, "executor", ""),
-            "ip_address": getattr(r, "ip_address", ""),
-            "version": getattr(r, "version", ""),
-            "architecture": getattr(r, "architecture", ""),
-            "platform": getattr(r, "platform", ""),
-            "groups": ", ".join(groups) if groups else "",
-            "projects": ", ".join(projects) if projects else "",
-        })
+        try:
+            # 🆕 Получаем полную информацию по раннеру (RunnerAll → Runner)
+            full_runner = gl.runners_all.get(r.id)
+
+            groups = []
+            projects = []
+
+            if full_runner.runner_type == "group_type":
+                groups = [g["full_path"] for g in full_runner.groups.list(all=True)]
+            elif full_runner.runner_type == "project_type":
+                projects = [p["path_with_namespace"] for p in full_runner.projects.list(all=True)]
+
+            data.append({
+                "id": full_runner.id,
+                "description": desc,
+                "runner_type": full_runner.runner_type,
+                "is_shared": full_runner.is_shared,
+                "active": full_runner.active,
+                "paused": full_runner.paused,
+                "status": getattr(full_runner, "status", "unknown"),
+                "online": getattr(full_runner, "online", None),
+                "executor": getattr(full_runner, "executor", ""),
+                "ip_address": getattr(full_runner, "ip_address", ""),
+                "version": getattr(full_runner, "version", ""),
+                "architecture": getattr(full_runner, "architecture", ""),
+                "platform": getattr(full_runner, "platform", ""),
+                "groups": ", ".join(groups),
+                "projects": ", ".join(projects),
+            })
+
+        except Exception as e:
+            logger.warning(f"Не удалось получить связи для runner {r.id}: {e}")
+            continue
+
+        time.sleep(0.05)  # чуть замедляем, чтобы не зафлудить API
 
     logger.info(f"✅ Всего раннеров: {len(data)}")
     return data
+
 
 # ======================
 # 📘 Запись отчёта
