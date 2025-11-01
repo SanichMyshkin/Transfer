@@ -1,15 +1,20 @@
 import com.michelin.cio.hudson.plugins.rolestrategy.*
+import com.synopsys.arc.jenkins.plugins.rolestrategy.RoleType
 import groovy.json.JsonOutput
 
-def roleMap = [:]
+def result = [:]
 def auth = Jenkins.instance.getAuthorizationStrategy()
 
 if (auth instanceof RoleBasedAuthorizationStrategy) {
-    def globalRoles = auth.getRoleMap(RoleBasedAuthorizationStrategy.GLOBAL)
-    globalRoles.getRoles().each { role ->
-        def sids = globalRoles.getSidsForRole(role)
-        roleMap[role.getName()] = sids
+    // перебор по всем типам ролей
+    [RoleType.Global, RoleType.Project, RoleType.Slave].each { type ->
+        def roleMap = auth.getRoleMap(type)
+        def roles = [:]
+        roleMap.getRoles().each { role ->
+            roles[role.name] = roleMap.getSidsForRole(role)
+        }
+        result[type.name()] = roles
     }
 }
 
-println JsonOutput.prettyPrint(JsonOutput.toJson(roleMap))
+println JsonOutput.prettyPrint(JsonOutput.toJson(result))
