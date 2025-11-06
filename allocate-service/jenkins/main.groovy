@@ -6,12 +6,11 @@ def result = [:]
 def auth = Jenkins.instance.getAuthorizationStrategy()
 
 if (auth instanceof RoleBasedAuthorizationStrategy) {
-    // перебор по всем типам ролей
     [RoleType.Global, RoleType.Project, RoleType.Slave].each { type ->
         def roleMap = auth.getRoleMap(type)
         def roles = [:]
         roleMap.getRoles().each { role ->
-            roles[role.name] = roleMap.getSidsForRole(role)
+            roles[role.name] = roleMap.getSidsForRole(role.name)
         }
         result[type.name()] = roles
     }
