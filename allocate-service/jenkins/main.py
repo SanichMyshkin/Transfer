@@ -9,7 +9,6 @@ from dotenv import load_dotenv
 from jenkins_groovy import JenkinsGroovyClient
 from jenkins_scripts import SCRIPT_USERS, SCRIPT_JOBS, SCRIPT_NODES
 
-
 # === Настройка логирования ===
 LOG_FILE = os.path.join(os.getcwd(), "jenkins_inventory.log")
 
@@ -35,8 +34,7 @@ logger.addHandler(console_handler)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 load_dotenv()
 
-
-# === Глобальные параметры ===
+# === Параметры подключения ===
 JENKINS_URL = os.getenv("JENKINS_URL")
 USER = os.getenv("USER")
 TOKEN = os.getenv("TOKEN")
@@ -45,9 +43,9 @@ FILE_PATH = os.path.join(os.getcwd(), "jenkins_inventory.xlsx")
 client = JenkinsGroovyClient(JENKINS_URL, USER, TOKEN, is_https=True)
 
 
-# === Вспомогательные функции ===
+# === Утилиты ===
 def create_excel_if_missing():
-    """Создать базовый Excel-файл, если отсутствует"""
+    """Создает Excel-файл с нужными листами, если его нет"""
     if not os.path.exists(FILE_PATH):
         wb = xlsxwriter.Workbook(FILE_PATH)
         wb.add_worksheet("Users")
@@ -59,7 +57,6 @@ def create_excel_if_missing():
 
 
 def get_users():
-    """Получить пользователей из Jenkins"""
     logger.info("Получаем пользователей...")
     data = client.run_script(SCRIPT_USERS)
     logger.info(f"Пользователей: {data['total']}")
@@ -67,7 +64,6 @@ def get_users():
 
 
 def get_jobs():
-    """Получить джобы из Jenkins"""
     logger.info("Получаем джобы...")
     data = client.run_script(SCRIPT_JOBS)
     logger.info(f"Джоб: {data['total']}")
@@ -75,43 +71,45 @@ def get_jobs():
 
 
 def get_nodes():
-    """Получить ноды из Jenkins"""
     logger.info("Получаем ноды...")
     data = client.run_script(SCRIPT_NODES)
     logger.info(f"Нод: {data['total']}")
     return data
 
 
+# === Запись в Excel ===
+def init_headers(ws, headers):
+    """Создает заголовки только если таблица пуста"""
+    if ws.max_row == 1 and all(cell.value is None for cell in ws[1]):
+        ws.append(headers)
+
+
 def write_users(ws, users):
-    """Записать пользователей в Excel"""
-    if ws.max_row == 1 and ws.cell(1, 1).value is None:
-        ws.append(["ID", "Full Name", "Email"])
+    """Запись пользователей"""
+    init_headers(ws, ["ID", "Full Name", "Email"])
     for u in users["users"]:
         ws.append([u.get("id", ""), u.get("fullName", ""), u.get("email", "")])
 
 
 def write_jobs(ws, jobs):
-    """Записать джобы в Excel"""
-    if ws.max_row == 1 and ws.cell(1, 1).value is None:
-        ws.append(
-            [
-                "Timestamp",
-                "Name",
-                "Type",
-                "URL",
-                "Description",
-                "Is Buildable",
-                "Is Folder",
-                "Last Build",
-                "Last Result",
-                "Last Build Time",
-            ]
-        )
-    timestamp = datetime.now().isoformat()
+    """Запись джоб"""
+    init_headers(
+        ws,
+        [
+            "Name",
+            "Type",
+            "URL",
+            "Description",
+            "Is Buildable",
+            "Is Folder",
+            "Last Build",
+            "Last Result",
+            "Last Build Time",
+        ],
+    )
     for j in jobs["jobs"]:
         ws.append(
             [
-                timestamp,
                 j.get("name", ""),
                 j.get("type", ""),
                 j.get("url", ""),
@@ -126,24 +124,11 @@ def write_jobs(ws, jobs):
 
 
 def write_nodes(ws, nodes):
-    """Записать ноды в Excel"""
-    if ws.max_row == 1 and ws.cell(1, 1).value is None:
-        ws.append(
-            [
-                "Timestamp",
-                "Name",
-                "Online",
-                "Executors",
-                "Labels",
-                "Mode",
-                "Description",
-            ]
-        )
-    timestamp = datetime.now().isoformat()
+    """Запись нод"""
+    init_headers(ws, ["Name", "Online", "Executors", "Labels", "Mode", "Description"])
     for n in nodes["nodes"]:
         ws.append(
             [
-                timestamp,
                 n.get("name", ""),
                 str(n.get("online", "")),
                 str(n.get("executors", "")),
@@ -155,21 +140,30 @@ def write_nodes(ws, nodes):
 
 
 def write_summary(ws, users, jobs, nodes):
-    """Добавить сводку в Excel"""
-    if ws.max_row == 1 and ws.cell(1, 1).value is None:
-        ws.append(["Дата", "Пользователи", "Джобы", "Ноды"])
-    ws.append(
-        [
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            users["total"],
-            jobs["total"],
-            nodes["total"],
-        ]
-    )
+    """Сводка — вывод вниз по столбцу"""
+    labels = ["Дата", "Пользователи", "Джобы", "Ноды"]
+    values = [
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        users["total"],
+        jobs["total"],
+        nodes["total"],
+    ]
+
+    if ws.max_row == 1 and all(cell.value is None for cell in ws[1]):
+        # первая инициализация — в столбец A (метки)
+        for i, label in enumerate(labels, start=1):
+            ws.cell(row=i, column=1).value = label
+        for i, val in enumerate(values, start=1):
+            ws.cell(row=i, column=2).value = val
+    else:
+        # добавляем новые значения в следующий столбец
+        next_col = ws.max_column + 1
+        for i, val in enumerate(values, start=1):
+            ws.cell(row=i, column=next_col).value = val
 
 
 def update_excel(users, jobs, nodes):
-    """Обновить Excel-файл всеми данными"""
+    """Главная функция записи"""
     create_excel_if_missing()
     wb = openpyxl.load_workbook(FILE_PATH)
     write_users(wb["Users"], users)
