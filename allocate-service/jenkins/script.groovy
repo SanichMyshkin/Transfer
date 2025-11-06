@@ -1,32 +1,38 @@
-import jenkins.model.Jenkins
-import com.cloudbees.hudson.plugins.folder.Folder
+import com.michelin.cio.hudson.plugins.rolestrategy.*
 import groovy.json.JsonOutput
 
-def folders = Jenkins.instance.getAllItems(Folder.class)
-def result = []
+def strategy = Jenkins.instance.getAuthorizationStrategy()
+if (!(strategy instanceof RoleBasedAuthorizationStrategy)) {
+    return JsonOutput.toJson([error: "Role Strategy plugin not used"])
+}
 
-folders.each { f ->
-    def jobs = f.getAllJobs()
-    def totalBuilds = 0
-    jobs.each { j ->
-        totalBuilds += j.getBuilds().size()
-    }
+def roles = [:]
 
-    result << [
-        folder: f.fullName,
-        jobCount: jobs.size(),
-        buildCount: totalBuilds
+// global roles
+roles.global = strategy.getRoleMap(RoleBasedAuthorizationStrategy.GLOBAL).getRoles().collect { r ->
+    [
+        name: r.getName(),
+        permissions: r.getPermissions()*.id,
+        sids: strategy.getRoleMap(RoleBasedAuthorizationStrategy.GLOBAL).getSidsForRole(r.getName())
     ]
 }
 
-def rootJobs = Jenkins.instance.getItems()
-def rootBuilds = 0
-rootJobs.each { j ->
-    if (j.metaClass.hasProperty(j, 'builds')) {
-        rootBuilds += j.getBuilds().size()
-    }
+// project roles
+roles.project = strategy.getRoleMap(RoleBasedAuthorizationStrategy.PROJECT).getRoles().collect { r ->
+    [
+        name: r.getName(),
+        permissions: r.getPermissions()*.id,
+        sids: strategy.getRoleMap(RoleBasedAuthorizationStrategy.PROJECT).getSidsForRole(r.getName())
+    ]
 }
-result << [folder: "/", jobCount: rootJobs.size(), buildCount: rootBuilds]
 
-def totalBuildsAll = result.sum { it.buildCount }
-JsonOutput.toJson([totalFolders: result.size(), totalBuilds: totalBuildsAll, folders: result])
+// folder roles (если есть)
+roles.folder = strategy.getRoleMap(RoleBasedAuthorizationStrategy.ITEM).getRoles().collect { r ->
+    [
+        name: r.getName(),
+        permissions: r.getPermissions()*.id,
+        sids: strategy.getRoleMap(RoleBasedAuthorizationStrategy.ITEM).getSidsForRole(r.getName())
+    ]
+}
+
+JsonOutput.toJson(roles)
