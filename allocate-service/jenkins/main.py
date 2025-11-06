@@ -97,6 +97,29 @@ def write_excel(users, jobs, nodes):
         ws_j.write(row, 7, str(j.get("lastResult", "")))
         ws_j.write(row, 8, str(j.get("lastBuildTime", "")))
 
+    # --- Jobs with Builds only ---
+    ws_jb = wb.add_worksheet("JobsWithBuilds")
+    for col, h in enumerate(headers_j):
+        ws_jb.write(0, col, h)
+
+    filtered_jobs = [
+        j for j in jobs["jobs"]
+        if j.get("lastBuild") not in (None, "", "null") or j.get("lastResult") not in (None, "", "null")
+    ]
+
+    for row, j in enumerate(filtered_jobs, start=1):
+        ws_jb.write(row, 0, j.get("name", ""))
+        ws_jb.write(row, 1, j.get("type", ""))
+        ws_jb.write(row, 2, j.get("url", ""))
+        ws_jb.write(row, 3, j.get("description", ""))
+        ws_jb.write(row, 4, str(j.get("isBuildable", "")))
+        ws_jb.write(row, 5, str(j.get("isFolder", "")))
+        ws_jb.write(row, 6, str(j.get("lastBuild", "")))
+        ws_jb.write(row, 7, str(j.get("lastResult", "")))
+        ws_jb.write(row, 8, str(j.get("lastBuildTime", "")))
+
+    logger.info(f"Добавлен лист JobsWithBuilds: {len(filtered_jobs)} записей")
+
     # --- Nodes ---
     ws_n = wb.add_worksheet("Nodes")
     headers_n = ["Name", "Online", "Executors", "Labels", "Mode", "Description"]
@@ -116,15 +139,18 @@ def write_excel(users, jobs, nodes):
     ws_s.write(1, 0, "Пользователи")
     ws_s.write(2, 0, "Джобы")
     ws_s.write(3, 0, "Ноды")
+    ws_s.write(4, 0, "Джобы с билдами")
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     ws_s.write(0, 1, now)
     ws_s.write(1, 1, users["total"])
     ws_s.write(2, 1, jobs["total"])
     ws_s.write(3, 1, nodes["total"])
+    ws_s.write(4, 1, len(filtered_jobs))
 
     wb.close()
     logger.info(f"Excel полностью перезаписан: {FILE_PATH}")
+
 
 
 # === Основной поток ===
