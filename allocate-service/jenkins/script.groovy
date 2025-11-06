@@ -2,26 +2,27 @@ import groovy.json.JsonOutput
 
 def strategy = Jenkins.instance.getAuthorizationStrategy()
 def roles = [:]
-def RoleType
-def RoleBasedAuthorizationStrategy
 
-// Проверяем, какой класс доступен
+// Определяем, какие именно классы доступны
+def RoleType, RoleStrategyClass
+
 try {
-    RoleType = com.synopsys.arc.jenkins.plugins.rolestrategy.RoleType
-    RoleBasedAuthorizationStrategy = com.synopsys.arc.jenkins.plugins.rolestrategy.RoleBasedAuthorizationStrategy
-} catch (Throwable e1) {
+    RoleType = this.class.classLoader.loadClass('com.synopsys.arc.jenkins.plugins.rolestrategy.RoleType')
+    RoleStrategyClass = this.class.classLoader.loadClass('com.synopsys.arc.jenkins.plugins.rolestrategy.RoleBasedAuthorizationStrategy')
+} catch (Throwable t1) {
     try {
-        RoleType = com.michelin.cio.hudson.plugins.rolestrategy.RoleType
-        RoleBasedAuthorizationStrategy = com.michelin.cio.hudson.plugins.rolestrategy.RoleBasedAuthorizationStrategy
-    } catch (Throwable e2) {
-        return JsonOutput.toJson([error: "Role Strategy plugin не найден"])
+        RoleType = this.class.classLoader.loadClass('com.michelin.cio.hudson.plugins.rolestrategy.RoleType')
+        RoleStrategyClass = this.class.classLoader.loadClass('com.michelin.cio.hudson.plugins.rolestrategy.RoleBasedAuthorizationStrategy')
+    } catch (Throwable t2) {
+        return JsonOutput.toJson([error: "Role-Strategy plugin не найден"])
     }
 }
 
-if (!(strategy instanceof RoleBasedAuthorizationStrategy)) {
-    return JsonOutput.toJson([error: "Role Strategy не используется"])
+if (!RoleStrategyClass.isInstance(strategy)) {
+    return JsonOutput.toJson([error: "Role-Strategy не используется"])
 }
 
+// Функция для сбора ролей по типу
 def collectRoles = { roleType ->
     def roleMap = strategy.getRoleMap(roleType)
     return roleMap.getRoles().collect { r ->
