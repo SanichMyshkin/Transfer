@@ -2,7 +2,6 @@ import os
 import sys
 import logging
 import urllib3
-import openpyxl
 import xlsxwriter
 from datetime import datetime
 from dotenv import load_dotenv
@@ -19,9 +18,7 @@ for h in logging.root.handlers[:]:
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-formatter = logging.Formatter(
-    "%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S"
-)
+formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S")
 
 file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
 file_handler.setFormatter(formatter)
@@ -43,19 +40,7 @@ FILE_PATH = os.path.join(os.getcwd(), "jenkins_inventory.xlsx")
 client = JenkinsGroovyClient(JENKINS_URL, USER, TOKEN, is_https=True)
 
 
-# === Утилиты ===
-def create_excel_if_missing():
-    """Создает Excel-файл с нужными листами, если его нет"""
-    if not os.path.exists(FILE_PATH):
-        wb = xlsxwriter.Workbook(FILE_PATH)
-        wb.add_worksheet("Users")
-        wb.add_worksheet("Jobs")
-        wb.add_worksheet("Nodes")
-        wb.add_worksheet("Summary")
-        wb.close()
-        logger.info("Создан новый файл jenkins_inventory.xlsx")
-
-
+# === Получение данных ===
 def get_users():
     logger.info("Получаем пользователей...")
     data = client.run_script(SCRIPT_USERS)
@@ -77,101 +62,69 @@ def get_nodes():
     return data
 
 
-# === Запись в Excel ===
-def init_headers(ws, headers):
-    """Создает заголовки только если таблица пуста"""
-    if ws.max_row == 1 and all(cell.value is None for cell in ws[1]):
-        ws.append(headers)
+# === Запись Excel ===
+def write_excel(users, jobs, nodes):
+    """Перезаписывает Excel-файл полностью"""
+    wb = xlsxwriter.Workbook(FILE_PATH)
 
+    # --- Users ---
+    ws_u = wb.add_worksheet("Users")
+    headers_u = ["ID", "Full Name", "Email"]
+    for col, h in enumerate(headers_u):
+        ws_u.write(0, col, h)
+    for row, u in enumerate(users["users"], start=1):
+        ws_u.write(row, 0, u.get("id", ""))
+        ws_u.write(row, 1, u.get("fullName", ""))
+        ws_u.write(row, 2, u.get("email", ""))
 
-def write_users(ws, users):
-    """Запись пользователей"""
-    init_headers(ws, ["ID", "Full Name", "Email"])
-    for u in users["users"]:
-        ws.append([u.get("id", ""), u.get("fullName", ""), u.get("email", "")])
-
-
-def write_jobs(ws, jobs):
-    """Запись джоб"""
-    init_headers(
-        ws,
-        [
-            "Name",
-            "Type",
-            "URL",
-            "Description",
-            "Is Buildable",
-            "Is Folder",
-            "Last Build",
-            "Last Result",
-            "Last Build Time",
-        ],
-    )
-    for j in jobs["jobs"]:
-        ws.append(
-            [
-                j.get("name", ""),
-                j.get("type", ""),
-                j.get("url", ""),
-                j.get("description", ""),
-                str(j.get("isBuildable", "")),
-                str(j.get("isFolder", "")),
-                str(j.get("lastBuild", "")),
-                str(j.get("lastResult", "")),
-                str(j.get("lastBuildTime", "")),
-            ]
-        )
-
-
-def write_nodes(ws, nodes):
-    """Запись нод"""
-    init_headers(ws, ["Name", "Online", "Executors", "Labels", "Mode", "Description"])
-    for n in nodes["nodes"]:
-        ws.append(
-            [
-                n.get("name", ""),
-                str(n.get("online", "")),
-                str(n.get("executors", "")),
-                n.get("labels", ""),
-                n.get("mode", ""),
-                n.get("description", ""),
-            ]
-        )
-
-
-def write_summary(ws, users, jobs, nodes):
-    """Сводка — вывод вниз по столбцу"""
-    labels = ["Дата", "Пользователи", "Джобы", "Ноды"]
-    values = [
-        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        users["total"],
-        jobs["total"],
-        nodes["total"],
+    # --- Jobs ---
+    ws_j = wb.add_worksheet("Jobs")
+    headers_j = [
+        "Name", "Type", "URL", "Description",
+        "Is Buildable", "Is Folder", "Last Build",
+        "Last Result", "Last Build Time"
     ]
+    for col, h in enumerate(headers_j):
+        ws_j.write(0, col, h)
+    for row, j in enumerate(jobs["jobs"], start=1):
+        ws_j.write(row, 0, j.get("name", ""))
+        ws_j.write(row, 1, j.get("type", ""))
+        ws_j.write(row, 2, j.get("url", ""))
+        ws_j.write(row, 3, j.get("description", ""))
+        ws_j.write(row, 4, str(j.get("isBuildable", "")))
+        ws_j.write(row, 5, str(j.get("isFolder", "")))
+        ws_j.write(row, 6, str(j.get("lastBuild", "")))
+        ws_j.write(row, 7, str(j.get("lastResult", "")))
+        ws_j.write(row, 8, str(j.get("lastBuildTime", "")))
 
-    if ws.max_row == 1 and all(cell.value is None for cell in ws[1]):
-        # первая инициализация — в столбец A (метки)
-        for i, label in enumerate(labels, start=1):
-            ws.cell(row=i, column=1).value = label
-        for i, val in enumerate(values, start=1):
-            ws.cell(row=i, column=2).value = val
-    else:
-        # добавляем новые значения в следующий столбец
-        next_col = ws.max_column + 1
-        for i, val in enumerate(values, start=1):
-            ws.cell(row=i, column=next_col).value = val
+    # --- Nodes ---
+    ws_n = wb.add_worksheet("Nodes")
+    headers_n = ["Name", "Online", "Executors", "Labels", "Mode", "Description"]
+    for col, h in enumerate(headers_n):
+        ws_n.write(0, col, h)
+    for row, n in enumerate(nodes["nodes"], start=1):
+        ws_n.write(row, 0, n.get("name", ""))
+        ws_n.write(row, 1, str(n.get("online", "")))
+        ws_n.write(row, 2, str(n.get("executors", "")))
+        ws_n.write(row, 3, n.get("labels", ""))
+        ws_n.write(row, 4, n.get("mode", ""))
+        ws_n.write(row, 5, n.get("description", ""))
 
+    # --- Summary ---
+    ws_s = wb.add_worksheet("Summary")
+    ws_s.write(0, 0, "Дата")
+    ws_s.write(1, 0, "Пользователи")
+    ws_s.write(2, 0, "Джобы")
+    ws_s.write(3, 0, "Ноды")
 
-def update_excel(users, jobs, nodes):
-    """Главная функция записи"""
-    create_excel_if_missing()
-    wb = openpyxl.load_workbook(FILE_PATH)
-    write_users(wb["Users"], users)
-    write_jobs(wb["Jobs"], jobs)
-    write_nodes(wb["Nodes"], nodes)
-    write_summary(wb["Summary"], users, jobs, nodes)
-    wb.save(FILE_PATH)
-    logger.info(f"Результаты записаны в {FILE_PATH}")
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ws_s.write(0, 1, now)
+    ws_s.write(1, 1, users["total"])
+    ws_s.write(2, 1, jobs["total"])
+    ws_s.write(3, 1, nodes["total"])
+
+    wb.close()
+    logger.info(f"Excel полностью перезаписан: {FILE_PATH}")
 
 
 # === Основной поток ===
@@ -181,7 +134,7 @@ def main():
         users = get_users()
         jobs = get_jobs()
         nodes = get_nodes()
-        update_excel(users, jobs, nodes)
+        write_excel(users, jobs, nodes)
         logger.info("Инвентаризация завершена успешно.")
     except Exception as e:
         logger.exception(f"Ошибка при инвентаризации: {e}")
