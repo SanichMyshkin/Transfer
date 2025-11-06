@@ -3,11 +3,12 @@ import groovy.json.JsonOutput
 def strategy = Jenkins.instance.getAuthorizationStrategy()
 def loader = Jenkins.instance.pluginManager.uberClassLoader
 
-def RoleType = loader.loadClass('com.synopsys.arc.jenkins.plugins.rolestrategy.RoleType')
-def RoleBasedAuthorizationStrategy = loader.loadClass('com.synopsys.arc.jenkins.plugins.rolestrategy.RoleBasedAuthorizationStrategy')
+// пробуем старый пакет (Michelin)
+def RoleType = loader.loadClass('com.michelin.cio.hudson.plugins.rolestrategy.RoleType')
+def RoleBasedAuthorizationStrategy = loader.loadClass('com.michelin.cio.hudson.plugins.rolestrategy.RoleBasedAuthorizationStrategy')
 
 if (!RoleBasedAuthorizationStrategy.isInstance(strategy)) {
-    return JsonOutput.toJson([error: "Role Strategy plugin активен, но не используется в настройках авторизации"])
+    return JsonOutput.toJson([error: "Role-Strategy plugin есть, но не используется как текущая авторизация"])
 }
 
 def collectRoles = { roleType ->
