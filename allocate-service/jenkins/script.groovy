@@ -1,38 +1,26 @@
-import com.michelin.cio.hudson.plugins.rolestrategy.*
+import com.synopsys.arc.jenkins.plugins.rolestrategy.*
 import groovy.json.JsonOutput
 
 def strategy = Jenkins.instance.getAuthorizationStrategy()
 if (!(strategy instanceof RoleBasedAuthorizationStrategy)) {
-    return JsonOutput.toJson([error: "Role Strategy plugin not used"])
+    return JsonOutput.toJson([error: "Role Strategy plugin not active"])
 }
 
 def roles = [:]
 
-// global roles
-roles.global = strategy.getRoleMap(RoleBasedAuthorizationStrategy.GLOBAL).getRoles().collect { r ->
-    [
-        name: r.getName(),
-        permissions: r.getPermissions()*.id,
-        sids: strategy.getRoleMap(RoleBasedAuthorizationStrategy.GLOBAL).getSidsForRole(r.getName())
-    ]
+def collectRoles = { RoleType type ->
+    def roleMap = strategy.getRoleMap(type)
+    return roleMap.getRoles().collect { r ->
+        [
+            name: r.getName(),
+            permissions: r.getPermissions()*.id,
+            sids: roleMap.getSidsForRole(r.getName())
+        ]
+    }
 }
 
-// project roles
-roles.project = strategy.getRoleMap(RoleBasedAuthorizationStrategy.PROJECT).getRoles().collect { r ->
-    [
-        name: r.getName(),
-        permissions: r.getPermissions()*.id,
-        sids: strategy.getRoleMap(RoleBasedAuthorizationStrategy.PROJECT).getSidsForRole(r.getName())
-    ]
-}
-
-// folder roles (если есть)
-roles.folder = strategy.getRoleMap(RoleBasedAuthorizationStrategy.ITEM).getRoles().collect { r ->
-    [
-        name: r.getName(),
-        permissions: r.getPermissions()*.id,
-        sids: strategy.getRoleMap(RoleBasedAuthorizationStrategy.ITEM).getSidsForRole(r.getName())
-    ]
-}
+roles.global = collectRoles(RoleType.Global)
+roles.project = collectRoles(RoleType.Project)
+roles.folder = collectRoles(RoleType.Item)
 
 JsonOutput.toJson(roles)
