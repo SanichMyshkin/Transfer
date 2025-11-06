@@ -1,31 +1,18 @@
 import groovy.json.JsonOutput
 
 def strategy = Jenkins.instance.getAuthorizationStrategy()
-def roles = [:]
+def loader = Jenkins.instance.pluginManager.uberClassLoader
 
-// Определяем, какие именно классы доступны
-def RoleType, RoleStrategyClass
+def RoleType = loader.loadClass('com.synopsys.arc.jenkins.plugins.rolestrategy.RoleType')
+def RoleBasedAuthorizationStrategy = loader.loadClass('com.synopsys.arc.jenkins.plugins.rolestrategy.RoleBasedAuthorizationStrategy')
 
-try {
-    RoleType = this.class.classLoader.loadClass('com.synopsys.arc.jenkins.plugins.rolestrategy.RoleType')
-    RoleStrategyClass = this.class.classLoader.loadClass('com.synopsys.arc.jenkins.plugins.rolestrategy.RoleBasedAuthorizationStrategy')
-} catch (Throwable t1) {
-    try {
-        RoleType = this.class.classLoader.loadClass('com.michelin.cio.hudson.plugins.rolestrategy.RoleType')
-        RoleStrategyClass = this.class.classLoader.loadClass('com.michelin.cio.hudson.plugins.rolestrategy.RoleBasedAuthorizationStrategy')
-    } catch (Throwable t2) {
-        return JsonOutput.toJson([error: "Role-Strategy plugin не найден"])
-    }
+if (!RoleBasedAuthorizationStrategy.isInstance(strategy)) {
+    return JsonOutput.toJson([error: "Role Strategy plugin активен, но не используется в настройках авторизации"])
 }
 
-if (!RoleStrategyClass.isInstance(strategy)) {
-    return JsonOutput.toJson([error: "Role-Strategy не используется"])
-}
-
-// Функция для сбора ролей по типу
 def collectRoles = { roleType ->
     def roleMap = strategy.getRoleMap(roleType)
-    return roleMap.getRoles().collect { r ->
+    roleMap.getRoles().collect { r ->
         [
             name: r.getName(),
             permissions: r.getPermissions()*.id,
@@ -34,16 +21,10 @@ def collectRoles = { roleType ->
     }
 }
 
-roles.global = collectRoles(RoleType.Global)
-roles.project = collectRoles(RoleType.Project)
-roles.folder = collectRoles(RoleType.Item)
+def roles = [
+    global : collectRoles(RoleType.Global),
+    project: collectRoles(RoleType.Project),
+    folder : collectRoles(RoleType.Item)
+]
 
 JsonOutput.toJson(roles)
-
-
-
-Jenkins.instance.pluginManager.plugins.findAll {
-    it.shortName.contains("role") || it.displayName.contains("Role")
-}.each {
-    println("${it.displayName} — ${it.version} — enabled=${it.isEnabled()}")
-}
