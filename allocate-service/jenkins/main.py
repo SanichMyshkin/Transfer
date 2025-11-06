@@ -104,9 +104,10 @@ def write_excel(users, jobs, nodes):
 
     filtered_jobs = [
         j for j in jobs["jobs"]
-        if j.get("lastBuild") not in (None, "", "null") or j.get("lastResult") not in (None, "", "null")
+        if j.get("lastBuild") not in (None, "", "null")
     ]
 
+    total_builds = 0
     for row, j in enumerate(filtered_jobs, start=1):
         ws_jb.write(row, 0, j.get("name", ""))
         ws_jb.write(row, 1, j.get("type", ""))
@@ -118,7 +119,13 @@ def write_excel(users, jobs, nodes):
         ws_jb.write(row, 7, str(j.get("lastResult", "")))
         ws_jb.write(row, 8, str(j.get("lastBuildTime", "")))
 
-    logger.info(f"Добавлен лист JobsWithBuilds: {len(filtered_jobs)} записей")
+        # lastBuild — это номер последнего билда, значит суммарно билдов ≈ lastBuild
+        try:
+            total_builds += int(j.get("lastBuild", 0))
+        except ValueError:
+            pass
+
+    logger.info(f"Добавлен лист JobsWithBuilds: {len(filtered_jobs)} записей, всего билдов: {total_builds}")
 
     # --- Nodes ---
     ws_n = wb.add_worksheet("Nodes")
@@ -138,18 +145,21 @@ def write_excel(users, jobs, nodes):
     ws_s.write(0, 0, "Дата")
     ws_s.write(1, 0, "Пользователи")
     ws_s.write(2, 0, "Джобы")
-    ws_s.write(3, 0, "Ноды")
-    ws_s.write(4, 0, "Джобы с билдами")
+    ws_s.write(3, 0, "Джобы с билдами")
+    ws_s.write(4, 0, "Всего билдов")
+    ws_s.write(5, 0, "Ноды")
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     ws_s.write(0, 1, now)
     ws_s.write(1, 1, users["total"])
     ws_s.write(2, 1, jobs["total"])
-    ws_s.write(3, 1, nodes["total"])
-    ws_s.write(4, 1, len(filtered_jobs))
+    ws_s.write(3, 1, len(filtered_jobs))
+    ws_s.write(4, 1, total_builds)
+    ws_s.write(5, 1, nodes["total"])
 
     wb.close()
     logger.info(f"Excel полностью перезаписан: {FILE_PATH}")
+
 
 
 
