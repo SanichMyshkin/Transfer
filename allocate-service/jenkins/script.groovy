@@ -39,3 +39,11 @@ roles.project = collectRoles(RoleType.Project)
 roles.folder = collectRoles(RoleType.Item)
 
 JsonOutput.toJson(roles)
+
+
+
+Jenkins.instance.pluginManager.plugins.findAll {
+    it.shortName.contains("role") || it.displayName.contains("Role")
+}.each {
+    println("${it.displayName} — ${it.version} — enabled=${it.isEnabled()}")
+}
