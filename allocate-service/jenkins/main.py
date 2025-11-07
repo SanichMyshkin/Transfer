@@ -12,6 +12,7 @@ from ldap3.utils.conv import escape_filter_chars
 from jenkins_groovy import JenkinsGroovyClient
 from jenkins_scripts import SCRIPT_USERS, SCRIPT_JOBS, SCRIPT_NODES, SCRIPT_AD_GROUP
 
+
 # === Логирование ===
 LOG_FILE = os.path.join(os.getcwd(), "jenkins_inventory.log")
 
@@ -20,9 +21,7 @@ for h in logging.root.handlers[:]:
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
-formatter = logging.Formatter(
-    "%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S"
-)
+formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S")
 
 file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
 file_handler.setFormatter(formatter)
@@ -41,20 +40,19 @@ USER = os.getenv("USER")
 TOKEN = os.getenv("TOKEN")
 FILE_PATH = os.path.join(os.getcwd(), "jenkins_inventory.xlsx")
 
-client = JenkinsGroovyClient(JENKINS_URL, USER, TOKEN, is_https=False)
+client = JenkinsGroovyClient(JENKINS_URL, USER, TOKEN, is_https=True)
 
 # === LDAP ===
 AD_SERVER = os.getenv("AD_SERVER")
 AD_USER = os.getenv("AD_USER")
 AD_PASSWORD = os.getenv("AD_PASSWORD")
-AD_BASE = os.getenv("AD_PEOPLE_SEARCH_BASE")
+AD_BASE = os.getenv("AD_PEOPLE_SEARCH_BASE", "DC=fc,DC=uralsibbank,DC=ru")
 CA_CERT = os.getenv("CA_CERT", "CA.crt")
 
 
 # ============================================================
-# === Jenkins data ===
+# === Jenkins Data ===
 # ============================================================
-
 
 def get_users():
     logger.info("Получаем пользователей...")
@@ -90,7 +88,6 @@ def get_ad_groups():
 # === LDAP ===
 # ============================================================
 
-
 def connect_ldap():
     logger.info(f"Подключаемся к LDAP: {AD_SERVER}")
     tls = Tls(validate=ssl.CERT_REQUIRED, ca_certs_file=CA_CERT)
@@ -104,39 +101,6 @@ def safe_get(attr_dict, key):
     if isinstance(val, (list, tuple)):
         return val[0] if val else ""
     return val or ""
-
-
-def get_all_ldap_users(conn, search_base=AD_BASE):
-    """Получает всех пользователей из LDAP"""
-    logger.info("Получаем всех пользователей LDAP...")
-    conn.search(
-        search_base=search_base,
-        search_filter="(&(objectClass=user)(!(objectClass=computer)))",
-        search_scope=SUBTREE,
-        attributes=[
-            "sAMAccountName",
-            "displayName",
-            "mail",
-            "distinguishedName",
-            "whenCreated",
-        ],
-    )
-
-    results = []
-    for e in conn.entries:
-        a = e.entry_attributes_as_dict
-        results.append(
-            {
-                "sAMAccountName": safe_get(a, "sAMAccountName"),
-                "displayName": safe_get(a, "displayName"),
-                "mail": safe_get(a, "mail"),
-                "dn": safe_get(a, "distinguishedName"),
-                "whenCreated": str(safe_get(a, "whenCreated")),
-            }
-        )
-
-    logger.info(f"Всего пользователей в LDAP: {len(results)}")
-    return results
 
 
 def get_users_from_ad_group(conn, group_name):
@@ -165,9 +129,7 @@ def get_users_from_ad_group(conn, group_name):
         logger.info(f"ℹ️ Группа '{group_name}' пуста.")
         return {"group": group_name, "found": True, "members": []}
 
-    logger.info(
-        f"📋 Группа '{group_name}' найдена, пользователей: {len(members)} — начинаем сбор атрибутов..."
-    )
+    logger.info(f"📋 Группа '{group_name}' найдена, пользователей: {len(members)} — начинаем сбор атрибутов...")
 
     for dn in members:
         try:
@@ -180,34 +142,26 @@ def get_users_from_ad_group(conn, group_name):
             if conn.entries:
                 u = conn.entries[0]
                 a = u.entry_attributes_as_dict
-                users.append(
-                    {
-                        "ad_group": group_name,
-                        "user": safe_get(a, "sAMAccountName"),
-                        "displayName": safe_get(a, "displayName"),
-                        "mail": safe_get(a, "mail"),
-                        "whenCreated": str(safe_get(a, "whenCreated")),
-                        "user_dn": dn,
-                    }
-                )
+                users.append({
+                    "ad_group": group_name,
+                    "user": safe_get(a, "sAMAccountName"),
+                    "displayName": safe_get(a, "displayName"),
+                    "mail": safe_get(a, "mail"),
+                    "whenCreated": str(safe_get(a, "whenCreated")),
+                    "user_dn": dn,
+                })
         except Exception as e:
-            logger.error(
-                f"❌ Ошибка при обработке DN {dn} в группе '{group_name}': {e}"
-            )
+            logger.error(f"❌ Ошибка при обработке DN {dn} в группе '{group_name}': {e}")
 
     elapsed = time.perf_counter() - start_time
-    logger.info(
-        f"✅ Группа '{group_name}' обработана: {len(users)} пользователей, {elapsed:.2f} сек."
-    )
+    logger.info(f"✅ Группа '{group_name}' обработана: {len(users)} пользователей, {elapsed:.2f} сек.")
     return {"group": group_name, "found": True, "members": users}
 
 
-def fetch_ldap_data():
-    """Получает всех LDAP-пользователей + участников всех AD-групп Jenkins"""
+def fetch_ldap_group_members():
+    """Обходит только AD-группы Jenkins и получает их участников"""
     groups = get_ad_groups()
     conn = connect_ldap()
-
-    all_ldap_users = get_all_ldap_users(conn)
     ad_group_members = []
 
     total_groups = len(groups)
@@ -225,18 +179,15 @@ def fetch_ldap_data():
             logger.error(f"❌ Ошибка при запросе группы '{group}': {e}")
 
     conn.unbind()
-    logger.info(
-        f"🎯 Завершено. Всего пользователей из всех групп: {len(ad_group_members)}"
-    )
-    return all_ldap_users, ad_group_members
+    logger.info(f"🎯 Завершено. Всего пользователей из всех групп: {len(ad_group_members)}")
+    return ad_group_members
 
 
 # ============================================================
 # === Excel Writer ===
 # ============================================================
 
-
-def write_excel_with_ldap(users, jobs, nodes, ldap_users, ad_group_members):
+def write_excel(users, jobs, nodes, ad_group_members):
     wb = xlsxwriter.Workbook(FILE_PATH)
 
     # --- Users ---
@@ -252,15 +203,9 @@ def write_excel_with_ldap(users, jobs, nodes, ldap_users, ad_group_members):
     # --- Jobs ---
     ws_j = wb.add_worksheet("Jobs")
     headers_j = [
-        "Name",
-        "Type",
-        "URL",
-        "Description",
-        "Is Buildable",
-        "Is Folder",
-        "Last Build",
-        "Last Result",
-        "Last Build Time",
+        "Name", "Type", "URL", "Description",
+        "Is Buildable", "Is Folder", "Last Build",
+        "Last Result", "Last Build Time"
     ]
     for col, h in enumerate(headers_j):
         ws_j.write(0, col, h)
@@ -280,14 +225,8 @@ def write_excel_with_ldap(users, jobs, nodes, ldap_users, ad_group_members):
     for col, h in enumerate(headers_j):
         ws_jb.write(0, col, h)
 
-    filtered_jobs = [
-        j for j in jobs["jobs"] if j.get("lastBuild") not in (None, "", "null")
-    ]
-    total_builds = sum(
-        int(j.get("lastBuild", 0))
-        for j in filtered_jobs
-        if str(j.get("lastBuild", "")).isdigit()
-    )
+    filtered_jobs = [j for j in jobs["jobs"] if j.get("lastBuild") not in (None, "", "null")]
+    total_builds = sum(int(j.get("lastBuild", 0)) for j in filtered_jobs if str(j.get("lastBuild", "")).isdigit())
 
     for row, j in enumerate(filtered_jobs, start=1):
         ws_jb.write(row, 0, j.get("name", ""))
@@ -299,31 +238,6 @@ def write_excel_with_ldap(users, jobs, nodes, ldap_users, ad_group_members):
         ws_jb.write(row, 6, str(j.get("lastBuild", "")))
         ws_jb.write(row, 7, str(j.get("lastResult", "")))
         ws_jb.write(row, 8, str(j.get("lastBuildTime", "")))
-
-    # --- Nodes ---
-    ws_n = wb.add_worksheet("Nodes")
-    headers_n = ["Name", "Online", "Executors", "Labels", "Mode", "Description"]
-    for col, h in enumerate(headers_n):
-        ws_n.write(0, col, h)
-    for row, n in enumerate(nodes["nodes"], start=1):
-        ws_n.write(row, 0, n.get("name", ""))
-        ws_n.write(row, 1, str(n.get("online", "")))
-        ws_n.write(row, 2, str(n.get("executors", "")))
-        ws_n.write(row, 3, n.get("labels", ""))
-        ws_n.write(row, 4, n.get("mode", ""))
-        ws_n.write(row, 5, n.get("description", ""))
-
-    # --- LDAP Users ---
-    ws_lu = wb.add_worksheet("LDAP_Users")
-    headers_lu = ["sAMAccountName", "displayName", "mail", "dn", "whenCreated"]
-    for col, h in enumerate(headers_lu):
-        ws_lu.write(0, col, h)
-    for row, u in enumerate(ldap_users, start=1):
-        ws_lu.write(row, 0, u.get("sAMAccountName", ""))
-        ws_lu.write(row, 1, u.get("displayName", ""))
-        ws_lu.write(row, 2, u.get("mail", ""))
-        ws_lu.write(row, 3, u.get("dn", ""))
-        ws_lu.write(row, 4, u.get("whenCreated", ""))
 
     # --- AD Group Members ---
     ws_gm = wb.add_worksheet("AD_Group_Members")
@@ -346,8 +260,8 @@ def write_excel_with_ldap(users, jobs, nodes, ldap_users, ad_group_members):
     ws_s.write(3, 0, "Джобы с билдами")
     ws_s.write(4, 0, "Всего билдов")
     ws_s.write(5, 0, "Ноды")
-    ws_s.write(6, 0, "LDAP пользователей")
-    ws_s.write(7, 0, "AD групп (Jenkins)")
+    ws_s.write(6, 0, "Пользователей в AD-группах")
+    ws_s.write(7, 0, "Всего AD-групп (из Jenkins)")
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     ws_s.write(0, 1, now)
@@ -356,7 +270,7 @@ def write_excel_with_ldap(users, jobs, nodes, ldap_users, ad_group_members):
     ws_s.write(3, 1, len(filtered_jobs))
     ws_s.write(4, 1, total_builds)
     ws_s.write(5, 1, nodes["total"])
-    ws_s.write(6, 1, len(ldap_users))
+    ws_s.write(6, 1, len(ad_group_members))
     ws_s.write(7, 1, len(set([m["ad_group"] for m in ad_group_members])))
 
     wb.close()
@@ -367,15 +281,14 @@ def write_excel_with_ldap(users, jobs, nodes, ldap_users, ad_group_members):
 # === MAIN ===
 # ============================================================
 
-
 def main():
-    logger.info("=== Старт инвентаризации Jenkins + LDAP ===")
+    logger.info("=== Старт инвентаризации Jenkins + AD-группы ===")
     try:
         users = get_users()
         jobs = get_jobs()
         nodes = get_nodes()
-        ldap_users, ad_group_members = fetch_ldap_data()
-        write_excel_with_ldap(users, jobs, nodes, ldap_users, ad_group_members)
+        ad_group_members = fetch_ldap_group_members()
+        write_excel(users, jobs, nodes, ad_group_members)
         logger.info("Инвентаризация завершена успешно.")
     except Exception as e:
         logger.exception(f"Ошибка при инвентаризации: {e}")
