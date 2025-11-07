@@ -1,24 +1,27 @@
 import os
 import sys
+import ssl
 import logging
 import urllib3
 import xlsxwriter
 from datetime import datetime
 from dotenv import load_dotenv
+from ldap3 import Server, Connection, ALL, SUBTREE, Tls
+from ldap3.utils.conv import escape_filter_chars
 from jenkins_groovy import JenkinsGroovyClient
 from jenkins_scripts import SCRIPT_USERS, SCRIPT_JOBS, SCRIPT_NODES
 
 # === Настройка логирования ===
 LOG_FILE = os.path.join(os.getcwd(), "jenkins_inventory.log")
 
-# сброс старых хендлеров
 for h in logging.root.handlers[:]:
     logging.root.removeHandler(h)
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
-
-formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S")
+formatter = logging.Formatter(
+    "%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S"
+)
 
 file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
 file_handler.setFormatter(formatter)
@@ -31,16 +34,27 @@ logger.addHandler(console_handler)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 load_dotenv()
 
-# === Параметры подключения ===
+# === Jenkins credentials ===
 JENKINS_URL = os.getenv("JENKINS_URL")
 USER = os.getenv("USER")
 TOKEN = os.getenv("TOKEN")
 FILE_PATH = os.path.join(os.getcwd(), "jenkins_inventory.xlsx")
 
-client = JenkinsGroovyClient(JENKINS_URL, USER, TOKEN, is_https=True)
+# === LDAP credentials ===
+AD_SERVER = os.getenv("AD_SERVER")
+AD_USER = os.getenv("AD_USER")
+AD_PASSWORD = os.getenv("AD_PASSWORD")
+AD_BASE = os.getenv("AD_PEOPLE_SEARCH_BASE")
+CA_CERT = os.getenv("CA_CERT", "CA.crt")
+
+client = JenkinsGroovyClient(JENKINS_URL, USER, TOKEN, is_https=False)
 
 
-# === Получение данных ===
+# ============================================================
+# === Jenkins data fetchers ===
+# ============================================================
+
+
 def get_users():
     logger.info("Получаем пользователей...")
     data = client.run_script(SCRIPT_USERS)
@@ -62,8 +76,74 @@ def get_nodes():
     return data
 
 
-# === Запись Excel ===
-def write_excel(users, jobs, nodes):
+# ============================================================
+# === LDAP functions ===
+# ============================================================
+
+
+def connect_ldap():
+    logger.info(f"Подключаемся к LDAP: {AD_SERVER}")
+    tls = Tls(validate=ssl.CERT_REQUIRED, ca_certs_file=CA_CERT)
+    server = Server(AD_SERVER, use_ssl=True, get_info=ALL, tls=tls)
+    return Connection(server, AD_USER, AD_PASSWORD, auto_bind=True)
+
+
+def get_user_groups(conn, sam_or_mail):
+    """Возвращает список групп AD по SAM или mail"""
+    if not sam_or_mail:
+        return None
+    filt = escape_filter_chars(sam_or_mail)
+    search = f"(|(sAMAccountName={filt})(mail={filt}))"
+    conn.search(
+        search_base=AD_BASE,
+        search_filter=f"(&(objectClass=user){search})",
+        search_scope=SUBTREE,
+        attributes=["sAMAccountName", "displayName", "mail", "memberOf"],
+    )
+    if not conn.entries:
+        return None
+    entry = conn.entries[0]
+    groups = entry.memberOf.values if "memberOf" in entry else []
+    return [str(g.split(",")[0].replace("CN=", "")) for g in groups]
+
+
+def map_jenkins_to_ldap(jenkins_users):
+    """Сопоставляет пользователей Jenkins с LDAP-группами"""
+    conn = connect_ldap()
+    matched, unmatched, all_groups = [], [], set()
+
+    for u in jenkins_users["users"]:
+        uid = u.get("id")
+        mail = u.get("email", "")
+        groups = get_user_groups(conn, uid) or get_user_groups(conn, mail)
+        if groups:
+            matched.append(
+                {
+                    "jenkins_id": uid,
+                    "fullName": u.get("fullName", ""),
+                    "email": mail,
+                    "ad_groups": ", ".join(groups),
+                }
+            )
+            all_groups.update(groups)
+        else:
+            unmatched.append(
+                {"jenkins_id": uid, "fullName": u.get("fullName", ""), "email": mail}
+            )
+
+    conn.unbind()
+    logger.info(
+        f"LDAP сопоставлено: {len(matched)}, не найдено: {len(unmatched)}, уникальных групп: {len(all_groups)}"
+    )
+    return matched, unmatched, len(all_groups)
+
+
+# ============================================================
+# === Excel Writer ===
+# ============================================================
+
+
+def write_excel(users, jobs, nodes, matched, unmatched, ad_group_count):
     """Перезаписывает Excel-файл полностью"""
     wb = xlsxwriter.Workbook(FILE_PATH)
 
@@ -80,9 +160,15 @@ def write_excel(users, jobs, nodes):
     # --- Jobs ---
     ws_j = wb.add_worksheet("Jobs")
     headers_j = [
-        "Name", "Type", "URL", "Description",
-        "Is Buildable", "Is Folder", "Last Build",
-        "Last Result", "Last Build Time"
+        "Name",
+        "Type",
+        "URL",
+        "Description",
+        "Is Buildable",
+        "Is Folder",
+        "Last Build",
+        "Last Result",
+        "Last Build Time",
     ]
     for col, h in enumerate(headers_j):
         ws_j.write(0, col, h)
@@ -97,14 +183,13 @@ def write_excel(users, jobs, nodes):
         ws_j.write(row, 7, str(j.get("lastResult", "")))
         ws_j.write(row, 8, str(j.get("lastBuildTime", "")))
 
-    # --- Jobs with Builds only ---
+    # --- Jobs with Builds ---
     ws_jb = wb.add_worksheet("JobsWithBuilds")
     for col, h in enumerate(headers_j):
         ws_jb.write(0, col, h)
 
     filtered_jobs = [
-        j for j in jobs["jobs"]
-        if j.get("lastBuild") not in (None, "", "null")
+        j for j in jobs["jobs"] if j.get("lastBuild") not in (None, "", "null")
     ]
 
     total_builds = 0
@@ -118,14 +203,14 @@ def write_excel(users, jobs, nodes):
         ws_jb.write(row, 6, str(j.get("lastBuild", "")))
         ws_jb.write(row, 7, str(j.get("lastResult", "")))
         ws_jb.write(row, 8, str(j.get("lastBuildTime", "")))
-
-        # lastBuild — это номер последнего билда, значит суммарно билдов ≈ lastBuild
         try:
             total_builds += int(j.get("lastBuild", 0))
         except ValueError:
             pass
 
-    logger.info(f"Добавлен лист JobsWithBuilds: {len(filtered_jobs)} записей, всего билдов: {total_builds}")
+    logger.info(
+        f"Добавлен лист JobsWithBuilds: {len(filtered_jobs)} записей, всего билдов: {total_builds}"
+    )
 
     # --- Nodes ---
     ws_n = wb.add_worksheet("Nodes")
@@ -140,6 +225,24 @@ def write_excel(users, jobs, nodes):
         ws_n.write(row, 4, n.get("mode", ""))
         ws_n.write(row, 5, n.get("description", ""))
 
+    # --- Jenkins ↔ AD Mapping ---
+    ws_m = wb.add_worksheet("Jenkins-AD")
+    headers_m = ["Jenkins ID", "Full Name", "Email", "AD Groups"]
+    for col, h in enumerate(headers_m):
+        ws_m.write(0, col, h)
+    for row, item in enumerate(matched, start=1):
+        ws_m.write(row, 0, item["jenkins_id"])
+        ws_m.write(row, 1, item["fullName"])
+        ws_m.write(row, 2, item["email"])
+        ws_m.write(row, 3, item["ad_groups"])
+
+    start = len(matched) + 2
+    ws_m.write(start, 0, "Непривязанные Jenkins учётки:")
+    for row, item in enumerate(unmatched, start=start + 1):
+        ws_m.write(row, 0, item["jenkins_id"])
+        ws_m.write(row, 1, item["fullName"])
+        ws_m.write(row, 2, item["email"])
+
     # --- Summary ---
     ws_s = wb.add_worksheet("Summary")
     ws_s.write(0, 0, "Дата")
@@ -148,6 +251,7 @@ def write_excel(users, jobs, nodes):
     ws_s.write(3, 0, "Джобы с билдами")
     ws_s.write(4, 0, "Всего билдов")
     ws_s.write(5, 0, "Ноды")
+    ws_s.write(6, 0, "AD групп (уникальных)")
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     ws_s.write(0, 1, now)
@@ -156,21 +260,25 @@ def write_excel(users, jobs, nodes):
     ws_s.write(3, 1, len(filtered_jobs))
     ws_s.write(4, 1, total_builds)
     ws_s.write(5, 1, nodes["total"])
+    ws_s.write(6, 1, ad_group_count)
 
     wb.close()
     logger.info(f"Excel полностью перезаписан: {FILE_PATH}")
 
 
-
-
+# ============================================================
 # === Основной поток ===
+# ============================================================
+
+
 def main():
     logger.info("=== Старт инвентаризации Jenkins ===")
     try:
         users = get_users()
         jobs = get_jobs()
         nodes = get_nodes()
-        write_excel(users, jobs, nodes)
+        matched, unmatched, ad_group_count = map_jenkins_to_ldap(users)
+        write_excel(users, jobs, nodes, matched, unmatched, ad_group_count)
         logger.info("Инвентаризация завершена успешно.")
     except Exception as e:
         logger.exception(f"Ошибка при инвентаризации: {e}")
