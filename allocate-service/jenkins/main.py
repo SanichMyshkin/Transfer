@@ -40,7 +40,7 @@ USER = os.getenv("USER")
 TOKEN = os.getenv("TOKEN")
 FILE_PATH = os.path.join(os.getcwd(), "jenkins_inventory.xlsx")
 
-client = JenkinsGroovyClient(JENKINS_URL, USER, TOKEN, is_http=False)
+client = JenkinsGroovyClient(JENKINS_URL, USER, TOKEN, is_https=False)
 
 # === LDAP ===
 AD_SERVER = os.getenv("AD_SERVER")
@@ -76,7 +76,6 @@ def get_nodes():
 
 
 def get_ad_groups():
-    """Получаем AD-группы из Jenkins"""
     logger.info("Получаем AD-группы из Jenkins...")
     data = client.run_script(SCRIPT_AD_GROUP)
     groups = data.get("ad_groups", [])
@@ -96,7 +95,6 @@ def connect_ldap():
 
 
 def safe_get(attr_dict, key):
-    """Безопасно достаёт значение LDAP-атрибута"""
     val = attr_dict.get(key, "")
     if isinstance(val, (list, tuple)):
         return val[0] if val else ""
@@ -104,7 +102,6 @@ def safe_get(attr_dict, key):
 
 
 def get_users_from_ad_group(conn, group_name):
-    """Возвращает пользователей конкретной AD-группы"""
     start_time = time.perf_counter()
     name_esc = escape_filter_chars(group_name)
     group_filter = f"(&(objectClass=group)(|(cn={name_esc})(sAMAccountName={name_esc})(name={name_esc})))"
@@ -129,8 +126,6 @@ def get_users_from_ad_group(conn, group_name):
         logger.info(f"ℹ️ Группа '{group_name}' пуста.")
         return {"group": group_name, "found": True, "members": []}
 
-    logger.info(f"📋 Группа '{group_name}' найдена, пользователей: {len(members)} — начинаем сбор атрибутов...")
-
     for dn in members:
         try:
             conn.search(
@@ -146,7 +141,7 @@ def get_users_from_ad_group(conn, group_name):
                     "ad_group": group_name,
                     "user": safe_get(a, "sAMAccountName"),
                     "displayName": safe_get(a, "displayName"),
-                    "mail": safe_get(a, "mail"),
+                    "mail": safe_get(a, "mail").lower(),
                     "whenCreated": str(safe_get(a, "whenCreated")),
                     "user_dn": dn,
                 })
@@ -159,11 +154,9 @@ def get_users_from_ad_group(conn, group_name):
 
 
 def fetch_ldap_group_members():
-    """Обходит только AD-группы Jenkins и получает их участников"""
     groups = get_ad_groups()
     conn = connect_ldap()
     ad_group_members = []
-
     total_groups = len(groups)
     logger.info(f"=== Обработка {total_groups} AD-групп из Jenkins ===")
 
@@ -173,8 +166,6 @@ def fetch_ldap_group_members():
             g_data = get_users_from_ad_group(conn, group)
             if g_data["found"]:
                 ad_group_members.extend(g_data["members"])
-            else:
-                logger.warning(f"⚠️ Группа '{group}' отсутствует в AD")
         except Exception as e:
             logger.error(f"❌ Ошибка при запросе группы '{group}': {e}")
 
@@ -184,10 +175,60 @@ def fetch_ldap_group_members():
 
 
 # ============================================================
+# === Сопоставление Jenkins ↔ AD ===
+# ============================================================
+
+def match_jenkins_to_ad(jenkins_users, ad_group_members):
+    """Сопоставляем пользователей Jenkins с AD по email / id"""
+    ad_by_email = {}
+    ad_by_user = {}
+
+    for a in ad_group_members:
+        mail = a.get("mail", "").lower()
+        user = a.get("user", "").lower()
+        group = a.get("ad_group", "")
+        if mail:
+            ad_by_email.setdefault(mail, []).append(group)
+        if user:
+            ad_by_user.setdefault(user, []).append(group)
+
+    matches = []
+    not_found = []
+
+    for u in jenkins_users["users"]:
+        jid = u.get("id", "").lower()
+        mail = (u.get("email") or "").lower()
+
+        matched_groups = set()
+        if mail in ad_by_email:
+            matched_groups.update(ad_by_email[mail])
+        if jid in ad_by_user:
+            matched_groups.update(ad_by_user[jid])
+
+        if matched_groups:
+            matches.append({
+                "jenkins_id": u.get("id", ""),
+                "fullName": u.get("fullName", ""),
+                "email": u.get("email", ""),
+                "ad_groups": ", ".join(sorted(matched_groups))
+            })
+        else:
+            not_found.append({
+                "jenkins_id": u.get("id", ""),
+                "fullName": u.get("fullName", ""),
+                "email": u.get("email", ""),
+                "ad_groups": "NOT FOUND"
+            })
+
+    logger.info(f"🧩 Совпадений найдено: {len(matches)}, не найдено: {len(not_found)}")
+    return matches + not_found
+
+
+# ============================================================
 # === Excel Writer ===
 # ============================================================
 
-def write_excel(users, jobs, nodes, ad_group_members):
+def write_excel(users, jobs, nodes, ad_group_members, user_ad_match):
     wb = xlsxwriter.Workbook(FILE_PATH)
 
     # --- Users ---
@@ -202,42 +243,16 @@ def write_excel(users, jobs, nodes, ad_group_members):
 
     # --- Jobs ---
     ws_j = wb.add_worksheet("Jobs")
-    headers_j = [
-        "Name", "Type", "URL", "Description",
-        "Is Buildable", "Is Folder", "Last Build",
-        "Last Result", "Last Build Time"
-    ]
+    headers_j = ["Name", "Type", "URL", "Description",
+                 "Is Buildable", "Is Folder", "Last Build",
+                 "Last Result", "Last Build Time"]
     for col, h in enumerate(headers_j):
         ws_j.write(0, col, h)
     for row, j in enumerate(jobs["jobs"], start=1):
-        ws_j.write(row, 0, j.get("name", ""))
-        ws_j.write(row, 1, j.get("type", ""))
-        ws_j.write(row, 2, j.get("url", ""))
-        ws_j.write(row, 3, j.get("description", ""))
-        ws_j.write(row, 4, str(j.get("isBuildable", "")))
-        ws_j.write(row, 5, str(j.get("isFolder", "")))
-        ws_j.write(row, 6, str(j.get("lastBuild", "")))
-        ws_j.write(row, 7, str(j.get("lastResult", "")))
-        ws_j.write(row, 8, str(j.get("lastBuildTime", "")))
-
-    # --- JobsWithBuilds ---
-    ws_jb = wb.add_worksheet("JobsWithBuilds")
-    for col, h in enumerate(headers_j):
-        ws_jb.write(0, col, h)
-
-    filtered_jobs = [j for j in jobs["jobs"] if j.get("lastBuild") not in (None, "", "null")]
-    total_builds = sum(int(j.get("lastBuild", 0)) for j in filtered_jobs if str(j.get("lastBuild", "")).isdigit())
-
-    for row, j in enumerate(filtered_jobs, start=1):
-        ws_jb.write(row, 0, j.get("name", ""))
-        ws_jb.write(row, 1, j.get("type", ""))
-        ws_jb.write(row, 2, j.get("url", ""))
-        ws_jb.write(row, 3, j.get("description", ""))
-        ws_jb.write(row, 4, str(j.get("isBuildable", "")))
-        ws_jb.write(row, 5, str(j.get("isFolder", "")))
-        ws_jb.write(row, 6, str(j.get("lastBuild", "")))
-        ws_jb.write(row, 7, str(j.get("lastResult", "")))
-        ws_jb.write(row, 8, str(j.get("lastBuildTime", "")))
+        for col, key in enumerate(["name", "type", "url", "description",
+                                   "isBuildable", "isFolder", "lastBuild",
+                                   "lastResult", "lastBuildTime"]):
+            ws_j.write(row, col, str(j.get(key, "")))
 
     # --- Nodes ---
     ws_n = wb.add_worksheet("Nodes")
@@ -245,12 +260,8 @@ def write_excel(users, jobs, nodes, ad_group_members):
     for col, h in enumerate(headers_n):
         ws_n.write(0, col, h)
     for row, n in enumerate(nodes["nodes"], start=1):
-        ws_n.write(row, 0, n.get("name", ""))
-        ws_n.write(row, 1, str(n.get("online", "")))
-        ws_n.write(row, 2, str(n.get("executors", "")))
-        ws_n.write(row, 3, n.get("labels", ""))
-        ws_n.write(row, 4, n.get("mode", ""))
-        ws_n.write(row, 5, n.get("description", ""))
+        for col, key in enumerate(["name", "online", "executors", "labels", "mode", "description"]):
+            ws_n.write(row, col, str(n.get(key, "")))
 
     # --- AD Group Members ---
     ws_gm = wb.add_worksheet("AD_Group_Members")
@@ -258,33 +269,36 @@ def write_excel(users, jobs, nodes, ad_group_members):
     for col, h in enumerate(headers_gm):
         ws_gm.write(0, col, h)
     for row, u in enumerate(ad_group_members, start=1):
-        ws_gm.write(row, 0, u.get("ad_group", ""))
-        ws_gm.write(row, 1, u.get("user", ""))
-        ws_gm.write(row, 2, u.get("displayName", ""))
-        ws_gm.write(row, 3, u.get("mail", ""))
-        ws_gm.write(row, 4, u.get("whenCreated", ""))
-        ws_gm.write(row, 5, u.get("user_dn", ""))
+        for col, key in enumerate(["ad_group", "user", "displayName", "mail", "whenCreated", "user_dn"]):
+            ws_gm.write(row, col, str(u.get(key, "")))
+
+    # --- User ↔ AD Match ---
+    ws_m = wb.add_worksheet("User_AD_Match")
+    headers_m = ["jenkins_id", "fullName", "email", "ad_groups"]
+    for col, h in enumerate(headers_m):
+        ws_m.write(0, col, h)
+    for row, m in enumerate(user_ad_match, start=1):
+        for col, key in enumerate(headers_m):
+            ws_m.write(row, col, str(m.get(key, "")))
 
     # --- Summary ---
     ws_s = wb.add_worksheet("Summary")
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     ws_s.write(0, 0, "Дата")
     ws_s.write(1, 0, "Пользователи")
     ws_s.write(2, 0, "Джобы")
-    ws_s.write(3, 0, "Джобы с билдами")
-    ws_s.write(4, 0, "Всего билдов")
-    ws_s.write(5, 0, "Ноды")
-    ws_s.write(6, 0, "Пользователей в AD-группах")
-    ws_s.write(7, 0, "Всего AD-групп (из Jenkins)")
+    ws_s.write(3, 0, "Ноды")
+    ws_s.write(4, 0, "AD-групп")
+    ws_s.write(5, 0, "Пользователей AD")
+    ws_s.write(6, 0, "Совпадений Jenkins↔AD")
 
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     ws_s.write(0, 1, now)
     ws_s.write(1, 1, users["total"])
     ws_s.write(2, 1, jobs["total"])
-    ws_s.write(3, 1, len(filtered_jobs))
-    ws_s.write(4, 1, total_builds)
-    ws_s.write(5, 1, nodes["total"])
-    ws_s.write(6, 1, len(ad_group_members))
-    ws_s.write(7, 1, len(set([m["ad_group"] for m in ad_group_members])))
+    ws_s.write(3, 1, nodes["total"])
+    ws_s.write(4, 1, len(set([m["ad_group"] for m in ad_group_members])))
+    ws_s.write(5, 1, len(ad_group_members))
+    ws_s.write(6, 1, len([m for m in user_ad_match if m["ad_groups"] != "NOT FOUND"]))
 
     wb.close()
     logger.info(f"✅ Excel отчёт успешно создан: {FILE_PATH}")
@@ -295,13 +309,14 @@ def write_excel(users, jobs, nodes, ad_group_members):
 # ============================================================
 
 def main():
-    logger.info("=== Старт инвентаризации Jenkins + AD-группы ===")
+    logger.info("=== Старт инвентаризации Jenkins + AD-группы + сопоставление ===")
     try:
         users = get_users()
         jobs = get_jobs()
         nodes = get_nodes()
         ad_group_members = fetch_ldap_group_members()
-        write_excel(users, jobs, nodes, ad_group_members)
+        user_ad_match = match_jenkins_to_ad(users, ad_group_members)
+        write_excel(users, jobs, nodes, ad_group_members, user_ad_match)
         logger.info("Инвентаризация завершена успешно.")
     except Exception as e:
         logger.exception(f"Ошибка при инвентаризации: {e}")
