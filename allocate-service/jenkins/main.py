@@ -40,13 +40,13 @@ USER = os.getenv("USER")
 TOKEN = os.getenv("TOKEN")
 FILE_PATH = os.path.join(os.getcwd(), "jenkins_inventory.xlsx")
 
-client = JenkinsGroovyClient(JENKINS_URL, USER, TOKEN, is_https=True)
+client = JenkinsGroovyClient(JENKINS_URL, USER, TOKEN, is_https=False)
 
 # === LDAP ===
 AD_SERVER = os.getenv("AD_SERVER")
 AD_USER = os.getenv("AD_USER")
 AD_PASSWORD = os.getenv("AD_PASSWORD")
-AD_BASE = os.getenv("AD_PEOPLE_SEARCH_BASE", "DC=fc,DC=uralsibbank,DC=ru")
+AD_BASE = os.getenv("AD_PEOPLE_SEARCH_BASE")
 CA_CERT = os.getenv("CA_CERT", "CA.crt")
 
 
