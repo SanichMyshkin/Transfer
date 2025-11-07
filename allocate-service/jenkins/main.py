@@ -40,13 +40,13 @@ USER = os.getenv("USER")
 TOKEN = os.getenv("TOKEN")
 FILE_PATH = os.path.join(os.getcwd(), "jenkins_inventory.xlsx")
 
-client = JenkinsGroovyClient(JENKINS_URL, USER, TOKEN, is_https=True)
+client = JenkinsGroovyClient(JENKINS_URL, USER, TOKEN, is_http=False)
 
 # === LDAP ===
 AD_SERVER = os.getenv("AD_SERVER")
 AD_USER = os.getenv("AD_USER")
 AD_PASSWORD = os.getenv("AD_PASSWORD")
-AD_BASE = os.getenv("AD_PEOPLE_SEARCH_BASE", "DC=fc,DC=uralsibbank,DC=ru")
+AD_BASE = os.getenv("AD_PEOPLE_SEARCH_BASE")
 CA_CERT = os.getenv("CA_CERT", "CA.crt")
 
 
@@ -239,6 +239,19 @@ def write_excel(users, jobs, nodes, ad_group_members):
         ws_jb.write(row, 7, str(j.get("lastResult", "")))
         ws_jb.write(row, 8, str(j.get("lastBuildTime", "")))
 
+    # --- Nodes ---
+    ws_n = wb.add_worksheet("Nodes")
+    headers_n = ["Name", "Online", "Executors", "Labels", "Mode", "Description"]
+    for col, h in enumerate(headers_n):
+        ws_n.write(0, col, h)
+    for row, n in enumerate(nodes["nodes"], start=1):
+        ws_n.write(row, 0, n.get("name", ""))
+        ws_n.write(row, 1, str(n.get("online", "")))
+        ws_n.write(row, 2, str(n.get("executors", "")))
+        ws_n.write(row, 3, n.get("labels", ""))
+        ws_n.write(row, 4, n.get("mode", ""))
+        ws_n.write(row, 5, n.get("description", ""))
+
     # --- AD Group Members ---
     ws_gm = wb.add_worksheet("AD_Group_Members")
     headers_gm = ["ad_group", "user", "displayName", "mail", "whenCreated", "user_dn"]
@@ -274,7 +287,7 @@ def write_excel(users, jobs, nodes, ad_group_members):
     ws_s.write(7, 1, len(set([m["ad_group"] for m in ad_group_members])))
 
     wb.close()
-    logger.info(f"Excel отчёт успешно создан: {FILE_PATH}")
+    logger.info(f"✅ Excel отчёт успешно создан: {FILE_PATH}")
 
 
 # ============================================================
