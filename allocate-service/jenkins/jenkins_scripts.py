@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-
+# jenkins_scripts.py
 # --- Получение пользователей ---
 SCRIPT_USERS = """
 import hudson.model.User
