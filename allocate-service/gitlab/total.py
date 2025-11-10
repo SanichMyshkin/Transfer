@@ -18,7 +18,7 @@ GITLAB_TOKEN = os.getenv("GITLAB_TOKEN")
 LOG_FILE = "gitlab_report.log"
 
 # 🆕 Ограничение числа проектов (например, 200)
-MAX_PROJECTS = int(os.getenv("MAX_PROJECTS", 200))
+# MAX_PROJECTS = int(os.getenv("MAX_PROJECTS", 200))
 
 # ======================
 # 🧠 Логирование
@@ -118,11 +118,11 @@ def get_projects_stats(gl: gitlab.Gitlab):
     total_commits = 0
 
     for idx, project in enumerate(projects, start=1):
-        if idx > MAX_PROJECTS:
-            logger.info(
-                f"⚠️ Достигнут лимит MAX_PROJECTS={MAX_PROJECTS}, останавливаемся."
-            )
-            break
+        # if idx > MAX_PROJECTS:
+        #     logger.info(
+        #         f"⚠️ Достигнут лимит MAX_PROJECTS={MAX_PROJECTS}, останавливаемся."
+        #     )
+        #     break
 
         try:
             full_proj = gl.projects.get(project.id, statistics=True)
