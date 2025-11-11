@@ -127,14 +127,58 @@ for r in roles:
         "Read-only": "Да" if r.get("readonly") == "1" else "Нет"
     })
 
+# === HOSTS ===
+logger.info("📥 Получаю список хостов (серверов)...")
+hosts = api.host.get(
+    output=["hostid", "host", "name", "status"],
+    selectInterfaces=["ip", "type", "port", "dns"],
+    selectGroups=["name"],
+    selectParentTemplates=["name"],
+)
+logger.info(f"📦 Хостов получено: {len(hosts)}")
+
+host_data = []
+for h in hosts:
+    ip_list = [i.get("ip") for i in h.get("interfaces", []) if i.get("ip")]
+    ip = ", ".join(ip_list) if ip_list else "—"
+    groups = ", ".join(g["name"] for g in h.get("groups", [])) or "—"
+    templates = ", ".join(t["name"] for t in h.get("parentTemplates", [])) or "—"
+    status = "Активен" if str(h.get("status")) == "0" else "Отключён"
+
+    host_data.append({
+        "ID": h.get("hostid"),
+        "Имя хоста": h.get("name", "—"),
+        "Хост (системное имя)": h.get("host", "—"),
+        "IP": ip,
+        "Группы": groups,
+        "Шаблоны": templates,
+        "Статус": status
+    })
+
+# === СВОДНАЯ ТАБЛИЦА ===
+logger.info("📊 Формирую сводку...")
+summary_data = [
+    ["Дата генерации", datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
+    ["Пользователей всего", len(user_data)],
+    ["С автологином", sum(1 for u in user_data if u["Автовход"] == "Да")],
+    ["Групп пользователей", len(group_data)],
+    ["Ролей", len(role_data)],
+    ["Хостов всего", len(host_data)],
+    ["Активных хостов", sum(1 for h in host_data if h["Статус"] == "Активен")],
+    ["Отключённых хостов", sum(1 for h in host_data if h["Статус"] == "Отключён")],
+]
+summary_df = pd.DataFrame(summary_data, columns=["Показатель", "Значение"])
+
 # === СОХРАНЕНИЕ В EXCEL ===
 logger.info("💾 Сохраняю всё в Excel...")
 with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
+    summary_df.to_excel(writer, sheet_name="Сводка", index=False)
     pd.DataFrame(user_data).sort_values(by="Логин").to_excel(writer, sheet_name="Пользователи", index=False)
     pd.DataFrame(group_data).sort_values(by="Группа").to_excel(writer, sheet_name="Группы", index=False)
     pd.DataFrame(role_data).sort_values(by="Имя роли").to_excel(writer, sheet_name="Роли", index=False)
+    pd.DataFrame(host_data).sort_values(by="Имя хоста").to_excel(writer, sheet_name="Хосты", index=False)
 
-logger.info(f"📊 Отчёт сохранён в {OUTPUT_FILE}")
+logger.info(f"📘 Отчёт сохранён в {OUTPUT_FILE}")
 
 api.logout()
 logger.info("🔒 Сессия закрыта. Готово ✅")
