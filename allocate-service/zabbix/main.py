@@ -38,7 +38,11 @@ logger.info("✅ Подключение успешно!")
 # === USERS ===
 logger.info("📥 Получаю список пользователей...")
 users = api.user.get(
-    output=["userid", "alias", "username", "name", "surname", "type", "autologin", "lang"],
+    output=[
+        "userid", "alias", "username", "name", "surname", "type",
+        "autologin", "autologout", "lang", "refresh", "theme",
+        "attempt_ip", "attempt_clock", "timezone", "roleid"
+    ],
     selectUsrgrps=["name"],
     selectRole=["name"],
     selectSessions=["lastaccess"],
@@ -52,7 +56,7 @@ user_data = []
 for u in users:
     login = u.get("alias") or u.get("username") or "—"
 
-    # --- emails ---
+    # --- обработка email ---
     medias = []
     for m in u.get("medias", []):
         s = m.get("sendto")
@@ -62,15 +66,19 @@ for u in users:
             medias.append(s)
     email = ", ".join(medias) if medias else "—"
 
+    # --- группы и роль ---
     groups = ", ".join(g["name"] for g in u.get("usrgrps", []))
-    role = u.get("role", {}).get("name", roles_map.get(int(u.get("type", 0)), "N/A"))
+    role_name = u.get("role", {}).get("name", roles_map.get(int(u.get("type", 0)), "N/A"))
+    role_id = u.get("roleid", "—")
 
+    # --- логин / IP / время ---
     last_ts = u.get("sessions", [{}])[0].get("lastaccess")
     last_login = (
         datetime.utcfromtimestamp(int(last_ts)).strftime("%Y-%m-%d %H:%M:%S")
         if last_ts else "—"
     )
     autologin = "Да" if u.get("autologin") == "1" else "Нет"
+    attempt_ip = u.get("attempt_ip", "—")
 
     user_data.append({
         "ID": u.get("userid", "—"),
@@ -78,10 +86,15 @@ for u in users:
         "Имя": f"{u.get('name','')} {u.get('surname','')}".strip() or "—",
         "Email": email,
         "Группы": groups or "—",
-        "Роль": role,
+        "Role ID": role_id,
+        "Роль (имя)": role_name,
+        "IP последнего входа": attempt_ip,
         "Последний вход": last_login,
         "Автовход": autologin,
-        "Язык интерфейса": u.get("lang", "—")
+        "Язык интерфейса": u.get("lang", "—"),
+        "Тема": u.get("theme", "—"),
+        "Обновление": u.get("refresh", "—"),
+        "Часовой пояс": u.get("timezone", "—")
     })
 
 # === USERGROUPS ===
