@@ -3,6 +3,7 @@ import logging
 from datetime import datetime
 import pandas as pd
 from dotenv import load_dotenv
+from collections import Counter
 from zabbix_utils import ZabbixAPI
 
 # === ЗАГРУЗКА НАСТРОЕК ===
@@ -10,10 +11,10 @@ load_dotenv()
 ZABBIX_URL = os.getenv("ZABBIX_URL")
 ZABBIX_TOKEN = os.getenv("ZABBIX_TOKEN")
 LOG_FILE = os.getenv("LOG_FILE", "zabbix_userdata_report.log")
-OUTPUT_FILE = "zabbix_users_full_report.xlsx"
+OUTPUT_FILE = "zabbix_full_report.xlsx"
 
 # === ЛОГИ ===
-logger = logging.getLogger("zabbix_userdata_report")
+logger = logging.getLogger("zabbix_report")
 logger.setLevel(logging.INFO)
 fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S")
 
@@ -56,7 +57,7 @@ user_data = []
 for u in users:
     login = u.get("alias") or u.get("username") or "—"
 
-    # --- обработка email ---
+    # --- email ---
     medias = []
     for m in u.get("medias", []):
         s = m.get("sendto")
@@ -131,7 +132,7 @@ for r in roles:
     })
 
 # === HOSTS ===
-logger.info("📥 Получаю список хостов (серверов)...")
+logger.info("📥 Получаю список хостов...")
 hosts = api.host.get(
     output=["hostid", "host", "name", "status"],
     selectInterfaces=["ip", "type", "port", "dns"],
@@ -140,10 +141,39 @@ hosts = api.host.get(
 )
 logger.info(f"📦 Хостов получено: {len(hosts)}")
 
-host_data = []
-total_triggers = total_graphs = total_dashboards = 0
+logger.info("📥 Получаю все триггеры...")
+triggers_all = api.trigger.get(output=["triggerid"], selectHosts=["hostid"])
+logger.info(f"📦 Триггеров: {len(triggers_all)}")
 
-for idx, h in enumerate(hosts, 1):
+logger.info("📥 Получаю все графики...")
+graphs_all = api.graph.get(output=["graphid"], selectHosts=["hostid"])
+logger.info(f"📦 Графиков: {len(graphs_all)}")
+
+logger.info("📥 Получаю все дашборды...")
+dashboards_all = api.dashboard.get(output=["dashboardid", "name"])
+logger.info(f"📦 Дашбордов: {len(dashboards_all)}")
+
+# === Подсчёт ===
+trigger_count = Counter()
+for t in triggers_all:
+    for h in t.get("hosts", []):
+        trigger_count[h["hostid"]] += 1
+
+graph_count = Counter()
+for g in graphs_all:
+    for h in g.get("hosts", []):
+        graph_count[h["hostid"]] += 1
+
+dashboard_count = Counter()
+for d in dashboards_all:
+    name = d.get("name", "")
+    for h in hosts:
+        if h.get("name") in name:
+            dashboard_count[h["hostid"]] += 1
+
+# === Формируем таблицу по хостам ===
+host_data = []
+for h in hosts:
     hostid = h.get("hostid")
     host_name = h.get("name", "—")
 
@@ -153,18 +183,6 @@ for idx, h in enumerate(hosts, 1):
     templates = ", ".join(t["name"] for t in h.get("parentTemplates", [])) or "—"
     status = "Активен" if str(h.get("status")) == "0" else "Отключён"
 
-    # --- Триггеры ---
-    triggers_count = int(api.trigger.get(hostids=[hostid], countOutput=True))
-    total_triggers += triggers_count
-
-    # --- Графики ---
-    graphs_count = int(api.graph.get(hostids=[hostid], countOutput=True))
-    total_graphs += graphs_count
-
-    # --- Дашборды ---
-    dashboards_count = int(api.dashboard.get(search={"name": host_name}, countOutput=True))
-    total_dashboards += dashboards_count
-
     host_data.append({
         "ID": hostid,
         "Имя хоста": host_name,
@@ -172,14 +190,11 @@ for idx, h in enumerate(hosts, 1):
         "IP": ip,
         "Группы": groups,
         "Шаблоны": templates,
-        "Триггеров": triggers_count,
-        "Графиков": graphs_count,
-        "Дашбордов": dashboards_count,
+        "Триггеров": trigger_count.get(hostid, 0),
+        "Графиков": graph_count.get(hostid, 0),
+        "Дашбордов": dashboard_count.get(hostid, 0),
         "Статус": status
     })
-
-    if idx % 50 == 0:
-        logger.info(f"🔹 Обработано {idx}/{len(hosts)} хостов...")
 
 logger.info("✅ Подсчёт по хостам завершён.")
 
@@ -194,9 +209,9 @@ summary_data = [
     ["Хостов всего", len(host_data)],
     ["Активных хостов", sum(1 for h in host_data if h["Статус"] == "Активен")],
     ["Отключённых хостов", sum(1 for h in host_data if h["Статус"] == "Отключён")],
-    ["Всего триггеров", total_triggers],
-    ["Всего графиков", total_graphs],
-    ["Всего дашбордов", total_dashboards],
+    ["Всего триггеров", sum(trigger_count.values())],
+    ["Всего графиков", sum(graph_count.values())],
+    ["Всего дашбордов", sum(dashboard_count.values())],
 ]
 summary_df = pd.DataFrame(summary_data, columns=["Показатель", "Значение"])
 
