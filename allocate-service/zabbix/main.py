@@ -57,7 +57,6 @@ user_data = []
 for u in users:
     login = u.get("alias") or u.get("username") or "—"
 
-    # --- email ---
     medias = []
     for m in u.get("medias", []):
         s = m.get("sendto")
@@ -67,12 +66,10 @@ for u in users:
             medias.append(s)
     email = ", ".join(medias) if medias else "—"
 
-    # --- группы и роль ---
     groups = ", ".join(g["name"] for g in u.get("usrgrps", []))
     role_name = u.get("role", {}).get("name", roles_map.get(int(u.get("type", 0)), "N/A"))
     role_id = u.get("roleid", "—")
 
-    # --- логин / IP / время ---
     last_ts = u.get("sessions", [{}])[0].get("lastaccess")
     last_login = (
         datetime.utcfromtimestamp(int(last_ts)).strftime("%Y-%m-%d %H:%M:%S")
@@ -141,19 +138,42 @@ hosts = api.host.get(
 )
 logger.info(f"📦 Хостов получено: {len(hosts)}")
 
-logger.info("📥 Получаю все триггеры...")
-triggers_all = api.trigger.get(output=["triggerid"], selectHosts=["hostid"])
-logger.info(f"📦 Триггеров: {len(triggers_all)}")
+# === ТРИГГЕРЫ, ГРАФИКИ, ДАШБОРДЫ ===
+batch_size = 500  # можно уменьшить до 200, если API слабый
 
-logger.info("📥 Получаю все графики...")
-graphs_all = api.graph.get(output=["graphid"], selectHosts=["hostid"])
-logger.info(f"📦 Графиков: {len(graphs_all)}")
+logger.info("📥 Получаю все триггеры по частям...")
+triggers_all = []
+for i in range(0, len(hosts), batch_size):
+    hostids_batch = [h["hostid"] for h in hosts[i:i + batch_size]]
+    try:
+        part = api.trigger.get(output=["triggerid"], hostids=hostids_batch, selectHosts=["hostid"])
+        triggers_all.extend(part)
+        logger.info(f"🔹 Триггеры: +{len(part)} (всего {len(triggers_all)})")
+    except Exception as e:
+        logger.warning(f"⚠️ Ошибка при загрузке триггеров для пачки {i}-{i+batch_size}: {e}")
+logger.info(f"📦 Всего триггеров: {len(triggers_all)}")
+
+logger.info("📥 Получаю все графики по частям...")
+graphs_all = []
+for i in range(0, len(hosts), batch_size):
+    hostids_batch = [h["hostid"] for h in hosts[i:i + batch_size]]
+    try:
+        part = api.graph.get(output=["graphid"], hostids=hostids_batch, selectHosts=["hostid"])
+        graphs_all.extend(part)
+        logger.info(f"🔹 Графики: +{len(part)} (всего {len(graphs_all)})")
+    except Exception as e:
+        logger.warning(f"⚠️ Ошибка при загрузке графиков для пачки {i}-{i+batch_size}: {e}")
+logger.info(f"📦 Всего графиков: {len(graphs_all)}")
 
 logger.info("📥 Получаю все дашборды...")
-dashboards_all = api.dashboard.get(output=["dashboardid", "name"])
-logger.info(f"📦 Дашбордов: {len(dashboards_all)}")
+try:
+    dashboards_all = api.dashboard.get(output=["dashboardid", "name"])
+    logger.info(f"📦 Дашбордов: {len(dashboards_all)}")
+except Exception as e:
+    logger.warning(f"⚠️ Ошибка при получении дашбордов: {e}")
+    dashboards_all = []
 
-# === Подсчёт ===
+# === ГРУППИРОВКА ===
 trigger_count = Counter()
 for t in triggers_all:
     for h in t.get("hosts", []):
@@ -171,7 +191,7 @@ for d in dashboards_all:
         if h.get("name") in name:
             dashboard_count[h["hostid"]] += 1
 
-# === Формируем таблицу по хостам ===
+# === ФОРМИРУЕМ ХОСТЫ ===
 host_data = []
 for h in hosts:
     hostid = h.get("hostid")
@@ -199,7 +219,6 @@ for h in hosts:
 logger.info("✅ Подсчёт по хостам завершён.")
 
 # === СВОДКА ===
-logger.info("📊 Формирую сводку...")
 summary_data = [
     ["Дата генерации", datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
     ["Пользователей всего", len(user_data)],
