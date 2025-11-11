@@ -59,18 +59,6 @@ services:
     networks:
       - minio-net
 
-  vector:
-    image: timberio/vector:latest-alpine
-    container_name: vector
-    restart: unless-stopped
-    volumes:
-      - ./volume/nexus-data/log/audit:/var/log/nexus_audit:ro
-      - ./vector/vector.toml:/etc/vector/vector.toml:ro
-    environment:
-      - VECTOR_LOG=info
-    networks:
-      - minio-net
-
 networks:
   minio-net:
     external: true
