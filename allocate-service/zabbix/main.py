@@ -99,7 +99,10 @@ for u in users:
 
 # === USERGROUPS ===
 logger.info("📥 Получаю группы пользователей...")
-groups = api.usergroup.get(output=["usrgrpid", "name", "gui_access", "users_status"], selectUsers=["alias", "username"])
+groups = api.usergroup.get(
+    output=["usrgrpid", "name", "gui_access", "users_status"],
+    selectUsers=["alias", "username"]
+)
 logger.info(f"📦 Групп пользователей: {len(groups)}")
 
 group_data = []
@@ -138,24 +141,49 @@ hosts = api.host.get(
 logger.info(f"📦 Хостов получено: {len(hosts)}")
 
 host_data = []
-for h in hosts:
+total_triggers = total_graphs = total_dashboards = 0
+
+for idx, h in enumerate(hosts, 1):
+    hostid = h.get("hostid")
+    host_name = h.get("name", "—")
+
     ip_list = [i.get("ip") for i in h.get("interfaces", []) if i.get("ip")]
     ip = ", ".join(ip_list) if ip_list else "—"
     groups = ", ".join(g["name"] for g in h.get("groups", [])) or "—"
     templates = ", ".join(t["name"] for t in h.get("parentTemplates", [])) or "—"
     status = "Активен" if str(h.get("status")) == "0" else "Отключён"
 
+    # --- Триггеры ---
+    triggers_count = int(api.trigger.get(hostids=[hostid], countOutput=True))
+    total_triggers += triggers_count
+
+    # --- Графики ---
+    graphs_count = int(api.graph.get(hostids=[hostid], countOutput=True))
+    total_graphs += graphs_count
+
+    # --- Дашборды ---
+    dashboards_count = int(api.dashboard.get(search={"name": host_name}, countOutput=True))
+    total_dashboards += dashboards_count
+
     host_data.append({
-        "ID": h.get("hostid"),
-        "Имя хоста": h.get("name", "—"),
+        "ID": hostid,
+        "Имя хоста": host_name,
         "Хост (системное имя)": h.get("host", "—"),
         "IP": ip,
         "Группы": groups,
         "Шаблоны": templates,
+        "Триггеров": triggers_count,
+        "Графиков": graphs_count,
+        "Дашбордов": dashboards_count,
         "Статус": status
     })
 
-# === СВОДНАЯ ТАБЛИЦА ===
+    if idx % 50 == 0:
+        logger.info(f"🔹 Обработано {idx}/{len(hosts)} хостов...")
+
+logger.info("✅ Подсчёт по хостам завершён.")
+
+# === СВОДКА ===
 logger.info("📊 Формирую сводку...")
 summary_data = [
     ["Дата генерации", datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
@@ -166,6 +194,9 @@ summary_data = [
     ["Хостов всего", len(host_data)],
     ["Активных хостов", sum(1 for h in host_data if h["Статус"] == "Активен")],
     ["Отключённых хостов", sum(1 for h in host_data if h["Статус"] == "Отключён")],
+    ["Всего триггеров", total_triggers],
+    ["Всего графиков", total_graphs],
+    ["Всего дашбордов", total_dashboards],
 ]
 summary_df = pd.DataFrame(summary_data, columns=["Показатель", "Значение"])
 
