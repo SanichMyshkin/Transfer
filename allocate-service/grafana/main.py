@@ -7,7 +7,8 @@ import requests
 
 load_dotenv()
 GRAFANA_URL = os.getenv("GRAFANA_URL")
-GRAFANA_API_KEY = os.getenv("GRAFANA_API_KEY")
+GRAFANA_USER = os.getenv("GRAFANA_USER")
+GRAFANA_PASS = os.getenv("GRAFANA_PASS")
 LOG_FILE = os.getenv("LOG_FILE", "grafana_users_report.log")
 OUTPUT_FILE = "grafana_users_report.xlsx"
 
@@ -21,15 +22,16 @@ ch = logging.StreamHandler()
 ch.setFormatter(fmt)
 logger.addHandler(ch)
 
-if not GRAFANA_URL or not GRAFANA_API_KEY:
-    logger.error("Не найден GRAFANA_URL или GRAFANA_API_KEY")
+if not GRAFANA_URL or not GRAFANA_USER or not GRAFANA_PASS:
+    logger.error("Не найдены GRAFANA_URL / GRAFANA_USER / GRAFANA_PASS")
     raise SystemExit(1)
-
-headers = {"Authorization": f"Bearer {GRAFANA_API_KEY}"}
 
 def grafana_get(endpoint, params=None):
     url = f"{GRAFANA_URL.rstrip('/')}/api/{endpoint.lstrip('/')}"
-    r = requests.get(url, headers=headers, params=params, timeout=15)
+    r = requests.get(url, auth=(GRAFANA_USER, GRAFANA_PASS), params=params, timeout=15)
+    if r.status_code == 401:
+        logger.error("Ошибка 401: неправильный логин или пароль")
+        raise SystemExit(1)
     r.raise_for_status()
     return r.json()
 
