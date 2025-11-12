@@ -6,7 +6,8 @@ import requests
 
 load_dotenv()
 GRAFANA_URL = os.getenv("GRAFANA_URL")
-GRAFANA_TOKEN = os.getenv("GRAFANA_API_KEY")
+GRAFANA_USER = os.getenv("GRAFANA_USER")
+GRAFANA_PASS = os.getenv("GRAFANA_PASS")
 LOG_FILE = os.getenv("LOG_FILE", "grafana_users_v1.log")
 OUTPUT_FILE = "grafana_users_v1.xlsx"
 
@@ -20,27 +21,34 @@ ch = logging.StreamHandler()
 ch.setFormatter(fmt)
 logger.addHandler(ch)
 
-if not GRAFANA_URL or not GRAFANA_TOKEN:
-    logger.error("❌ Не найден GRAFANA_URL или GRAFANA_API_KEY в .env")
+if not GRAFANA_URL or not GRAFANA_USER or not GRAFANA_PASS:
+    logger.error("❌ Не найдены GRAFANA_URL / GRAFANA_USER / GRAFANA_PASS в .env")
     raise SystemExit(1)
 
-headers = {"Authorization": f"Bearer {GRAFANA_TOKEN}"}
 requests.packages.urllib3.disable_warnings()
+session = requests.Session()
+session.auth = (GRAFANA_USER, GRAFANA_PASS)
+session.verify = False  # отключаем SSL проверку
 
 def get_all_users():
     users = []
     page = 1
     while True:
-        r = requests.get(
+        r = session.get(
             f"{GRAFANA_URL.rstrip('/')}/api/v1/users",
-            headers=headers,
             params={"page": page, "limit": 1000},
-            verify=False,
             timeout=30
         )
+        if r.status_code == 401:
+            logger.error("❌ Ошибка 401: неверный логин или недостаточно прав (нужен Server Admin)")
+            raise SystemExit(1)
+        if r.status_code == 403:
+            logger.error("❌ Ошибка 403: доступ к /api/v1/users запрещён. Включи auth.basic и зайди под Server Admin.")
+            raise SystemExit(1)
         if r.status_code != 200:
             logger.error(f"Ошибка {r.status_code}: {r.text}")
             break
+
         data = r.json()
         if not data:
             break
