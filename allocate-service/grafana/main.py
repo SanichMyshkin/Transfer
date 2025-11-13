@@ -34,14 +34,14 @@ if not GRAFANA_URL or not GRAFANA_USER or not GRAFANA_PASS:
 # ========================= GRAFANA CLIENT =========================
 client = GrafanaApi(
     auth=(GRAFANA_USER, GRAFANA_PASS),
-    host=GRAFANA_URL,
+    host=GRAFANA_URL
 )
 
 # ========================= GET USERS =========================
 def get_all_users():
     logger.info("📥 Получаю пользователей Grafana через grafana-client ...")
     try:
-        users = client.users.get_all_users()
+        users = client.admin.get_users()  # <-- правильный метод
         logger.info(f"📦 Всего пользователей: {len(users)}")
         return users
     except Exception as e:
