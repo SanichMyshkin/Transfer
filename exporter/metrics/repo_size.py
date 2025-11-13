@@ -64,8 +64,7 @@ def fetch_repository_metrics() -> list:
                 task_statuses[blob_name] = {"delete": 0, "compact": 0}
             task_statuses[blob_name][status_key] = 1
 
-    #external_links = get_external_policies(GITLAB_URL, GITLAB_TOKEN, GITLAB_BRANCH)
-    external_links = {"dckr": "https://wikipedia.com"}
+    external_links = get_external_policies(GITLAB_URL, GITLAB_TOKEN, GITLAB_BRANCH)
 
     logging.info(f"Полученные внешние политики: {external_links}")
     REPO_STORAGE.clear()

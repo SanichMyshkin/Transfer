@@ -83,107 +83,107 @@ def scan_project_for_policies(
     return result
 
 
-def get_external_policies(
-    gitlab_url: str,
-    gitlab_token: str,
-    gitlab_branch: str,
-    group_id: int = 3514,
-    target_path: str = "nexus/cleaner",
-) -> Dict[str, str]:
-    """
-    Получает политики из всех проектов группы GitLab.
-    Ищет YAML-файлы в пути nexus/cleaner, извлекает repo_names.
-
-    Возвращает:
-        { repo_name: ссылка_на_файл }
-    """
-    logging.info(f"🔗 Подключение к GitLab: {gitlab_url}")
-    result = {}
-
-    try:
-        gl = get_gitlab_connection(gitlab_url, gitlab_token)
-        group = gl.groups.get(group_id)
-        projects = group.projects.list(all=True, include_subgroups=True)
-
-        logging.info(f"📦 Найдено проектов в группе: {len(projects)}")
-
-        for project_info in projects:
-            try:
-                project = gl.projects.get(project_info.id)
-                logging.debug(f"🔍 Сканирование проекта: {project.path_with_namespace}")
-
-                # Получаем список файлов в target_path
-                items = project.repository_tree(
-                    path=target_path, recursive=True, ref=gitlab_branch
-                )
-                yaml_files = [
-                    item
-                    for item in items
-                    if item["type"] == "blob"
-                    and item["name"].endswith((".yml", ".yaml"))
-                ]
-
-                if not yaml_files:
-                    continue
-
-                logging.info(
-                    f"📁 Проект {project.path_with_namespace}: найдено {len(yaml_files)} YAML файлов"
-                )
-
-                for file_info in yaml_files:
-                    file_path = file_info["path"]
-                    try:
-                        file_obj = project.files.get(
-                            file_path=file_path, ref=gitlab_branch
-                        )
-                        # ✅ base64-декодирование содержимого
-                        file_content = base64.b64decode(file_obj.content).decode(
-                            "utf-8"
-                        )
-
-                        data = yaml.safe_load(StringIO(file_content))
-                        if not isinstance(data, dict) or "repo_names" not in data:
-                            continue
-
-                        file_link = f"{gitlab_url}/{project.path_with_namespace}/-/blob/{gitlab_branch}/{file_path}"
-
-                        for repo_name in data["repo_names"]:
-                            if repo_name in result:
-                                logging.warning(
-                                    f"⚠️ Повтор: '{repo_name}' уже был добавлен. Файл: {file_link}"
-                                )
-                            else:
-                                result[repo_name] = file_link
-
-                    except Exception as e:
-                        logging.error(
-                            f"❌ Ошибка чтения файла {file_path} в проекте {project.path_with_namespace}: {str(e)}"
-                        )
-
-            except Exception as e:
-                logging.error(
-                    f"❌ Ошибка при обработке проекта {project_info.name}: {str(e)}"
-                )
-
-        logging.info(f"✅ Завершено. Собрано политик: {len(result)}")
-        return result
-
-    except Exception as e:
-        logging.error(f"⛔ Критическая ошибка при получении политик: {str(e)}")
-        return {}
-
-
 # def get_external_policies(
 #     gitlab_url: str,
 #     gitlab_token: str,
 #     gitlab_branch: str,
+#     group_id: int = 3514,
 #     target_path: str = "nexus/cleaner",
 # ) -> Dict[str, str]:
-#     return {
-#         "dckr": "https://gitlab.example.com/team/configs/-/blob/master/nexus/cleaner/policy1.yaml",
-#         "docker": "https://gitlab.example.com/team/configs/-/blob/master/nexus/cleaner/policy2.yaml",
-#         "nexus-repo-3": "https://gitlab.example.com/devops/cleanup/-/blob/master/nexus/cleaner/policy3.yml",
-#     }
+#     """
+#     Получает политики из всех проектов группы GitLab.
+#     Ищет YAML-файлы в пути nexus/cleaner, извлекает repo_names.
+
+#     Возвращает:
+#         { repo_name: ссылка_на_файл }
+#     """
+#     logging.info(f"🔗 Подключение к GitLab: {gitlab_url}")
+#     result = {}
+
+#     try:
+#         gl = get_gitlab_connection(gitlab_url, gitlab_token)
+#         group = gl.groups.get(group_id)
+#         projects = group.projects.list(all=True, include_subgroups=True)
+
+#         logging.info(f"📦 Найдено проектов в группе: {len(projects)}")
+
+#         for project_info in projects:
+#             try:
+#                 project = gl.projects.get(project_info.id)
+#                 logging.debug(f"🔍 Сканирование проекта: {project.path_with_namespace}")
+
+#                 # Получаем список файлов в target_path
+#                 items = project.repository_tree(
+#                     path=target_path, recursive=True, ref=gitlab_branch
+#                 )
+#                 yaml_files = [
+#                     item
+#                     for item in items
+#                     if item["type"] == "blob"
+#                     and item["name"].endswith((".yml", ".yaml"))
+#                 ]
+
+#                 if not yaml_files:
+#                     continue
+
+#                 logging.info(
+#                     f"📁 Проект {project.path_with_namespace}: найдено {len(yaml_files)} YAML файлов"
+#                 )
+
+#                 for file_info in yaml_files:
+#                     file_path = file_info["path"]
+#                     try:
+#                         file_obj = project.files.get(
+#                             file_path=file_path, ref=gitlab_branch
+#                         )
+#                         # ✅ base64-декодирование содержимого
+#                         file_content = base64.b64decode(file_obj.content).decode(
+#                             "utf-8"
+#                         )
+
+#                         data = yaml.safe_load(StringIO(file_content))
+#                         if not isinstance(data, dict) or "repo_names" not in data:
+#                             continue
+
+#                         file_link = f"{gitlab_url}/{project.path_with_namespace}/-/blob/{gitlab_branch}/{file_path}"
+
+#                         for repo_name in data["repo_names"]:
+#                             if repo_name in result:
+#                                 logging.warning(
+#                                     f"⚠️ Повтор: '{repo_name}' уже был добавлен. Файл: {file_link}"
+#                                 )
+#                             else:
+#                                 result[repo_name] = file_link
+
+#                     except Exception as e:
+#                         logging.error(
+#                             f"❌ Ошибка чтения файла {file_path} в проекте {project.path_with_namespace}: {str(e)}"
+#                         )
+
+#             except Exception as e:
+#                 logging.error(
+#                     f"❌ Ошибка при обработке проекта {project_info.name}: {str(e)}"
+#                 )
+
+#         logging.info(f"✅ Завершено. Собрано политик: {len(result)}")
+#         return result
+
+#     except Exception as e:
+#         logging.error(f"⛔ Критическая ошибка при получении политик: {str(e)}")
+#         return {}
+
+
+def get_external_policies(
+    gitlab_url: str,
+    gitlab_token: str,
+    gitlab_branch: str,
+    target_path: str = "nexus/cleaner",
+) -> Dict[str, str]:
+    return {
+        "dckr": "https://gitlab.example.com/team/configs/-/blob/master/nexus/cleaner/policy1.yaml",
+        "docker": "https://gitlab.example.com/team/configs/-/blob/master/nexus/cleaner/policy2.yaml",
+        "nexus-repo-3": "https://gitlab.example.com/devops/cleanup/-/blob/master/nexus/cleaner/policy3.yml",
+    }
 
 
 def get_gitlab_file_content(

@@ -14,9 +14,10 @@ from metrics.docker_tags import fetch_docker_tags_metrics
 from metrics.tasks import (
     fetch_task_metrics,
     fetch_all_blob_and_repo_metrics,
-    fetch_custom_policy_metrics,
+    # fetch_custom_policy_metrics,
 )
-from metrics.docker_ports import fetch_docker_ports
+
+# from metrics.docker_ports import fetch_docker_ports
 from metrics.cleanup_policy import fetch_cleanup_policy_usage
 from metrics.certificates_expired import fetch_cert_lifetime_metrics
 
@@ -32,7 +33,7 @@ def main():
     fetch_repositories_metrics(NEXUS_API_URL, auth)
 
     logging.info("Первичный запуск сбора Docker портов...")
-    fetch_docker_ports(NEXUS_API_URL, get_auth())
+    # fetch_docker_ports(NEXUS_API_URL, get_auth())
 
     logging.info("Первичный запуск сбора НЕ используемых политик...")
     fetch_cleanup_policy_usage(NEXUS_API_URL, auth)
@@ -55,7 +56,7 @@ def main():
             fetch_repositories_metrics(NEXUS_API_URL, auth)
 
             logging.info("Периодический запуск сбора Docker портов...")
-            fetch_docker_ports(NEXUS_API_URL, get_auth())
+            # fetch_docker_ports(NEXUS_API_URL, get_auth())
 
             logging.info("Периодический запуск сбора НЕ используемых политик...")
             fetch_cleanup_policy_usage(NEXUS_API_URL, auth)
@@ -67,7 +68,7 @@ def main():
             fetch_all_blob_and_repo_metrics(NEXUS_API_URL, auth)
 
             logging.info("Периодический запуск сбора кастомных повисших конфигов...")
-            fetch_custom_policy_metrics(NEXUS_API_URL, auth)
+            # fetch_custom_policy_metrics(NEXUS_API_URL, auth)
 
             last_repo_metrics_time = current_time
 
