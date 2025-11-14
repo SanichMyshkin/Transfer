@@ -129,10 +129,3 @@ class GitLabConfigLoader:
                 cleaned[org_id] = sorted(unique)
 
         return cleaned
-
-
-if __name__ == "__main__":
-    loader = GitLabConfigLoader()
-    owners_clean = loader.get_owners_clean()
-    for org_id, owner in owners_clean.items():
-        print(f"{org_id}: {owner}")

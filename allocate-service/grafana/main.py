@@ -6,6 +6,8 @@ import requests
 from dotenv import load_dotenv
 from tqdm import tqdm
 
+from gitlab_config_loader import GitLabConfigLoader
+
 load_dotenv()
 
 GRAFANA_URL = os.getenv("GRAFANA_URL")
@@ -15,50 +17,40 @@ GRAFANA_PASS = os.getenv("GRAFANA_PASS")
 OUTPUT_FILE = "grafana_report.xlsx"
 LOG_FILE = "grafana_report.log"
 
-ORG_LIMIT = 5
 SLEEP_AFTER_SWITCH = 1
 SLEEP_BETWEEN_CALLS = 0.2
+
+ORG_LIMIT = int(os.getenv("ORG_LIMIT", "999999"))
 
 logger = logging.getLogger("grafana_report")
 logger.setLevel(logging.INFO)
 
-fmt = logging.Formatter(
-    "%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S"
-)
+fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S")
 fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
 fh.setFormatter(fmt)
 logger.addHandler(fh)
+
 ch = logging.StreamHandler()
 ch.setFormatter(fmt)
 logger.addHandler(ch)
 
 requests.packages.urllib3.disable_warnings()
-
 session = requests.Session()
 session.verify = False
 
 
 def login_cookie():
-    payload = {"user": GRAFANA_USER, "password": GRAFANA_PASS}
-    r = session.post(f"{GRAFANA_URL}/login", json=payload)
+    r = session.post(f"{GRAFANA_URL}/login", json={"user": GRAFANA_USER, "password": GRAFANA_PASS})
     r.raise_for_status()
     time.sleep(SLEEP_BETWEEN_CALLS)
-
-
-login_cookie()
 
 
 def switch_org(org_id):
     r = session.post(f"{GRAFANA_URL}/api/user/using/{org_id}")
+    if r.status_code in (401, 403):
+        raise PermissionError("NO_ACCESS")
     r.raise_for_status()
     time.sleep(SLEEP_AFTER_SWITCH)
-
-
-def get_orgs():
-    r = session.get(f"{GRAFANA_URL}/api/orgs")
-    r.raise_for_status()
-    time.sleep(SLEEP_BETWEEN_CALLS)
-    return r.json()
 
 
 def get_users_in_org(org_id):
@@ -86,9 +78,7 @@ def get_dashboards_in_folder(fid):
 
 
 def get_all_dashboards_raw():
-    r = session.get(
-        f"{GRAFANA_URL}/api/search", params={"type": "dash-db", "limit": 5000}
-    )
+    r = session.get(f"{GRAFANA_URL}/api/search", params={"type": "dash-db", "limit": 5000})
     r.raise_for_status()
     time.sleep(SLEEP_BETWEEN_CALLS)
     return r.json()
@@ -114,24 +104,53 @@ def get_dashboard_panels(uid):
     return c
 
 
-logger.info("Загружаю список организаций...")
-orgs = get_orgs()
-orgs = orgs[:ORG_LIMIT]
+loader = GitLabConfigLoader()
+owners_clean = loader.get_owners_clean()
+
+org_ids = sorted(owners_clean.keys())
+org_ids = org_ids[:ORG_LIMIT]
+
+logger.info(f"Найдено организаций в GitLab: {len(owners_clean)}")
+logger.info(f"Будет обработано: {len(org_ids)}")
+
+login_cookie()
 
 rows_users = []
 rows_folders = []
 rows_dashboards = []
 rows_orgs = []
 
-for org in tqdm(orgs, desc="Организации", ncols=100):
-    org_id = org["id"]
-    org_name = org["name"]
+for org_id in tqdm(org_ids, desc="Организации", ncols=100):
+    owner = owners_clean.get(org_id)
 
-    switch_org(org_id)
+    if isinstance(owner, tuple):
+        owner_group = owner[0]
+    elif isinstance(owner, list):
+        owner_group = ", ".join([o[0] for o in owner])
+    else:
+        owner_group = ""
+
+    try:
+        switch_org(org_id)
+    except PermissionError:
+        rows_orgs.append(
+            {
+                "org_id": org_id,
+                "org_name": "",
+                "owner_group": owner_group,
+                "users_total": "NO ACCESS",
+                "folders_total": "NO ACCESS",
+                "dashboards_total": "NO ACCESS",
+                "panels_total": "NO ACCESS",
+            }
+        )
+        continue
+
+    r = session.get(f"{GRAFANA_URL}/api/orgs/{org_id}")
+    r.raise_for_status()
+    org_name = r.json().get("name") or f"org_{org_id}"
 
     users = get_users_in_org(org_id)
-    users_total = len(users)
-
     for u in users:
         rows_users.append(
             {
@@ -144,13 +163,15 @@ for org in tqdm(orgs, desc="Организации", ncols=100):
             }
         )
 
+    users_total = len(users)
+
     folders = get_folders()
     folders_total = len(folders)
 
     dashboards_total = 0
     panels_total = 0
 
-    for f in tqdm(folders, desc=f"Папки {org_name}", leave=False, ncols=100):
+    for f in folders:
         fid = f["id"]
         fname = f["title"]
 
@@ -210,12 +231,14 @@ for org in tqdm(orgs, desc="Организации", ncols=100):
         {
             "org_id": org_id,
             "org_name": org_name,
+            "owner_group": owner_group,
             "users_total": users_total,
             "folders_total": folders_total,
             "dashboards_total": dashboards_total,
             "panels_total": panels_total,
         }
     )
+
 
 df_users = pd.DataFrame(rows_users)
 df_orgs = pd.DataFrame(rows_orgs)
@@ -230,9 +253,7 @@ global_summary = {
     "panels_total": df_dashboards["panels"].sum(),
 }
 
-df_global_summary = pd.DataFrame(
-    list(global_summary.items()), columns=["metric", "value"]
-)
+df_global_summary = pd.DataFrame(list(global_summary.items()), columns=["metric", "value"])
 
 with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
     df_users.to_excel(writer, sheet_name="Users", index=False)
