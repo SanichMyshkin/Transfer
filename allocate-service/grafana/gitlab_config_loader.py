@@ -72,42 +72,27 @@ class GitLabConfigLoader:
 
         return result
 
-    def detect_org_owners(self):
-        mappings = self.load_group_mappings()
-        orgs = {}
+    def get_owners_clean(self):
+        owners = self.get_org_owners()  # существующая функция
 
-        for m in mappings:
-            org_id = m["org_id"]
-            orgs.setdefault(org_id, []).append(m)
+        cleaned = {}
 
-        owners = {}
+        for org_id, entries in owners.items():
+            unique = set()
 
-        for org_id, groups in orgs.items():
+            for e in entries:
+                dn = e["group_dn"]
+                # вытащить CN=xxxx до первой запятой
+                cn = dn.split(",")[0].replace("CN=", "").strip()
+                unique.add((cn, e["grafana_admin"]))
 
-            # 1) Локальные владельцы (основные)
-            internal_admins = [
-                g for g in groups
-                if g.get("org_role") == "Admin" and g.get("grafana_admin") is False
-            ]
+            # если одна запись — вернуть одиночное значение
+            if len(unique) == 1:
+                cleaned[org_id] = next(iter(unique))
+            else:
+                cleaned[org_id] = list(unique)
 
-            if internal_admins:
-                owners[org_id] = internal_admins
-                continue
-
-            # 2) Если локальных нет — берем глобальных (fallback)
-            global_admins = [
-                g for g in groups
-                if g.get("org_role") == "Admin" and g.get("grafana_admin") is True
-            ]
-
-            if global_admins:
-                owners[org_id] = global_admins
-                continue
-
-            # 3) Если админов нет — владельцев нет
-            owners[org_id] = []
-
-        return owners
+        return cleaned
 
 
 
