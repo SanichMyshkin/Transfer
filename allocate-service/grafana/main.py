@@ -13,13 +13,13 @@ GRAFANA_USER = os.getenv("GRAFANA_USER")
 GRAFANA_PASS = os.getenv("GRAFANA_PASS")
 
 OUTPUT_FILE = "grafana_report.xlsx"
-LOG_FILE = "grafana_cookie_report.log"
+LOG_FILE = "grafana_report.log"
 
 ORG_LIMIT = 5
 SLEEP_AFTER_SWITCH = 1
 SLEEP_BETWEEN_CALLS = 0.2
 
-logger = logging.getLogger("grafana_cookie_report")
+logger = logging.getLogger("grafana_report")
 logger.setLevel(logging.INFO)
 
 fmt = logging.Formatter(
@@ -118,7 +118,6 @@ logger.info("Загружаю список организаций...")
 orgs = get_orgs()
 orgs = orgs[:ORG_LIMIT]
 
-rows_summary = []
 rows_users = []
 rows_folders = []
 rows_dashboards = []
@@ -131,6 +130,8 @@ for org in tqdm(orgs, desc="Организации", ncols=100):
     switch_org(org_id)
 
     users = get_users_in_org(org_id)
+    users_total = len(users)
+
     for u in users:
         rows_users.append(
             {
@@ -144,6 +145,8 @@ for org in tqdm(orgs, desc="Организации", ncols=100):
         )
 
     folders = get_folders()
+    folders_total = len(folders)
+
     dashboards_total = 0
     panels_total = 0
 
@@ -203,22 +206,12 @@ for org in tqdm(orgs, desc="Организации", ncols=100):
             }
         )
 
-    rows_summary.append(
-        {
-            "org_id": org_id,
-            "org_name": org_name,
-            "users_total": len(users),
-            "folders_total": len(folders),
-            "dashboards_total": dashboards_total,
-            "panels_total": panels_total,
-        }
-    )
-
     rows_orgs.append(
         {
             "org_id": org_id,
             "org_name": org_name,
-            "folders_total": len(folders),
+            "users_total": users_total,
+            "folders_total": folders_total,
             "dashboards_total": dashboards_total,
             "panels_total": panels_total,
         }
@@ -228,7 +221,6 @@ df_users = pd.DataFrame(rows_users)
 df_orgs = pd.DataFrame(rows_orgs)
 df_folders = pd.DataFrame(rows_folders)
 df_dashboards = pd.DataFrame(rows_dashboards)
-df_summary = pd.DataFrame(rows_summary)
 
 global_summary = {
     "organizations_total": len(df_orgs),
@@ -238,14 +230,15 @@ global_summary = {
     "panels_total": df_dashboards["panels"].sum(),
 }
 
-df_global_summary = pd.DataFrame([global_summary])
+df_global_summary = pd.DataFrame(
+    list(global_summary.items()), columns=["metric", "value"]
+)
 
 with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
     df_users.to_excel(writer, sheet_name="Users", index=False)
     df_orgs.to_excel(writer, sheet_name="Organizations", index=False)
     df_folders.to_excel(writer, sheet_name="Folders", index=False)
     df_dashboards.to_excel(writer, sheet_name="Dashboards", index=False)
-    df_global_summary.to_excel(writer, sheet_name="Summary", index=False, startrow=0)
-    df_summary.to_excel(writer, sheet_name="Summary", index=False, startrow=4)
+    df_global_summary.to_excel(writer, sheet_name="Summary", index=False)
 
 logger.info(f"Готово! Данные сохранены в файл: {OUTPUT_FILE}")
