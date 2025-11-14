@@ -73,17 +73,9 @@ class GitLabConfigLoader:
         return result
 
     def detect_org_owners(self):
-        """
-        Locate real owners of organizations:
-        Owners are groups where:
-            org_role == "Admin"
-            grafana_admin == False
-        Global admins do NOT count as owners.
-        """
         mappings = self.load_group_mappings()
         orgs = {}
 
-        # group mappings by org
         for m in mappings:
             org_id = m["org_id"]
             orgs.setdefault(org_id, []).append(m)
@@ -91,13 +83,32 @@ class GitLabConfigLoader:
         owners = {}
 
         for org_id, groups in orgs.items():
+
+            # 1) Локальные владельцы (основные)
             internal_admins = [
                 g for g in groups
                 if g.get("org_role") == "Admin" and g.get("grafana_admin") is False
             ]
-            owners[org_id] = internal_admins  # may be empty list
+
+            if internal_admins:
+                owners[org_id] = internal_admins
+                continue
+
+            # 2) Если локальных нет — берем глобальных (fallback)
+            global_admins = [
+                g for g in groups
+                if g.get("org_role") == "Admin" and g.get("grafana_admin") is True
+            ]
+
+            if global_admins:
+                owners[org_id] = global_admins
+                continue
+
+            # 3) Если админов нет — владельцев нет
+            owners[org_id] = []
 
         return owners
+
 
 
 if __name__ == "__main__":
