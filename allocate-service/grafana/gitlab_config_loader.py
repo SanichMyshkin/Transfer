@@ -18,17 +18,17 @@ class GitLabConfigLoader:
         self.ref = os.getenv("GITLAB_REF", "main")
 
         if not all([self.url, self.token]):
-            raise RuntimeError("Missing required: GITLAB_URL, GITLAB_TOKEN")
+            raise RuntimeError("Missing required env vars: GITLAB_URL, GITLAB_TOKEN")
 
         self.gl = gitlab.Gitlab(
             self.url,
             private_token=self.token,
-            ssl_verify=False
+            ssl_verify=False,
         )
 
         self.project = self.gl.projects.get(self.project_id)
 
-    def load_raw_text(self):
+    def load_raw_text(self) -> str:
         f = self.project.files.get(file_path=self.file_path, ref=self.ref)
         decoded = base64.b64decode(f.content)
         return decoded.decode("utf-8")
@@ -38,65 +38,101 @@ class GitLabConfigLoader:
         data = tomllib.loads(text)
 
         servers = data.get("servers")
-        mappings = []
+        mappings_raw = []
 
-        # Case 1 — servers: dict
         if isinstance(servers, dict):
             gm = servers.get("group_mappings", [])
             if isinstance(gm, list):
-                mappings.extend(gm)
+                mappings_raw.extend(gm)
 
-        # Case 2 — servers: list
         elif isinstance(servers, list):
             for item in servers:
-                if isinstance(item, dict) and "group_mappings" in item:
-                    gm = item["group_mappings"]
+                if isinstance(item, dict):
+                    gm = item.get("group_mappings")
                     if isinstance(gm, list):
-                        mappings.extend(gm)
+                        mappings_raw.extend(gm)
 
-        # Filter out invalid entries
         result = []
-        for m in mappings:
+        for m in mappings_raw:
             if not isinstance(m, dict):
                 continue
-            if m.get("org_id") is None:
+
+            org_id = m.get("org_id")
+            if org_id is None:
                 continue
+
             result.append(
                 {
-                    "org_id": m.get("org_id"),
+                    "org_id": org_id,
                     "group_dn": m.get("group_dn"),
                     "org_role": m.get("org_role"),
-                    "grafana_admin": m.get("grafana_admin", False),
+                    "grafana_admin": bool(m.get("grafana_admin", False)),
                 }
             )
 
         return result
 
-    def get_owners_clean(self):
-        owners = self.get_org_owners()  # существующая функция
+    def detect_org_owners(self):
+        mappings = self.load_group_mappings()
+        orgs = {}
 
+        for m in mappings:
+            org_id = m["org_id"]
+            orgs.setdefault(org_id, []).append(m)
+
+        owners = {}
+
+        for org_id, groups in orgs.items():
+            internal_admins = [
+                g
+                for g in groups
+                if g.get("org_role") == "Admin" and g.get("grafana_admin") is False
+            ]
+            if internal_admins:
+                owners[org_id] = internal_admins
+                continue
+
+            global_admins = [
+                g
+                for g in groups
+                if g.get("org_role") == "Admin" and g.get("grafana_admin") is True
+            ]
+            if global_admins:
+                owners[org_id] = global_admins
+            else:
+                owners[org_id] = []
+
+        return owners
+
+    def get_owners_clean(self):
+        owners = self.detect_org_owners()
         cleaned = {}
 
-        for org_id, entries in owners.items():
+        for org_id, groups in owners.items():
             unique = set()
 
-            for e in entries:
-                dn = e["group_dn"]
-                # вытащить CN=xxxx до первой запятой
-                cn = dn.split(",")[0].replace("CN=", "").strip()
-                unique.add((cn, e["grafana_admin"]))
+            for g in groups:
+                dn = g.get("group_dn") or ""
+                first_part = dn.split(",")[0].strip()
+                if first_part.upper().startswith("CN="):
+                    cn = first_part[3:].strip()
+                else:
+                    cn = first_part
 
-            # если одна запись — вернуть одиночное значение
-            if len(unique) == 1:
+                unique.add((cn, bool(g.get("grafana_admin"))))
+
+            if len(unique) == 0:
+                cleaned[org_id] = []
+            elif len(unique) == 1:
                 cleaned[org_id] = next(iter(unique))
             else:
-                cleaned[org_id] = list(unique)
+                cleaned[org_id] = sorted(unique)
 
         return cleaned
 
 
-
 if __name__ == "__main__":
     loader = GitLabConfigLoader()
-    owners = loader.detect_org_owners()
-    print(owners)
+    owners_clean = loader.get_owners_clean()
+    for org_id, owner in owners_clean.items():
+        print(f"{org_id}: {owner}")
