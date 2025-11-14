@@ -15,7 +15,6 @@ GRAFANA_PASS = os.getenv("GRAFANA_PASS")
 
 OUTPUT_FILE = "grafana_report.xlsx"
 LOG_FILE = "grafana_report.log"
-
 ORG_LIMIT = int(os.getenv("ORG_LIMIT", "50"))
 SLEEP_AFTER_SWITCH = 1
 SLEEP_BETWEEN_CALLS = 0.2
@@ -35,12 +34,15 @@ requests.packages.urllib3.disable_warnings()
 session = requests.Session()
 session.verify = False
 
+
 def login_cookie():
     r = session.post(f"{GRAFANA_URL}/login", json={"user": GRAFANA_USER, "password": GRAFANA_PASS})
     r.raise_for_status()
     time.sleep(SLEEP_BETWEEN_CALLS)
 
+
 login_cookie()
+
 
 def switch_org(org_id):
     r = session.post(f"{GRAFANA_URL}/api/user/using/{org_id}")
@@ -50,13 +52,22 @@ def switch_org(org_id):
     time.sleep(SLEEP_AFTER_SWITCH)
     return True
 
-def get_users_in_org(org_id):
-    r = session.get(f"{GRAFANA_URL}/api/orgs/{org_id}/users")
+
+def get_org_name(org_id):
+    r = session.get(f"{GRAFANA_URL}/api/orgs/{org_id}")
+    if r.status_code != 200:
+        return f"ORG_{org_id}"
+    return r.json().get("name", f"ORG_{org_id}")
+
+
+def get_users_in_org():
+    r = session.get(f"{GRAFANA_URL}/api/org/users")
     if r.status_code == 401:
         return None
     r.raise_for_status()
     time.sleep(SLEEP_BETWEEN_CALLS)
     return r.json()
+
 
 def get_folders():
     r = session.get(f"{GRAFANA_URL}/api/folders", params={"limit": 5000})
@@ -64,11 +75,13 @@ def get_folders():
     time.sleep(SLEEP_BETWEEN_CALLS)
     return r.json()
 
+
 def get_dashboards_in_folder(fid):
     r = session.get(f"{GRAFANA_URL}/api/search", params={"folderIds": fid, "type": "dash-db", "limit": 5000})
     r.raise_for_status()
     time.sleep(SLEEP_BETWEEN_CALLS)
     return r.json()
+
 
 def get_all_dashboards_raw():
     r = session.get(f"{GRAFANA_URL}/api/search", params={"type": "dash-db", "limit": 5000})
@@ -76,9 +89,11 @@ def get_all_dashboards_raw():
     time.sleep(SLEEP_BETWEEN_CALLS)
     return r.json()
 
+
 def get_root_dashboards():
     all_dash = get_all_dashboards_raw()
     return [d for d in all_dash if d.get("folderId") in (0, None)]
+
 
 def get_dashboard_panels(uid):
     r = session.get(f"{GRAFANA_URL}/api/dashboards/uid/{uid}")
@@ -93,6 +108,7 @@ def get_dashboard_panels(uid):
             if "panels" in row:
                 c += len(row["panels"])
     return c
+
 
 def get_all_grafana_users():
     users = []
@@ -110,19 +126,14 @@ def get_all_grafana_users():
         time.sleep(SLEEP_BETWEEN_CALLS)
     return users
 
+
 loader = GitLabConfigLoader()
 owners_clean = loader.get_owners_clean()
-
 org_ids = sorted(owners_clean.keys())
 org_ids = org_ids[:ORG_LIMIT]
 
-logger.info(f"Будет обработано организаций: {len(org_ids)}")
-
-logger.info("Загружаю глобальных пользователей Grafana...")
-all_grafana_users = get_all_grafana_users()
-
 rows_all_users = []
-for u in all_grafana_users:
+for u in get_all_grafana_users():
     rows_all_users.append({
         "id": u.get("id"),
         "name": u.get("name"),
@@ -140,14 +151,15 @@ rows_dashboards = []
 rows_orgs = []
 
 for org_id in tqdm(org_ids, desc="Организации", ncols=100):
-    org_owner, is_global = owners_clean.get(org_id, ("UNKNOWN", False))
+    owner_group, is_global = owners_clean.get(org_id, ("UNKNOWN", False))
+
     ok = switch_org(org_id)
+    org_name = get_org_name(org_id)
 
     if not ok:
         rows_orgs.append({
-            "org_id": org_id,
-            "org_name": f"ORG_{org_id}",
-            "owner_group": org_owner,
+            "organization": org_name,
+            "owner_group": owner_group,
             "users_total": "NO ACCESS",
             "folders_total": "NO ACCESS",
             "dashboards_total": "NO ACCESS",
@@ -155,12 +167,11 @@ for org_id in tqdm(org_ids, desc="Организации", ncols=100):
         })
         continue
 
-    users = get_users_in_org(org_id)
+    users = get_users_in_org()
     if users is None:
         rows_orgs.append({
-            "org_id": org_id,
-            "org_name": f"ORG_{org_id}",
-            "owner_group": org_owner,
+            "organization": org_name,
+            "owner_group": owner_group,
             "users_total": "NO ACCESS",
             "folders_total": "NO ACCESS",
             "dashboards_total": "NO ACCESS",
@@ -171,7 +182,7 @@ for org_id in tqdm(org_ids, desc="Организации", ncols=100):
     users_total = len(users)
     for u in users:
         rows_users.append({
-            "org_id": org_id,
+            "organization": org_name,
             "user_id": u.get("userId"),
             "email": u.get("email"),
             "login": u.get("login"),
@@ -191,8 +202,7 @@ for org_id in tqdm(org_ids, desc="Организации", ncols=100):
         dashboards_total += len(dashboards)
 
         rows_folders.append({
-            "org_id": org_id,
-            "folder_id": fid,
+            "organization": org_name,
             "folder_title": fname,
             "dashboards_count": len(dashboards),
         })
@@ -203,8 +213,7 @@ for org_id in tqdm(org_ids, desc="Организации", ncols=100):
             panels = get_dashboard_panels(uid)
             panels_total += panels
             rows_dashboards.append({
-                "org_id": org_id,
-                "folder_id": fid,
+                "organization": org_name,
                 "folder_title": fname,
                 "dashboard_uid": uid,
                 "dashboard_title": title,
@@ -220,8 +229,7 @@ for org_id in tqdm(org_ids, desc="Организации", ncols=100):
         panels = get_dashboard_panels(uid)
         panels_total += panels
         rows_dashboards.append({
-            "org_id": org_id,
-            "folder_id": 0,
+            "organization": org_name,
             "folder_title": "ROOT",
             "dashboard_uid": uid,
             "dashboard_title": title,
@@ -229,9 +237,8 @@ for org_id in tqdm(org_ids, desc="Организации", ncols=100):
         })
 
     rows_orgs.append({
-        "org_id": org_id,
-        "org_name": f"ORG_{org_id}",
-        "owner_group": org_owner,
+        "organization": org_name,
+        "owner_group": owner_group,
         "users_total": users_total,
         "folders_total": folders_total,
         "dashboards_total": dashboards_total,
@@ -256,7 +263,7 @@ df_global_summary = pd.DataFrame(list(global_summary.items()), columns=["metric"
 
 with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
     df_all_users.to_excel(writer, sheet_name="GrafanaUsers", index=False)
-    df_users.to_excel(writer, sheet_name="Users", index=False)
+    df_users.to_excel(writer, sheet_name="OrganizationUsers", index=False)
     df_orgs.to_excel(writer, sheet_name="Organizations", index=False)
     df_folders.to_excel(writer, sheet_name="Folders", index=False)
     df_dashboards.to_excel(writer, sheet_name="Dashboards", index=False)
