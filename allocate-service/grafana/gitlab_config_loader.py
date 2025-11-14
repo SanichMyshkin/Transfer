@@ -2,7 +2,6 @@ import os
 import base64
 import gitlab
 
-# tomllib for Python 3.11+, otherwise fallback to tomli
 try:
     import tomllib
 except ImportError:
@@ -14,17 +13,13 @@ class GitLabConfigLoader:
         self.url = os.getenv("GITLAB_URL")
         self.token = os.getenv("GITLAB_TOKEN")
 
-        # Defaults as requested
         self.project_id = os.getenv("GITLAB_PROJECT_ID", "3058")
         self.file_path = os.getenv("GITLAB_FILE_PATH", "grafana_main/ldap.toml")
         self.ref = os.getenv("GITLAB_REF", "main")
 
         if not all([self.url, self.token]):
-            raise RuntimeError(
-                "Missing required vars: GITLAB_URL, GITLAB_TOKEN"
-            )
+            raise RuntimeError("Missing required: GITLAB_URL, GITLAB_TOKEN")
 
-        # Disable SSL verification
         self.gl = gitlab.Gitlab(
             self.url,
             private_token=self.token,
@@ -45,13 +40,13 @@ class GitLabConfigLoader:
         servers = data.get("servers")
         mappings = []
 
-        # case: servers = dict
+        # Case 1 — servers: dict
         if isinstance(servers, dict):
             gm = servers.get("group_mappings", [])
             if isinstance(gm, list):
                 mappings.extend(gm)
 
-        # case: servers = list (array-of-tables)
+        # Case 2 — servers: list
         elif isinstance(servers, list):
             for item in servers:
                 if isinstance(item, dict) and "group_mappings" in item:
@@ -59,18 +54,16 @@ class GitLabConfigLoader:
                     if isinstance(gm, list):
                         mappings.extend(gm)
 
+        # Filter out invalid entries
         result = []
         for m in mappings:
             if not isinstance(m, dict):
                 continue
-
-            org_id = m.get("org_id")
-            if org_id is None:
+            if m.get("org_id") is None:
                 continue
-
             result.append(
                 {
-                    "org_id": org_id,
+                    "org_id": m.get("org_id"),
                     "group_dn": m.get("group_dn"),
                     "org_role": m.get("org_role"),
                     "grafana_admin": m.get("grafana_admin", False),
@@ -79,8 +72,35 @@ class GitLabConfigLoader:
 
         return result
 
+    def detect_org_owners(self):
+        """
+        Locate real owners of organizations:
+        Owners are groups where:
+            org_role == "Admin"
+            grafana_admin == False
+        Global admins do NOT count as owners.
+        """
+        mappings = self.load_group_mappings()
+        orgs = {}
+
+        # group mappings by org
+        for m in mappings:
+            org_id = m["org_id"]
+            orgs.setdefault(org_id, []).append(m)
+
+        owners = {}
+
+        for org_id, groups in orgs.items():
+            internal_admins = [
+                g for g in groups
+                if g.get("org_role") == "Admin" and g.get("grafana_admin") is False
+            ]
+            owners[org_id] = internal_admins  # may be empty list
+
+        return owners
+
 
 if __name__ == "__main__":
     loader = GitLabConfigLoader()
-    mappings = loader.load_group_mappings()
-    print(mappings)
+    owners = loader.detect_org_owners()
+    print(owners)
