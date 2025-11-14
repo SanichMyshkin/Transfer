@@ -2,6 +2,7 @@ import os
 import base64
 import gitlab
 
+# tomllib for Python 3.11+, otherwise fallback to tomli
 try:
     import tomllib
 except ImportError:
@@ -12,14 +13,24 @@ class GitLabConfigLoader:
     def __init__(self):
         self.url = os.getenv("GITLAB_URL")
         self.token = os.getenv("GITLAB_TOKEN")
-        self.project_id = os.getenv("GITLAB_PROJECT_ID")
-        self.file_path = os.getenv("GITLAB_FILE_PATH")
+
+        # Defaults as requested
+        self.project_id = os.getenv("GITLAB_PROJECT_ID", "3058")
+        self.file_path = os.getenv("GITLAB_FILE_PATH", "grafana_main/ldap.toml")
         self.ref = os.getenv("GITLAB_REF", "main")
 
-        if not all([self.url, self.token, self.project_id, self.file_path]):
-            raise RuntimeError("Missing GitLab env vars")
+        if not all([self.url, self.token]):
+            raise RuntimeError(
+                "Missing required vars: GITLAB_URL, GITLAB_TOKEN"
+            )
 
-        self.gl = gitlab.Gitlab(self.url, private_token=self.token)
+        # Disable SSL verification
+        self.gl = gitlab.Gitlab(
+            self.url,
+            private_token=self.token,
+            ssl_verify=False
+        )
+
         self.project = self.gl.projects.get(self.project_id)
 
     def load_raw_text(self):
@@ -32,12 +43,21 @@ class GitLabConfigLoader:
         data = tomllib.loads(text)
 
         servers = data.get("servers")
-        if not isinstance(servers, dict):
-            raise RuntimeError("TOML format error: [servers] must be a table")
+        mappings = []
 
-        mappings = servers.get("group_mappings")
-        if not isinstance(mappings, list):
-            raise RuntimeError("TOML format error: [[servers.group_mappings]] must be a list")
+        # case: servers = dict
+        if isinstance(servers, dict):
+            gm = servers.get("group_mappings", [])
+            if isinstance(gm, list):
+                mappings.extend(gm)
+
+        # case: servers = list (array-of-tables)
+        elif isinstance(servers, list):
+            for item in servers:
+                if isinstance(item, dict) and "group_mappings" in item:
+                    gm = item["group_mappings"]
+                    if isinstance(gm, list):
+                        mappings.extend(gm)
 
         result = []
         for m in mappings:
@@ -45,20 +65,17 @@ class GitLabConfigLoader:
                 continue
 
             org_id = m.get("org_id")
-            group_dn = m.get("group_dn")
-            org_role = m.get("org_role")
-            grafana_admin = m.get("grafana_admin", False)
-
             if org_id is None:
-                # просто пропускаем записи без org_id, но можно и логировать
                 continue
 
-            result.append({
-                "org_id": org_id,
-                "group_dn": group_dn,
-                "org_role": org_role,
-                "grafana_admin": grafana_admin,
-            })
+            result.append(
+                {
+                    "org_id": org_id,
+                    "group_dn": m.get("group_dn"),
+                    "org_role": m.get("org_role"),
+                    "grafana_admin": m.get("grafana_admin", False),
+                }
+            )
 
         return result
 
