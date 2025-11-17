@@ -3,6 +3,7 @@ import sys
 import logging
 from dotenv import load_dotenv
 from prometheus_api_client import PrometheusConnect, PrometheusApiClientException
+import xlsxwriter
 
 logging.basicConfig(
     level=logging.INFO,
@@ -12,80 +13,78 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-def load_env():
+def safe_query(prom, q):
+    try:
+        return prom.custom_query(q)
+    except:
+        return None
+
+
+def count_metric_names(prom, job):
+    q = f'label_values({{job="{job}"}},"__name__")'
+    res = safe_query(prom, q)
+    if not res:
+        return 0
+    return len({r["value"][1] for r in res})
+
+
+def count_series(prom, job):
+    q = f'count({{job="{job}"}})'
+    res = safe_query(prom, q)
+    if not res:
+        return 0
+    return int(res[0]["value"][1])
+
+
+def count_instances(prom, job):
+    q = f'count(count by (instance) ({{job="{job}"}}))'
+    res = safe_query(prom, q)
+    if not res:
+        return 0
+    return int(res[0]["value"][1])
+
+
+def main():
     load_dotenv()
-    url = os.getenv("VM_URL")
-    if not url:
+    vm_url = os.getenv("VM_URL")
+
+    if not vm_url:
         log.error("VM_URL отсутствует")
         sys.exit(1)
-    return url
 
-
-def connect(url: str) -> PrometheusConnect:
     try:
-        return PrometheusConnect(url=url, disable_ssl=True)
+        prom = PrometheusConnect(url=vm_url, disable_ssl=True)
     except Exception as e:
         log.error(f"Подключение невозможно: {e}")
         sys.exit(1)
 
-
-def safe_query(prom: PrometheusConnect, q: str):
     try:
-        return prom.custom_query(q)
-    except PrometheusApiClientException as e:
-        log.error(f"Ошибка запроса `{q}`: {e}")
-    except Exception as e:
-        log.error(f"Ошибка `{q}`: {e}")
-    return None
+        jobs = sorted(prom.get_label_values("job"))
+    except:
+        jobs = []
 
+    workbook = xlsxwriter.Workbook("job_metrics.xlsx")
+    sheet = workbook.add_worksheet("job_metrics")
 
-def fetch_jobs(prom: PrometheusConnect):
-    try:
-        return sorted(prom.get_label_values("job"))
-    except Exception as e:
-        log.error(f"Невозможно получить job: {e}")
-        return []
+    header = ["job", "metric_names", "series", "instances"]
+    for col, name in enumerate(header):
+        sheet.write(0, col, name)
 
-
-def fetch_metric_names(prom: PrometheusConnect):
-    try:
-        return prom.all_metrics()
-    except Exception as e:
-        log.error(f"Невозможно получить metric names: {e}")
-        return []
-
-
-def analyze_job(prom: PrometheusConnect, job: str):
-    q_series = f'count({{job="{job}"}})'
-    q_instances = f'count(count by (instance) ({{job="{job}"}}))'
-    series = safe_query(prom, q_series)
-    inst = safe_query(prom, q_instances)
-    if not series or not inst:
-        return None
-    return job, int(series[0]["value"][1]), int(inst[0]["value"][1])
-
-
-def main():
-    vm_url = load_env()
-    log.info(f"URL: {vm_url}")
-    prom = connect(vm_url)
-
-    metrics = fetch_metric_names(prom)
-    log.info(f"Уникальных metric names: {len(metrics)}")
-
-    jobs = fetch_jobs(prom)
-    log.info(f"Уникальных job: {len(jobs)}")
-
-    print("\nРаспределение:\n")
+    row = 1
     for job in jobs:
-        data = analyze_job(prom, job)
-        if not data:
-            print(f"  • {job:<25} | error")
-            continue
-        job_name, series_count, instances_count = data
-        print(f"  • {job_name:<25} | series = {series_count:<6} | instances = {instances_count}")
+        metric_names = count_metric_names(prom, job)
+        series = count_series(prom, job)
+        instances = count_instances(prom, job)
 
-    print("\nГотово.\n")
+        sheet.write(row, 0, job)
+        sheet.write_number(row, 1, metric_names)
+        sheet.write_number(row, 2, series)
+        sheet.write_number(row, 3, instances)
+
+        row += 1
+
+    workbook.close()
+    print("✔ Создан новый файл job_metrics.xlsx")
 
 
 if __name__ == "__main__":
