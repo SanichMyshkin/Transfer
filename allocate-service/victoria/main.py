@@ -27,24 +27,24 @@ def safe_query(prom, q):
 
 
 def count_metric_names_for_job(prom, job):
-    query = f'count(count by (__name__) ({{job="{job}"}}))'
-    res = safe_query(prom, query)
+    q = f'count(count by (__name__) ({{job="{job}"}}))'
+    res = safe_query(prom, q)
     if not res:
         return 0
     return int(res[0]["value"][1])
 
 
 def count_series_for_job(prom, job):
-    query = f'count({{job="{job}"}})'
-    res = safe_query(prom, query)
+    q = f'count({{job="{job}"}})'
+    res = safe_query(prom, q)
     if not res:
         return 0
     return int(res[0]["value"][1])
 
 
 def get_instances_for_job(prom, job):
-    query = f'count by (instance) ({{job="{job}"}})'
-    res = safe_query(prom, query)
+    q = f'count by (instance) ({{job="{job}"}})'
+    res = safe_query(prom, q)
     if not res:
         return []
     return [row["metric"].get("instance", "<none>") for row in res]
@@ -88,6 +88,7 @@ def main():
 
     workbook = xlsxwriter.Workbook("job_metrics.xlsx")
 
+    # ---------- Sheet 1 ----------
     sheet_jobs = workbook.add_worksheet("job_metrics")
     headers_jobs = ["job", "metric_names", "series", "instances_count", "instances_list"]
     for col, name in enumerate(headers_jobs):
@@ -115,7 +116,7 @@ def main():
     # ---------- Лист 2: статистика по team-service_id ----------
     log.info("Запрос агрегированных данных по team/service_id/instance/metric...")
 
-    # Один общий запрос, без дублей: всё сразу
+    # Один общий запрос
     query_group = 'count by (team, service_id, instance, __name__) ({__name__!=""})'
     group_rows = safe_query(prom, query_group)
 
@@ -123,16 +124,17 @@ def main():
 
     if group_rows:
         for row_data in group_rows:
-            metric_labels = row_data.get("metric", {})
+            labels = row_data.get("metric", {})
             value = int(row_data["value"][1])
 
-            team = metric_labels.get("team")
-            service_id = metric_labels.get("service_id")
-            instance = metric_labels.get("instance", "<none>")
-            metric_name = metric_labels.get("__name__", "<noname>")
+            team = labels.get("team")
+            service_id = labels.get("service_id")
+            instance = labels.get("instance", "<none>")
+            metric_name = labels.get("__name__", "<noname>")
 
-            group = build_group_key(team, service_id)
-            g = groups[group]
+            group_key = build_group_key(team, service_id)
+            g = groups[group_key]
+
             g["metric_names"].add(metric_name)
             g["instances"].add(instance)
             g["series"] += value
@@ -148,9 +150,9 @@ def main():
     for col, name in enumerate(headers_groups):
         sheet_groups.write(0, col, name)
 
-    log.info("Запись статистики по team-service_id в Excel...")
-
+    log.info("Запись статистики по team-service_id...")
     row = 1
+
     for group_name in sorted(groups.keys()):
         data = groups[group_name]
         metric_names_count = len(data["metric_names"])
@@ -165,6 +167,65 @@ def main():
         sheet_groups.write(row, 4, ", ".join(instances_list))
 
         row += 1
+
+    # ---------- Лист 3: Summary ----------
+    log.info("Готовим summary...")
+
+    sheet_summary = workbook.add_worksheet("summary")
+    sheet_summary.write(0, 0, "metric")
+    sheet_summary.write(0, 1, "value")
+
+    all_metric_names = set()
+    all_instances = set()
+    all_teams = set()
+    all_service_ids = set()
+    total_series_sum = 0
+
+    # Собираем по job
+    for job in jobs:
+        q = f'count by (__name__) ({{job="{job}"}})'
+        res = safe_query(prom, q)
+        if res:
+            for r in res:
+                mname = r["metric"].get("__name__")
+                if mname:
+                    all_metric_names.add(mname)
+                total_series_sum += int(r["value"][1])
+
+        instances = get_instances_for_job(prom, job)
+        for inst in instances:
+            all_instances.add(inst)
+
+    # Собираем по группам
+    for group_name, data in groups.items():
+        for inst in data["instances"]:
+            all_instances.add(inst)
+
+        for mn in data["metric_names"]:
+            all_metric_names.add(mn)
+
+        if "-" in group_name:
+            team, svc = group_name.split("-", 1)
+            if team not in ("<none>", "unlabeled"):
+                all_teams.add(team)
+            if svc not in ("<none>", "unlabeled"):
+                all_service_ids.add(svc)
+
+    summary_data = {
+        "total_jobs": len(jobs),
+        "total_metric_names": len(all_metric_names),
+        "total_series": total_series_sum,
+        "unique_instances_count": len(all_instances),
+        "unique_teams_count": len(all_teams),
+        "unique_service_ids_count": len(all_service_ids),
+        "team_service_groups_count": len(groups),
+    }
+
+    row_s = 1
+    for k, v in summary_data.items():
+        sheet_summary.write(row_s, 0, k)
+        sheet_summary.write_number(row_s, 1, v)
+        row_s += 1
 
     log.info("Сохранение файла job_metrics.xlsx...")
     workbook.close()
