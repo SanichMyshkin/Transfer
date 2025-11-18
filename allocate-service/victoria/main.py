@@ -104,15 +104,19 @@ def main():
         if not team:
             continue
 
-        try:
-            service_ids = prom.get_label_values("service_id", match=[f'team="{team}"'])
-        except Exception as e:
-            log.error(f"Ошибка получения service_id для team={team}: {e}")
-            service_ids = []
+        log.info(f"[team] {team}")
 
-        for service_id in service_ids:
-            if not service_id:
-                continue
+        q_svc = f'count by (service_id) ({{team="{team}"}})'
+        res_svc = safe_query(prom, q_svc)
+        service_ids = set()
+        if res_svc:
+            for r in res_svc:
+                sid = r["metric"].get("service_id")
+                if sid:
+                    service_ids.add(sid)
+
+        for service_id in sorted(service_ids):
+            log.info(f"[team-service] {team}/{service_id}")
 
             q_series = f'count({{team="{team}", service_id="{service_id}"}})'
             res_series = safe_query(prom, q_series)
@@ -120,10 +124,10 @@ def main():
 
             q_instances = f'count by (instance) ({{team="{team}", service_id="{service_id}"}})'
             res_instances = safe_query(prom, q_instances)
-            instances = []
+            instances = set()
             if res_instances:
                 for r in res_instances:
-                    instances.append(r["metric"].get("instance", "<none>"))
+                    instances.add(r["metric"].get("instance", "<none>"))
 
             q_metric_names = f'count by (__name__) ({{team="{team}", service_id="{service_id}"}})'
             res_metric_names = safe_query(prom, q_metric_names)
@@ -133,10 +137,10 @@ def main():
                     metric_names.add(r["metric"].get("__name__", "<noname>"))
 
             group_key = f"{team}-{service_id}"
-
-            groups[group_key]["metric_names"].update(metric_names)
-            groups[group_key]["instances"].update(instances)
-            groups[group_key]["series"] += series_count
+            g = groups[group_key]
+            g["metric_names"].update(metric_names)
+            g["instances"].update(instances)
+            g["series"] += series_count
 
     sheet_groups = workbook.add_worksheet("team_service_metrics")
     headers_groups = [
@@ -153,12 +157,16 @@ def main():
 
     for group_name in sorted(groups.keys()):
         data = groups[group_name]
+        metric_names_count = len(data["metric_names"])
+        series_count = data["series"]
+        instances_list = sorted(data["instances"])
+        instances_count = len(instances_list)
 
         sheet_groups.write(row, 0, group_name)
-        sheet_groups.write_number(row, 1, len(data["metric_names"]))
-        sheet_groups.write_number(row, 2, data["series"])
-        sheet_groups.write_number(row, 3, len(data["instances"]))
-        sheet_groups.write(row, 4, ", ".join(sorted(data["instances"])))
+        sheet_groups.write_number(row, 1, metric_names_count)
+        sheet_groups.write_number(row, 2, series_count)
+        sheet_groups.write_number(row, 3, instances_count)
+        sheet_groups.write(row, 4, ", ".join(instances_list))
 
         row += 1
 
