@@ -34,7 +34,7 @@ def count_metric_names_for_job(prom, job):
     return int(res[0]["value"][1])
 
 
-def count_series_for_job(prom, job):
+def count_time_series_for_job(prom, job):
     q = f'count({{job="{job}"}})'
     res = safe_query(prom, q)
     if not res:
@@ -77,8 +77,9 @@ def main():
 
     workbook = xlsxwriter.Workbook("job_metrics.xlsx")
 
+    # ---------- JOB SHEET ----------
     sheet_jobs = workbook.add_worksheet("job_metrics")
-    headers_jobs = ["job", "metric_names", "series", "instances_count", "instances_list"]
+    headers_jobs = ["job", "metric_names", "time_series", "instances_count", "instances_list"]
     for col, name in enumerate(headers_jobs):
         sheet_jobs.write(0, col, name)
 
@@ -87,17 +88,19 @@ def main():
 
     for job in jobs:
         log.info(f"[JOB] {job}")
+
         metric_names = count_metric_names_for_job(prom, job)
-        series = count_series_for_job(prom, job)
+        time_series = count_time_series_for_job(prom, job)
         instances = get_instances_for_job(prom, job)
 
         sheet_jobs.write(row, 0, job)
         sheet_jobs.write_number(row, 1, metric_names)
-        sheet_jobs.write_number(row, 2, series)
+        sheet_jobs.write_number(row, 2, time_series)
         sheet_jobs.write_number(row, 3, len(instances))
         sheet_jobs.write(row, 4, ", ".join(sorted(instances)))
         row += 1
 
+    # ---------- TEAM → SERVICE_ID ----------
     log.info("Получение списка team...")
     try:
         teams = prom.get_label_values("team")
@@ -106,9 +109,9 @@ def main():
         log.error(f"Ошибка получения team: {e}")
         teams = []
 
-    groups = defaultdict(lambda: {"metric_names": set(), "instances": set(), "series": 0})
+    groups = defaultdict(lambda: {"metric_names": set(), "instances": set(), "time_series": 0})
 
-    log.info("Обработка team/service_id по имеющимся team...")
+    log.info("Обработка team/service_id...")
 
     for team in sorted(teams):
         if not team:
@@ -136,129 +139,105 @@ def main():
         no_svc = max(total - with_svc, 0)
         log.info(f"[TEAM] {team}: total={total}, with_service_id={with_svc}, no_service_id={no_svc}")
 
+        # ---- TEAM + SERVICE_ID ----
         for service_id in sorted(service_ids):
             log.info(f"[TEAM-SVC] {team}/{service_id}")
 
             q_series = f'count({{team="{team}", service_id="{service_id}"}})'
             res_series = safe_query(prom, q_series)
-            series_count = int(res_series[0]["value"][1]) if res_series else 0
+            time_series_count = int(res_series[0]["value"][1]) if res_series else 0
 
             q_instances = f'count by (instance) ({{team="{team}", service_id="{service_id}"}})'
             inst_rows = safe_query(prom, q_instances)
-            inst_list = set()
-            if inst_rows:
-                for r in inst_rows:
-                    inst_list.add(r["metric"].get("instance", "<none>"))
+            inst_list = {r["metric"].get("instance", "<none>") for r in inst_rows} if inst_rows else set()
 
             q_metrics = f'count by (__name__) ({{team="{team}", service_id="{service_id}"}})'
             mn_rows = safe_query(prom, q_metrics)
-            metric_names = set()
-            if mn_rows:
-                for r in mn_rows:
-                    metric_names.add(r["metric"].get("__name__", "<noname>"))
+            metric_names = {r["metric"].get("__name__", "<noname>") for r in mn_rows} if mn_rows else set()
 
             key = f"{team}-{service_id}"
             g = groups[key]
             g["metric_names"].update(metric_names)
             g["instances"].update(inst_list)
-            g["series"] += series_count
+            g["time_series"] += time_series_count
 
+        # ---- TEAM WITHOUT service_id ----
         if no_svc > 0:
-            log.info(f"[TEAM-<none>] {team} — series без service_id: {no_svc}")
+            log.info(f"[TEAM-<none>] {team} — time_series без service_id: {no_svc}")
 
             q_instances_ns = f'count by (instance) ({{team="{team}", service_id=""}})'
             inst_ns_rows = safe_query(prom, q_instances_ns)
-            inst_ns = set()
-            if inst_ns_rows:
-                for r in inst_ns_rows:
-                    inst_ns.add(r["metric"].get("instance", "<none>"))
+            inst_ns = {r["metric"].get("instance", "<none>") for r in inst_ns_rows} if inst_ns_rows else set()
 
             q_metrics_ns = f'count by (__name__) ({{team="{team}", service_id=""}})'
             mn_ns_rows = safe_query(prom, q_metrics_ns)
-            metric_ns = set()
-            if mn_ns_rows:
-                for r in mn_ns_rows:
-                    metric_ns.add(r["metric"].get("__name__", "<noname>"))
+            metric_ns = {r["metric"].get("__name__", "<noname>") for r in mn_ns_rows} if mn_ns_rows else set()
 
             key = f"{team}-<none>"
             g = groups[key]
             g["metric_names"].update(metric_ns)
             g["instances"].update(inst_ns)
-            g["series"] += no_svc
+            g["time_series"] += no_svc
 
-    log.info("Обработка метрик с service_id, но без team...")
+    # ---- SERVICE_ID WITHOUT TEAM ----
+    log.info("Обработка service_id без team...")
 
     q_svc_no_team = 'count by (service_id) ({team="", service_id!=""})'
     svc_no_team_rows = safe_query(prom, q_svc_no_team)
-    svc_no_team_ids = set()
-    if svc_no_team_rows:
-        for r in svc_no_team_rows:
-            sid = r["metric"].get("service_id")
-            if sid:
-                svc_no_team_ids.add(sid)
+    svc_no_team_ids = {r["metric"].get("service_id") for r in svc_no_team_rows} if svc_no_team_rows else set()
 
     for service_id in sorted(svc_no_team_ids):
         log.info(f"[<none>-SVC] {service_id}")
 
         q_series = f'count({{team="", service_id="{service_id}"}})'
         res_series = safe_query(prom, q_series)
-        series_count = int(res_series[0]["value"][1]) if res_series else 0
+        time_series_count = int(res_series[0]["value"][1]) if res_series else 0
 
         q_instances = f'count by (instance) ({{team="", service_id="{service_id}"}})'
         inst_rows = safe_query(prom, q_instances)
-        inst_list = set()
-        if inst_rows:
-            for r in inst_rows:
-                inst_list.add(r["metric"].get("instance", "<none>"))
+        inst_list = {r["metric"].get("instance", "<none>") for r in inst_rows} if inst_rows else set()
 
         q_metrics = f'count by (__name__) ({{team="", service_id="{service_id}"}})'
         mn_rows = safe_query(prom, q_metrics)
-        metric_names = set()
-        if mn_rows:
-            for r in mn_rows:
-                metric_names.add(r["metric"].get("__name__", "<noname>"))
+        metric_names = {r["metric"].get("__name__", "<noname>") for r in mn_rows} if mn_rows else set()
 
         key = f"<none>-{service_id}"
         g = groups[key]
         g["metric_names"].update(metric_names)
         g["instances"].update(inst_list)
-        g["series"] += series_count
+        g["time_series"] += time_series_count
 
-    log.info("Обработка полностью неразмеченных (без team и service_id)...")
+    # ---- UNLABELED ----
+    log.info("Обработка полностью неразмеченных...")
 
     q_unlabeled = 'count({team="", service_id=""})'
     unlabeled_res = safe_query(prom, q_unlabeled)
     unlabeled_series = int(unlabeled_res[0]["value"][1]) if unlabeled_res else 0
 
     if unlabeled_series > 0:
-        log.info(f"[unlabeled] series: {unlabeled_series}")
+        log.info(f"[unlabeled] time_series: {unlabeled_series}")
 
         q_inst_unl = 'count by (instance) ({team="", service_id=""})'
         inst_unl_rows = safe_query(prom, q_inst_unl)
-        inst_unl = set()
-        if inst_unl_rows:
-            for r in inst_unl_rows:
-                inst_unl.add(r["metric"].get("instance", "<none>"))
+        inst_unl = {r["metric"].get("instance", "<none>") for r in inst_unl_rows} if inst_unl_rows else set()
 
         q_mn_unl = 'count by (__name__) ({team="", service_id=""})'
         mn_unl_rows = safe_query(prom, q_mn_unl)
-        mn_unl = set()
-        if mn_unl_rows:
-            for r in mn_unl_rows:
-                mn_unl.add(r["metric"].get("__name__", "<noname>"))
+        mn_unl = {r["metric"].get("__name__", "<noname>") for r in mn_unl_rows} if mn_unl_rows else set()
 
         g = groups["unlabeled"]
         g["metric_names"].update(mn_unl)
         g["instances"].update(inst_unl)
-        g["series"] += unlabeled_series
+        g["time_series"] += unlabeled_series
 
+    # ---------- WRITE GROUP SHEET ----------
     log.info("Запись листа team_service_metrics...")
 
     sheet_groups = workbook.add_worksheet("team_service_metrics")
     headers_groups = [
         "team_service",
         "metric_names",
-        "series",
+        "time_series",
         "instances_count",
         "instances_list",
     ]
@@ -270,11 +249,12 @@ def main():
         data = groups[group_name]
         sheet_groups.write(row, 0, group_name)
         sheet_groups.write_number(row, 1, len(data["metric_names"]))
-        sheet_groups.write_number(row, 2, data["series"])
+        sheet_groups.write_number(row, 2, data["time_series"])
         sheet_groups.write_number(row, 3, len(data["instances"]))
         sheet_groups.write(row, 4, ", ".join(sorted(data["instances"])))
         row += 1
 
+    # ---------- SUMMARY ----------
     log.info("Формирование summary...")
 
     sheet_summary = workbook.add_worksheet("summary")
@@ -285,8 +265,9 @@ def main():
     all_instances = set()
     all_teams = set()
     all_service_ids = set()
-    total_series_sum = 0
+    total_time_series_sum = 0
 
+    # job-данные
     for job in jobs:
         q = f'count by (__name__) ({{job="{job}"}})'
         res = safe_query(prom, q)
@@ -295,18 +276,15 @@ def main():
                 mname = r["metric"].get("__name__")
                 if mname:
                     all_metric_names.add(mname)
-                total_series_sum += int(r["value"][1])
+                total_time_series_sum += int(r["value"][1])
 
         instances = get_instances_for_job(prom, job)
-        for inst in instances:
-            all_instances.add(inst)
+        all_instances.update(instances)
 
+    # group-данные
     for group_name, data in groups.items():
-        for inst in data["instances"]:
-            all_instances.add(inst)
-
-        for mn in data["metric_names"]:
-            all_metric_names.add(mn)
+        all_instances.update(data["instances"])
+        all_metric_names.update(data["metric_names"])
 
         if "-" in group_name:
             team, svc = group_name.split("-", 1)
@@ -318,7 +296,7 @@ def main():
     summary_data = {
         "total_jobs": len(jobs),
         "total_metric_names": len(all_metric_names),
-        "total_series": total_series_sum,
+        "total_time_series": total_time_series_sum,
         "unique_instances_count": len(all_instances),
         "unique_teams_count": len(all_teams),
         "unique_service_ids_count": len(all_service_ids),
@@ -331,6 +309,7 @@ def main():
         sheet_summary.write_number(row_s, 1, v)
         row_s += 1
 
+    # ---------- FINAL ----------
     log.info("Сохранение файла job_metrics.xlsx...")
     workbook.close()
     log.info("✔ Готово. Файл job_metrics.xlsx создан.")
