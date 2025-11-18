@@ -16,13 +16,20 @@ log = logging.getLogger(__name__)
 
 
 def safe_query(prom, q):
+    log.info(f"QUERY: {q}")
     try:
         return prom.custom_query(q)
-    except PrometheusApiClientException as e:
-        log.error(f"Ошибка запроса `{q}`: {e}")
     except Exception as e:
-        log.error(f"Ошибка выполнения `{q}`: {e}")
+        log.error(f"ERROR `{q}`: {e}")
     return None
+
+
+def get_job_instances(prom, job):
+    q = f'count by (instance) ({{job="{job}"}})'
+    res = safe_query(prom, q)
+    if not res:
+        return []
+    return [row["metric"].get("instance", "<none>") for row in res]
 
 
 def count_metric_names_for_job(prom, job):
@@ -41,14 +48,6 @@ def count_series_for_job(prom, job):
     return int(res[0]["value"][1])
 
 
-def get_instances_for_job(prom, job):
-    q = f'count by (instance) ({{job="{job}"}})'
-    res = safe_query(prom, q)
-    if not res:
-        return []
-    return [row["metric"].get("instance", "<none>") for row in res]
-
-
 def main():
     load_dotenv()
     vm_url = os.getenv("VM_URL")
@@ -57,16 +56,17 @@ def main():
         log.error("VM_URL отсутствует")
         sys.exit(1)
 
+    log.info(f"Подключение: {vm_url}")
     try:
         prom = PrometheusConnect(url=vm_url, disable_ssl=True)
     except Exception as e:
-        log.error(f"Не удалось подключиться к VM: {e}")
+        log.error(f"Подключение провалено: {e}")
         sys.exit(1)
 
+    log.info("Загрузка списка job...")
     try:
         jobs = sorted(prom.get_label_values("job"))
-    except Exception as e:
-        log.error(f"Ошибка получения job: {e}")
+    except:
         jobs = []
 
     workbook = xlsxwriter.Workbook("job_metrics.xlsx")
@@ -77,153 +77,162 @@ def main():
         sheet_jobs.write(0, col, name)
 
     row = 1
-
     for job in jobs:
+        log.info(f"[JOB] {job}")
         metric_names = count_metric_names_for_job(prom, job)
         series = count_series_for_job(prom, job)
-        instances = get_instances_for_job(prom, job)
-        instances_count = len(instances)
+        instances = get_job_instances(prom, job)
 
         sheet_jobs.write(row, 0, job)
         sheet_jobs.write_number(row, 1, metric_names)
         sheet_jobs.write_number(row, 2, series)
-        sheet_jobs.write_number(row, 3, instances_count)
+        sheet_jobs.write_number(row, 3, len(instances))
         sheet_jobs.write(row, 4, ", ".join(sorted(instances)))
-
         row += 1
 
+    log.info("Получение team...")
     try:
         teams = prom.get_label_values("team")
-    except Exception as e:
-        log.error(f"Ошибка получения team: {e}")
+    except:
         teams = []
 
     groups = defaultdict(lambda: {"metric_names": set(), "instances": set(), "series": 0})
+
+    log.info("Обработка team/service_id...")
 
     for team in sorted(teams):
         if not team:
             continue
 
-        log.info(f"[team] {team}")
+        log.info(f"[TEAM] {team}")
 
         q_svc = f'count by (service_id) ({{team="{team}"}})'
-        res_svc = safe_query(prom, q_svc)
-        service_ids = set()
-        if res_svc:
-            for r in res_svc:
+        svc_rows = safe_query(prom, q_svc)
+        svc_ids = set()
+
+        if svc_rows:
+            for r in svc_rows:
                 sid = r["metric"].get("service_id")
                 if sid:
-                    service_ids.add(sid)
+                    svc_ids.add(sid)
 
-        for service_id in sorted(service_ids):
-            log.info(f"[team-service] {team}/{service_id}")
+        q_total = f'count({{team="{team}"}})'
+        q_total_res = safe_query(prom, q_total)
+        total = int(q_total_res[0]["value"][1]) if q_total_res else 0
+
+        q_has_svc = f'count({{team="{team}", service_id!=""}})'
+        q_has_svc_res = safe_query(prom, q_has_svc)
+        with_svc = int(q_has_svc_res[0]["value"][1]) if q_has_svc_res else 0
+
+        no_svc = max(total - with_svc, 0)
+
+        for service_id in sorted(svc_ids):
+            log.info(f"[TEAM-SVC] {team}/{service_id}")
 
             q_series = f'count({{team="{team}", service_id="{service_id}"}})'
             res_series = safe_query(prom, q_series)
             series_count = int(res_series[0]["value"][1]) if res_series else 0
 
             q_instances = f'count by (instance) ({{team="{team}", service_id="{service_id}"}})'
-            res_instances = safe_query(prom, q_instances)
-            instances = set()
-            if res_instances:
-                for r in res_instances:
-                    instances.add(r["metric"].get("instance", "<none>"))
+            inst_rows = safe_query(prom, q_instances)
+            inst_list = set()
+            if inst_rows:
+                for r in inst_rows:
+                    inst_list.add(r["metric"].get("instance", "<none>"))
 
-            q_metric_names = f'count by (__name__) ({{team="{team}", service_id="{service_id}"}})'
-            res_metric_names = safe_query(prom, q_metric_names)
+            q_metrics = f'count by (__name__) ({{team="{team}", service_id="{service_id}"}})'
+            mn_rows = safe_query(prom, q_metrics)
             metric_names = set()
-            if res_metric_names:
-                for r in res_metric_names:
+            if mn_rows:
+                for r in mn_rows:
                     metric_names.add(r["metric"].get("__name__", "<noname>"))
 
-            group_key = f"{team}-{service_id}"
-            g = groups[group_key]
+            g = groups[f"{team}-{service_id}"]
             g["metric_names"].update(metric_names)
-            g["instances"].update(instances)
+            g["instances"].update(inst_list)
             g["series"] += series_count
 
+        if no_svc > 0:
+            log.info(f"[TEAM-<none>] {team} — {no_svc} series")
+
+            q_instances = f'count by (instance) ({{team="{team}", service_id=""}})'
+            inst_rows = safe_query(prom, q_instances)
+            inst_list = set()
+            if inst_rows:
+                for r in inst_rows:
+                    inst_list.add(r["metric"].get("instance", "<none>"))
+
+            q_metrics = f'count by (__name__) ({{team="{team}", service_id=""}})'
+            mn_rows = safe_query(prom, q_metrics)
+            metric_names = set()
+            if mn_rows:
+                for r in mn_rows:
+                    metric_names.add(r["metric"].get("__name__", "<noname>"))
+
+            g = groups[f"{team}-<none>"]
+            g["metric_names"].update(metric_names)
+            g["instances"].update(inst_list)
+            g["series"] += no_svc
+
+    log.info("Поиск метрик без team и без service_id...")
+
+    q_unlabeled = 'count({team="", service_id=""})'
+    unl_res = safe_query(prom, q_unlabeled)
+    unlabeled_series = int(unl_res[0]["value"][1]) if unl_res else 0
+
+    if unlabeled_series > 0:
+        log.info(f"[UNLABELED] {unlabeled_series} series")
+
+        q_instances = 'count by (instance) ({team="", service_id=""})'
+        inst_rows = safe_query(prom, q_instances)
+        inst_list = set()
+        if inst_rows:
+            for r in inst_rows:
+                inst_list.add(r["metric"].get("instance", "<none>"))
+
+        q_metrics = 'count by (__name__) ({team="", service_id=""})'
+        mn_rows = safe_query(prom, q_metrics)
+        metric_names = set()
+        if mn_rows:
+            for r in mn_rows:
+                metric_names.add(r["metric"].get("__name__", "<noname>"))
+
+        g = groups["unlabeled"]
+        g["metric_names"].update(metric_names)
+        g["instances"].update(inst_list)
+        g["series"] += unlabeled_series
+
     sheet_groups = workbook.add_worksheet("team_service_metrics")
-    headers_groups = [
-        "team_service",
-        "metric_names",
-        "series",
-        "instances_count",
-        "instances_list",
-    ]
-    for col, name in enumerate(headers_groups):
+    headers = ["team_service", "metric_names", "series", "instances_count", "instances_list"]
+    for col, name in enumerate(headers):
         sheet_groups.write(0, col, name)
 
     row = 1
-
-    for group_name in sorted(groups.keys()):
-        data = groups[group_name]
-        metric_names_count = len(data["metric_names"])
-        series_count = data["series"]
-        instances_list = sorted(data["instances"])
-        instances_count = len(instances_list)
-
-        sheet_groups.write(row, 0, group_name)
-        sheet_groups.write_number(row, 1, metric_names_count)
-        sheet_groups.write_number(row, 2, series_count)
-        sheet_groups.write_number(row, 3, instances_count)
-        sheet_groups.write(row, 4, ", ".join(instances_list))
-
+    for name in sorted(groups.keys()):
+        g = groups[name]
+        sheet_groups.write(row, 0, name)
+        sheet_groups.write_number(row, 1, len(g["metric_names"]))
+        sheet_groups.write_number(row, 2, g["series"])
+        sheet_groups.write_number(row, 3, len(g["instances"]))
+        sheet_groups.write(row, 4, ", ".join(sorted(g["instances"])))
         row += 1
 
     sheet_summary = workbook.add_worksheet("summary")
     sheet_summary.write(0, 0, "metric")
     sheet_summary.write(0, 1, "value")
 
-    all_metric_names = set()
-    all_instances = set()
-    all_teams = set()
-    all_service_ids = set()
-    total_series_sum = 0
-
-    for job in jobs:
-        q = f'count by (__name__) ({{job="{job}"}})'
-        res = safe_query(prom, q)
-        if res:
-            for r in res:
-                mname = r["metric"].get("__name__")
-                if mname:
-                    all_metric_names.add(mname)
-                total_series_sum += int(r["value"][1])
-
-        instances = get_instances_for_job(prom, job)
-        for inst in instances:
-            all_instances.add(inst)
-
-    for group_name, data in groups.items():
-        for inst in data["instances"]:
-            all_instances.add(inst)
-        for mn in data["metric_names"]:
-            all_metric_names.add(mn)
-        if "-" in group_name:
-            team, svc = group_name.split("-", 1)
-            if team:
-                all_teams.add(team)
-            if svc:
-                all_service_ids.add(svc)
-
-    summary_data = {
-        "total_jobs": len(jobs),
-        "total_metric_names": len(all_metric_names),
-        "total_series": total_series_sum,
-        "unique_instances_count": len(all_instances),
-        "unique_teams_count": len(all_teams),
-        "unique_service_ids_count": len(all_service_ids),
-        "team_service_groups_count": len(groups),
+    summary = {
+        "groups_count": len(groups),
     }
 
-    row_s = 1
-    for k, v in summary_data.items():
-        sheet_summary.write(row_s, 0, k)
-        sheet_summary.write_number(row_s, 1, v)
-        row_s += 1
+    row = 1
+    for k, v in summary.items():
+        sheet_summary.write(row, 0, k)
+        sheet_summary.write_number(row, 1, v)
+        row += 1
 
     workbook.close()
-    log.info("✔ Готово. Файл job_metrics.xlsx создан.")
+    log.info("Готово.")
 
 
 if __name__ == "__main__":
