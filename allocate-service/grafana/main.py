@@ -87,14 +87,31 @@ def get_dashboards_in_folder(fid):
     return r.json()
 
 
+# -----------------------------------------------------
+# ПОЛНОЕ логирование результата /api/search
+# -----------------------------------------------------
 def get_all_dashboards_raw():
     r = session.get(
         f"{GRAFANA_URL}/api/search",
         params={"type": "dash-db", "limit": 5000},
     )
     r.raise_for_status()
+    data = r.json()
+
+    logger.info("==========================================================")
+    logger.info(f"RAW SEARCH RESULTS FOR CURRENT ORG: {len(data)} dashboards")
+    logger.info("Listing dashboards returned by /api/search:")
+    for d in data:
+        uid = d.get("uid")
+        title = d.get("title")
+        folder_id = d.get("folderId")
+        logger.info(
+            f"  - RAW: UID='{uid}', title='{title}', folderId={folder_id}"
+        )
+    logger.info("==========================================================")
+
     time.sleep(SLEEP_BETWEEN_CALLS)
-    return r.json()
+    return data
 
 
 def get_root_dashboards():
@@ -102,9 +119,9 @@ def get_root_dashboards():
     return [d for d in all_dash if d.get("folderId") in (0, None)]
 
 
-# ------------------------------------------------
-#  ДОБАВЛЕНА ВАЛИДАЦИЯ И ПОДРОБНОЕ ЛОГИРОВАНИЕ
-# ------------------------------------------------
+# -----------------------------------------------------
+# ДОБАВЛЕНО ПОЛНОЕ ЛОГИРОВАНИЕ + обработка 404 / 401
+# -----------------------------------------------------
 def get_dashboard_panels(uid, origininfo=""):
     url = f"{GRAFANA_URL}/api/dashboards/uid/{uid}"
     r = session.get(url)
@@ -160,9 +177,9 @@ def get_all_grafana_users():
     return users
 
 
-# ------------------------------------------------
+# -----------------------------------------------------
 # ОСНОВНОЙ КОД
-# ------------------------------------------------
+# -----------------------------------------------------
 
 login_cookie()
 
