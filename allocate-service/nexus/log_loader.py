@@ -3,66 +3,85 @@ import shutil
 import gzip
 import tarfile
 import zipfile
+import sqlite3
 import logging
 from pathlib import Path
-import pandas as pd
 import json
-import pyarrow as pa
-import pyarrow.parquet as pq
-
 
 logger = logging.getLogger("audit_loader")
 
 
-# ============================================================
-# Архиваторы
-# ============================================================
+# ================================
+# Создание базы
+# ================================
+def init_db(db_path: Path):
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
 
-def extract_zip(path: Path, to_dir: Path):
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS raw_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT,
+            initiator TEXT,
+            repo TEXT
+        );
+    """)
+
+    conn.commit()
+    return conn
+
+
+# ================================
+# Вспомогательные функции
+# ================================
+
+def safe_json_parse(line: str):
+    """Безопасный json.loads"""
+    if "{" not in line or "}" not in line:
+        return None
+    if len(line) > 5_000_000:
+        return None
     try:
-        with zipfile.ZipFile(path, "r") as z:
-            z.extractall(to_dir)
-        logger.info(f"Распакован ZIP: {path}")
-        return True
-    except Exception as e:
-        logger.error(f"Не удалось распаковать ZIP {path}: {e}")
-        return False
-
-
-def extract_tar(path: Path, to_dir: Path):
-    try:
-        with tarfile.open(path, "r:*") as t:
-            t.extractall(to_dir)
-        logger.info(f"Распакован TAR: {path}")
-        return True
-    except Exception as e:
-        logger.error(f"Не удалось распаковать TAR {path}: {e}")
-        return False
-
-
-def extract_gzip_log(path: Path):
-    """*.log.gz → *.log"""
-    try:
-        out_path = path.with_suffix("")
-        logger.info(f"Распаковка GZIP: {path} → {out_path}")
-        with gzip.open(path, "rb") as src, open(out_path, "wb") as dst:
-            shutil.copyfileobj(src, dst)
-        return out_path
-    except Exception as e:
-        logger.error(f"Ошибка распаковки gzip {path}: {e}")
+        return json.loads(line)
+    except Exception:
         return None
 
 
-def expand_archives(root: Path):
-    """
-    Рекурсивно распаковываем ВСЕ архивы:
-    zip, tar, tar.gz, tgz, log.gz
-    """
-    logger.info("Начата рекурсивная распаковка архивов")
+def extract_zip(path: Path, to: Path):
+    try:
+        with zipfile.ZipFile(path, "r") as z:
+            z.extractall(to)
+        return True
+    except:
+        return False
 
-    extracted = True
-    while extracted:
-        extracted = False
+
+def extract_tar(path: Path, to: Path):
+    try:
+        with tarfile.open(path, "r:*") as t:
+            t.extractall(to)
+        return True
+    except:
+        return False
+
+
+def extract_gzip(path: Path):
+    out = path.with_suffix("")  # remove .gz
+    try:
+        with gzip.open(path, "rb") as fin, open(out, "wb") as fout:
+            shutil.copyfileobj(fin, fout)
+        return out
+    except:
+        return None
+
+
+# ================================
+# Рекурсивная распаковка
+# ================================
+def expand_archives(root: Path):
+    changed = True
+    while changed:
+        changed = False
 
         for file in list(root.rglob("*")):
             if not file.is_file():
@@ -71,171 +90,99 @@ def expand_archives(root: Path):
             name = file.name.lower()
 
             if name.endswith(".zip"):
+                logger.info(f"ZIP → {file}")
                 if extract_zip(file, file.parent):
                     file.unlink()
-                    extracted = True
+                    changed = True
                 continue
 
             if name.endswith(".tar") or name.endswith(".tar.gz") or name.endswith(".tgz"):
+                logger.info(f"TAR → {file}")
                 if extract_tar(file, file.parent):
                     file.unlink()
-                    extracted = True
+                    changed = True
                 continue
 
             if name.endswith(".log.gz"):
-                new_file = extract_gzip_log(file)
-                if new_file:
+                logger.info(f"GZIP LOG → {file}")
+                out = extract_gzip(file)
+                if out:
                     file.unlink()
-                    extracted = True
+                    changed = True
                 continue
 
-    logger.info("Все архивы успешно развёрнуты")
 
+# ================================
+# Обработка одного лог-файла
+# ================================
+def load_log_file(path: Path, conn):
+    logger.info(f"Чтение: {path}")
 
-# ============================================================
-# Стриминговый парсинг JSON
-# ============================================================
-
-def safe_parse_json(line: str):
-    """
-    Безопасный парс JSON.
-    Пропускаем строки без {} и слишком длинные.
-    """
-    line = line.strip()
-
-    if "{" not in line or "}" not in line:
-        return None
-
-    if len(line) > 5_000_000:  # >5MB
-        return None
-
-    try:
-        return json.loads(line)
-    except Exception:
-        return None
-
-
-def write_batch(batch, writer, fields):
-    """
-    Выравнивание схемы и запись батча в Parquet.
-    """
-    aligned = []
-    for obj in batch:
-        row = {field: obj.get(field, None) for field in fields}
-        aligned.append(row)
-
-    table = pa.Table.from_pylist(aligned)
-    writer.write_table(table)
-
-
-def stream_log_to_parquet(path: Path, writer, fields: set):
-    logger.info(f"Чтение лог-файла: {path}")
-
+    cur = conn.cursor()
     batch = []
-    batch_size = 10000
-    total = 0
+    count = 0
 
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
-        for raw in f:
-            obj = safe_parse_json(raw)
-            if obj is None:
+        for raw_line in f:
+            jl = safe_json_parse(raw_line.strip())
+            if not jl:
                 continue
 
-            # дополняем схему новыми ключами
-            for k in obj:
-                if k not in fields:
-                    fields.add(k)
+            batch.append((
+                jl.get("timestamp"),
+                jl.get("initiator"),
+                jl.get("attributes", {}).get("repository.name")
+                or jl.get("attributes", {}).get("repositoryName")
+            ))
 
-            batch.append(obj)
-            total += 1
+            count += 1
 
-            if len(batch) >= batch_size:
-                write_batch(batch, writer, fields)
+            if len(batch) >= 10_000:
+                cur.executemany("INSERT INTO raw_logs(timestamp, initiator, repo) VALUES (?, ?, ?)", batch)
+                conn.commit()
                 batch.clear()
 
     if batch:
-        write_batch(batch, writer, fields)
+        cur.executemany("INSERT INTO raw_logs(timestamp, initiator, repo) VALUES (?, ?, ?)", batch)
+        conn.commit()
 
-    logger.info(f" → JSON записей извлечено: {total}")
+    logger.info(f" → JSON строк: {count}")
 
 
-# ============================================================
-# Основной процесс загрузки логов
-# ============================================================
+# ================================
+# Главная функция
+# ================================
+def load_all_audit_logs(archive_path: str):
+    project_dir = Path(".")
+    extract_dir = project_dir / "temp_extract"
+    extract_dir.mkdir(exist_ok=True)
 
-def load_all_audit_logs(archive_path: str) -> pd.DataFrame:
-    """
-    Полная потоковая обработка:
-      - распаковка
-      - поиск audit/
-      - обработка всех .log
-      - запись JSON → Parquet
-      - чтение Parquet → DataFrame
-    """
-    root = Path("temp_extract")
-    if root.exists():
-        shutil.rmtree(root)
-    root.mkdir()
+    db_path = project_dir / "temp_db" / "audit.db"
+    db_path.parent.mkdir(exist_ok=True)
 
-    parsed_dir = root / "parsed"
-    parsed_dir.mkdir()
+    logger.info(f"Создаём SQLite: {db_path}")
+    conn = init_db(db_path)
 
-    parquet_file = parsed_dir / "records.parquet"
+    # первичное извлечение
+    logger.info(f"Извлечение архива: {archive_path}")
+    if not extract_zip(Path(archive_path), extract_dir) and \
+       not extract_tar(Path(archive_path), extract_dir):
+        raise Exception("Не удалось распаковать главный архив")
 
-    archive_path = Path(archive_path)
-    logger.info(f"Начинаем обработку архива: {archive_path}")
-    logger.info(f"Рабочая директория: {root}")
+    expand_archives(extract_dir)
 
-    # первичная распаковка главного архива
-    if not extract_zip(archive_path, root) and \
-       not extract_tar(archive_path, root):
-        raise Exception("Не удалось распаковать входной архив")
+    audit_dirs = list(extract_dir.rglob("audit"))
+    logger.info(f"Найдено audit директорий: {len(audit_dirs)}")
 
-    # рекурсивная распаковка
-    expand_archives(root)
+    for ad in audit_dirs:
+        log_files = list(ad.rglob("*.log"))
+        logger.info(f"В {ad} — {len(log_files)} логов")
 
-    # поиск папок audit
-    audit_dirs = list(root.rglob("audit"))
-    if not audit_dirs:
-        raise Exception("Папка audit не найдена")
+        for lf in log_files:
+            load_log_file(lf, conn)
 
-    for a in audit_dirs:
-        logger.info(f"Найдена audit: {a}")
+    conn.commit()
+    conn.close()
 
-    # сбор всех логов
-    log_files = []
-    for a in audit_dirs:
-        found = list(a.rglob("*.log"))
-        for lf in found:
-            logger.info(f"Найден лог: {lf}")
-        log_files += found
-
-    if not log_files:
-        raise Exception("Нет .log файлов")
-
-    # создаём Parquet writer
-    logger.info("Создаём Parquet writer")
-    writer = pq.ParquetWriter(
-        parquet_file,
-        schema=None,
-        use_dictionary=True,
-        compression="snappy"
-    )
-
-    schema_fields = set()
-
-    # потоковая обработка логов
-    logger.info("Старт потоковой обработки логов…")
-    for lf in log_files:
-        stream_log_to_parquet(lf, writer, schema_fields)
-
-    writer.close()
-
-    logger.info(f"Выгрузка завершена. Чтение Parquet: {parquet_file}")
-
-    # загружаем DataFrame
-    df = pd.read_parquet(parquet_file)
-
-    logger.info(f"Всего JSON строк в DataFrame: {len(df)}")
-
-    return df
+    logger.info("Готово. SQLite база заполнена.")
+    return db_path
