@@ -1,159 +1,153 @@
 import os
-import tempfile
 import shutil
-import zipfile
+import gzip
 import tarfile
+import zipfile
+import logging
 from pathlib import Path
 import pandas as pd
 import json
-import logging
 
 
 logger = logging.getLogger("audit_loader")
 
 
-SUPPORTED_ARCHIVES = {".zip", ".tar", ".gz", ".tgz"}
-
-
-def is_archive(path: Path):
-    if path.suffix.lower() in SUPPORTED_ARCHIVES:
-        return True
-    if path.name.endswith(".tar.gz"):
-        return True
-    return False
-
-
-def extract_archive(path: Path, to_dir: Path):
-    """Извлечение одного архива"""
-    logger.info(f"Распаковка архива: {path}")
-
-    suffix = path.suffix.lower()
-
-    if suffix == ".zip":
+def extract_zip(path: Path, to_dir: Path):
+    try:
         with zipfile.ZipFile(path, "r") as z:
             z.extractall(to_dir)
         return True
+    except:
+        return False
 
+
+def extract_tar(path: Path, to_dir: Path):
     try:
         with tarfile.open(path, "r:*") as t:
             t.extractall(to_dir)
         return True
     except:
-        logger.warning(f"Не удалось распаковать архив: {path}")
         return False
 
 
-def expand_all_archives(root_dir: Path):
+def extract_gzip_log(path: Path):
     """
-    Рекурсивно распаковывает ВСЕ архивы внутри root_dir
+    Распаковка audit-2025-09-14.log.gz → audit-2025-09-14.log
     """
-    logger.info("Начинаем рекурсивную распаковку вложенных архивов...")
+    logger.info(f"Распаковка gzip-файла: {path}")
 
-    extracted = True
-    while extracted:
-        extracted = False
+    out_path = path.with_suffix("")  # удаляем .gz
+    try:
+        with gzip.open(path, "rb") as gz_in:
+            with open(out_path, "wb") as f_out:
+                shutil.copyfileobj(gz_in, f_out)
+        return out_path
+    except Exception as e:
+        logger.error(f"Ошибка при распаковке gzip: {e}")
+        return None
 
-        for file in list(root_dir.rglob("*")):
-            if file.is_file() and is_archive(file):
-                logger.info(f"Найден вложенный архив: {file}")
 
-                target_dir = file.parent
+def expand_archives(work_dir: Path):
+    """
+    Распаковка ВСЕХ zip/tar/gz внутри рабочей директории.
+    """
+    extracted_any = True
+    while extracted_any:
+        extracted_any = False
 
-                if extract_archive(file, target_dir):
-                    logger.debug(f"Удаляем архив после распаковки: {file}")
-                    try:
-                        file.unlink()
-                    except:
-                        pass
-                    extracted = True
+        for file in list(work_dir.rglob("*")):
+            if not file.is_file():
+                continue
 
-    logger.info("Рекурсивная распаковка завершена.")
+            name = file.name.lower()
+
+            # ZIP
+            if name.endswith(".zip"):
+                logger.info(f"Найден zip: {file}")
+                if extract_zip(file, file.parent):
+                    file.unlink()
+                    extracted_any = True
+                continue
+
+            # TAR or TAR.GZ
+            if name.endswith(".tar") or name.endswith(".tar.gz") or name.endswith(".tgz"):
+                logger.info(f"Найден tar: {file}")
+                if extract_tar(file, file.parent):
+                    file.unlink()
+                    extracted_any = True
+                continue
+
+            # GZIP LOG → .log.gz
+            if name.endswith(".log.gz"):
+                new_file = extract_gzip_log(file)
+                if new_file is not None:
+                    file.unlink()
+                    extracted_any = True
+                continue
 
 
 def parse_json_from_log(path: Path):
-    """Извлекает JSON-объекты из обычного .log построчно."""
     logger.info(f"Чтение лог-файла: {path}")
 
     rows = []
-    count = 0
+    cnt = 0
 
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
+            
             try:
                 obj = json.loads(line)
                 rows.append(obj)
-                count += 1
+                cnt += 1
             except json.JSONDecodeError:
                 continue
 
-    logger.info(f" -> JSON-строк извлечено: {count}")
+    logger.info(f" -> JSON-строк извлечено: {cnt}")
     return rows
 
 
-def load_all_audit_logs(archive_path):
-    """
-    - разархивирует переданный архив
-    - рекурсивно распаковывает все вложенные архивы
-    - ищет ВСЕ папки audit
-    - собирает ВСЕ файлы .log
-    - вытаскивает из них JSON-строки
-    """
+def load_all_audit_logs(archive_path: str):
+    project_temp = Path("temp_extract")
+    project_temp.mkdir(exist_ok=True)
+
+    logger.info(f"Рабочая директория: {project_temp}")
+
     archive_path = Path(archive_path)
-    if not archive_path.exists():
-        raise FileNotFoundError(f"Архив не найден: {archive_path}")
 
-    temp_dir = Path(tempfile.mkdtemp(prefix="audit_extract_"))
-    logger.info(f"Создана временная директория: {temp_dir}")
+    if not extract_zip(archive_path, project_temp) and \
+       not extract_tar(archive_path, project_temp):
+        raise Exception("Не удалось распаковать главный архив")
 
-    try:
-        logger.info(f"Начальная распаковка: {archive_path}")
+    logger.info("Первичная распаковка завершена. Начинаем рекурсивную...")
 
-        # 1) первичная распаковка
-        if not extract_archive(archive_path, temp_dir):
-            raise SystemExit("Невозможно распаковать исходный архив.")
+    expand_archives(project_temp)
 
-        # 2) рекурсивная распаковка вложенных архивов
-        expand_all_archives(temp_dir)
+    logger.info("Поиск папок audit...")
+    audit_dirs = list(project_temp.rglob("audit"))
+    for d in audit_dirs:
+        logger.info(f"Найдена audit: {d}")
 
-        # 3) поиск папок audit
-        audit_dirs = list(temp_dir.rglob("audit"))
-        logger.info(f"Найдено папок audit: {len(audit_dirs)}")
+    if not audit_dirs:
+        raise Exception("Папки audit не найдены")
 
-        if not audit_dirs:
-            raise SystemExit("Папка audit не найдена.")
+    logger.info("Поиск .log файлов...")
+    log_files = []
+    for d in audit_dirs:
+        files = list(d.rglob("*.log"))
+        for f in files:
+            logger.info(f"Найден лог-файл: {f}")
+        log_files.extend(files)
 
-        for ad in audit_dirs:
-            logger.debug(f" -> audit: {ad}")
+    if not log_files:
+        raise Exception(" *.log файлов нет")
 
-        # 4) поиск .log файлов
-        log_files = []
-        for ad in audit_dirs:
-            found = list(ad.rglob("*.log"))
-            logger.info(f"В {ad} найдено .log файлов: {len(found)}")
+    all_rows = []
+    for lf in log_files:
+        all_rows.extend(parse_json_from_log(lf))
 
-            for lf in found:
-                logger.debug(f" -> log: {lf}")
+    logger.info(f"Всего JSON-строк собрано: {len(all_rows)}")
 
-            log_files += found
-
-        if not log_files:
-            raise SystemExit("Нет .log файлов.")
-
-        # 5) читаем все логи
-        all_rows = []
-        for lf in log_files:
-            all_rows.extend(parse_json_from_log(lf))
-
-        logger.info(f"Всего JSON-строк во всех логах: {len(all_rows)}")
-
-        if not all_rows:
-            raise SystemExit("В логах нет JSON-строк.")
-
-        return pd.DataFrame(all_rows)
-
-    finally:
-        logger.info(f"Удаляем временную директорию: {temp_dir}")
-        shutil.rmtree(temp_dir, ignore_errors=True)
+    return pd.DataFrame(all_rows)
