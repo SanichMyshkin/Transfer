@@ -9,30 +9,29 @@ import json
 
 
 def _extract_if_archive(src_path, dst_dir):
-    """Распаковка zip/tar.gz/tgz/7z и т.д. в dst_dir"""
+    """Распаковка zip/tar.gz/tgz."""
     suffix = src_path.suffix.lower()
 
-    # zip
     if suffix == ".zip":
         with zipfile.ZipFile(src_path, "r") as z:
             z.extractall(dst_dir)
         return True
 
-    # tar / tar.gz / tgz
     if suffix in {".tar", ".gz", ".tgz"} or src_path.name.endswith(".tar.gz"):
         try:
             with tarfile.open(src_path, "r:*") as t:
                 t.extractall(dst_dir)
             return True
-        except tarfile.TarError:
+        except:
             return False
 
     return False
 
 
-def _recursive_extract(root, work_dir):
+def _recursive_extract(work_dir):
     """
-    Находит ВСЕ архивы в work_dir, извлекает, пока архивов не останется.
+    Извлекает ВСЕ архивы внутри work_dir до тех пор,
+    пока архивов не останется.
     """
     extracted = True
     while extracted:
@@ -40,7 +39,6 @@ def _recursive_extract(root, work_dir):
         for path in list(Path(work_dir).rglob("*")):
             if path.is_file():
                 if _extract_if_archive(path, path.parent):
-                    # удаляем сам архив, он больше не нужен
                     try:
                         path.unlink()
                     except:
@@ -48,28 +46,34 @@ def _recursive_extract(root, work_dir):
                     extracted = True
 
 
-def _load_jsonl(fname):
-    """Читает JSONL безопасно"""
+def _load_json_from_log(fname):
+    """
+    Читает обычный .log, в каждой строке ищет JSON.
+    Некорректные строки пропускаются.
+    """
     rows = []
-    with open(fname, "r", encoding="utf-8") as f:
+    with open(fname, "r", encoding="utf-8", errors="ignore") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
+            # пытаемся распарсить json внутри строки
             try:
-                rows.append(json.loads(line))
+                obj = json.loads(line)
+                rows.append(obj)
             except json.JSONDecodeError:
-                pass
+                # строка не JSON — пропускаем
+                continue
     return rows
 
 
 def load_all_audit_logs(archive_path):
     """
-    Главная функция:
-    - распаковывает архив любого уровня вложенности
+    - распаковывает архив любой вложенности
     - ищет папку audit
-    - собирает все *.jsonl файлы
-    - возвращает единый DataFrame (сырые строки)
+    - собирает ВСЕ *.log файлы
+    - вытаскивает из них строки, содержащие JSON
+    - формирует единый DataFrame
     """
     archive_path = Path(archive_path)
     if not archive_path.exists():
@@ -78,36 +82,35 @@ def load_all_audit_logs(archive_path):
     tmpdir = tempfile.mkdtemp(prefix="audit_extract_")
 
     try:
-        # 1) распаковываем верхний архив в tmpdir
+        # 1) первичная распаковка
         if not _extract_if_archive(archive_path, tmpdir):
-            raise ValueError(f"Формат архива не поддерживается: {archive_path}")
+            raise SystemExit("Не удалось распаковать архив.")
 
-        # 2) рекурсивно распаковываем всё, что есть внутри
-        _recursive_extract(archive_path, tmpdir)
+        # 2) рекурсивная распаковка
+        _recursive_extract(tmpdir)
 
-        # 3) ищем папку audit любой глубины
+        # 3) ищем ВСЕ директории audit
         audits = list(Path(tmpdir).rglob("audit"))
         if not audits:
-            raise SystemExit("Папка audit внутри архива не найдена.")
+            raise SystemExit("Папка audit не найдена в архиве.")
 
-        # 4) собираем JSONL-файлы
+        # 4) собираем все *.log
         log_files = []
         for audit_dir in audits:
-            log_files += list(audit_dir.rglob("*.jsonl"))
+            log_files += list(audit_dir.rglob("*.log"))
 
         if not log_files:
-            raise SystemExit("В папке audit нет JSONL-файлов.")
+            raise SystemExit("В папке audit нет .log файлов.")
 
-        # 5) читаем все логи в общий список
+        # 5) читаем все строки из всех логов
         all_rows = []
         for lf in log_files:
-            all_rows.extend(_load_jsonl(lf))
+            all_rows.extend(_load_json_from_log(lf))
 
         if not all_rows:
-            raise SystemExit("JSONL-файлы пусты.")
+            raise SystemExit("В .log-файлах нет JSON-строк.")
 
         return pd.DataFrame(all_rows)
 
     finally:
-        # можно оставить архив после дебага — закомментируй строку ниже
         shutil.rmtree(tmpdir, ignore_errors=True)
