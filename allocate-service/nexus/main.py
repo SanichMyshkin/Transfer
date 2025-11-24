@@ -1,8 +1,8 @@
 import pandas as pd
 import json
+import logging
 from datetime import timedelta
 from log_loader import load_all_audit_logs
-
 
 """
 Анализ логов Nexus: группировка обращений пользователей по репозиториям.
@@ -34,8 +34,24 @@ merge_gap : timedelta
 """
 
 
+# ============================================
+# ЛОГИРОВАНИЕ
+# ============================================
+
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+
+log = logging.getLogger("main")
+
+
+"""
+Анализ логов Nexus: группировка обращений пользователей по репозиториям.
+"""
+
+
 def parse_log_record(d: dict):
-    """Приведение сырой записи (dict) к твоему формату или пропуск"""
+    """Приведение сырой записи (dict) к формату или пропуск"""
     initiator = d.get("initiator", "")
 
     # Пропускаем системные задания Nexus (*TASK, system, scheduled и т.п.)
@@ -59,12 +75,13 @@ def parse_log_record(d: dict):
 # 2. Загрузка всех логов из архива
 # ============================================
 
-print("Загрузка логов из архива...")
+log.info("Начинаем загрузку логов из архива")
 
-# вместо "trash/nexus.jsonl" — указываешь архив
 df_raw = load_all_audit_logs("path/to/big_archive.zip")
 
-# Парсим все записи аналогично твоей функции parse_log_line
+log.info(f"Загружено сырых записей: {len(df_raw)}")
+
+# Парсим записи
 records = []
 for raw in df_raw.to_dict(orient="records"):
     parsed = parse_log_record(raw)
@@ -72,32 +89,50 @@ for raw in df_raw.to_dict(orient="records"):
         records.append(parsed)
 
 df = pd.DataFrame(records)
+log.info(f"После фильтрации валидных записей: {len(df)}")
+
 if df.empty:
-    raise SystemExit("Не найдено ни одной валидной записи.")
+    log.error("Не найдено ни одной валидной записи")
+    raise SystemExit("Нет данных")
 
 
 # ============================================
 # 3. Приведение временных меток
 # ============================================
 
+log.info("Преобразуем timestamp")
+
 df["timestamp"] = pd.to_datetime(
     df["timestamp"], format="%Y-%m-%d %H:%M:%S,%f%z", errors="coerce"
 )
+
+before = len(df)
 df = df.dropna(subset=["timestamp"])
+after = len(df)
+
+log.info(f"Удалено строк с некорректным timestamp: {before - after}")
 
 # Разбивка initiator на username / ip
+log.info("Извлекаем username и IP")
+
 df[["username", "ip"]] = (
     df["initiator"].astype(str).str.extract(r"^(?:(.+?)/)?(\d+\.\d+\.\d+\.\d+)$")
 )
+
 df["username"] = df["username"].fillna("anonymous")
+
 df = df[~df["username"].str.contains(r"\*TASK", na=False)]
 
 df = df.sort_values(by=["initiator", "repo", "timestamp"])
+
+log.info(f"Готово: после сортировки и очистки осталось {len(df)} строк")
 
 
 # ============================================
 # 4. Формирование первичных обращений
 # ============================================
+
+log.info("Формируем первичные сессии")
 
 max_interval = timedelta(minutes=5)
 df["gap"] = (
@@ -118,10 +153,14 @@ sessions = (
     .reset_index()
 )
 
+log.info(f"Получено первичных сессий: {len(sessions)}")
+
 
 # ============================================
-# 5. Объединение коротких подряд сессий
+# 5. Объединение коротких подряд идущих сессий
 # ============================================
+
+log.info("Объединяем короткие сессии")
 
 sessions = sessions.sort_values(by=["initiator", "repo", "start_time"])
 merge_gap = timedelta(minutes=1)
@@ -145,15 +184,19 @@ sessions = (
     .reset_index()
 )
 
+log.info(f"Сессий после объединения: {len(sessions)}")
+
 
 # ============================================
-# 6. Определение идентификатора пользователя
+# 6. Идентификатор пользователя
 # ============================================
+
+log.info("Определяем user_identity")
 
 sessions["user_identity"] = sessions.apply(
-    lambda r: (
-        r["username"] if r["username"] not in {"anonymous", "*UNKNOWN"} else r["ip"]
-    ),
+    lambda r: r["username"]
+    if r["username"] not in {"anonymous", "*UNKNOWN"}
+    else r["ip"],
     axis=1,
 )
 
@@ -161,6 +204,8 @@ sessions["user_identity"] = sessions.apply(
 # ============================================
 # 7. Сводка по репозиториям
 # ============================================
+
+log.info("Строим сводку по репозиториям")
 
 repo_stats = (
     sessions.groupby("repo")
@@ -175,6 +220,8 @@ repo_stats = (
 # ============================================
 # 8. Пользователи по каждому репозиторию
 # ============================================
+
+log.info("Формируем перечень пользователей по каждому репозиторию")
 
 
 def combine_users_with_ips(group):
@@ -208,6 +255,8 @@ repo_users = (
 # 9. Пользователи и IP
 # ============================================
 
+log.info("Готовим список пользователей и IP")
+
 user_ips = (
     sessions.groupby("username")["ip"]
     .apply(lambda x: sorted([ip for ip in set(x) if pd.notna(ip)]))
@@ -228,8 +277,10 @@ users_anonymous_flat = pd.DataFrame(anon_rows)
 
 
 # ============================================
-# 10. Убираем временную зону для Excel
+# 10. Убираем временную зону
 # ============================================
+
+log.info("Удаляем временную зону")
 
 for col in ["start_time", "end_time"]:
     if hasattr(sessions[col].dtype, "tz"):
@@ -241,10 +292,10 @@ for col in ["start_time", "end_time"]:
 # ============================================
 
 output_file = "nexus_report.xlsx"
+log.info(f"Создаём Excel-файл: {output_file}")
 
 
 def prepend_instruction(df, text_lines):
-    """Добавляет строки-инструкции перед таблицей, без смещения столбцов"""
     blank_row = {col: None for col in df.columns}
     instruction_rows = []
     for line in text_lines:
@@ -256,40 +307,45 @@ def prepend_instruction(df, text_lines):
 
 
 with pd.ExcelWriter(output_file, engine="xlsxwriter") as writer:
-    # --- 1. Сводка по репозиториям ---
-    text_repo = [
-        "Эта таблица показывает, сколько обращений было к каждому репозиторию.",
-        "Поля: total_requests — количество обращений, total_users — уникальных пользователей.",
-        "",
-    ]
-    df_repo = prepend_instruction(repo_stats, text_repo)
+    df_repo = prepend_instruction(
+        repo_stats,
+        [
+            "Эта таблица показывает, сколько обращений было к каждому репозиторию.",
+            "Поля: total_requests — количество обращений, total_users — уникальных пользователей.",
+            "",
+        ],
+    )
     df_repo.to_excel(writer, sheet_name="Сводка по репозиториям", index=False)
 
-    # --- 2. Пользователи по каждому репозиторию ---
-    text_repo_users = [
-        "Здесь видно, кто именно обращался к каждому репозиторию.",
-        "Формат: username (ip). Если только IP — пользователь анонимный.",
-        "",
-    ]
-    df_repo_users = prepend_instruction(repo_users, text_repo_users)
+    df_repo_users = prepend_instruction(
+        repo_users,
+        [
+            "Пользователи обращавшиеся к репозиторию.",
+            "",
+        ],
+    )
     df_repo_users.to_excel(
         writer, sheet_name="Пользователи по репозиторию", index=False
     )
 
-    # --- 3. Обычные пользователи ---
-    text_normal = [
-        "Список зарегистрированных пользователей и IP-адресов, с которых они подключались.",
-        "",
-    ]
-    df_normal = prepend_instruction(users_normal, text_normal)
+    df_normal = prepend_instruction(
+        users_normal,
+        [
+            "Зарегистрированные пользователи и их IP.",
+            "",
+        ],
+    )
     df_normal.to_excel(writer, sheet_name="Обычные пользователи", index=False)
 
-    # --- 4. Анонимные пользователи ---
-    text_anon = ["Анонимные подключения без логина. Каждый IP — отдельная строка.", ""]
-    df_anon = prepend_instruction(users_anonymous_flat, text_anon)
+    df_anon = prepend_instruction(
+        users_anonymous_flat,
+        [
+            "Анонимные пользователи (по IP).",
+            "",
+        ],
+    )
     df_anon.to_excel(writer, sheet_name="Анонимные пользователи", index=False)
 
-    # --- Автоширина ---
     all_sheets = {
         "Сводка по репозиториям": df_repo,
         "Пользователи по репозиторию": df_repo_users,
@@ -303,5 +359,4 @@ with pd.ExcelWriter(output_file, engine="xlsxwriter") as writer:
             max_len = max(len(str(col)), df_tmp[col].astype(str).map(len).max()) + 2
             worksheet.set_column(i, i, max_len)
 
-
-print(f"\nГотово: {output_file}")
+log.info("Готово: Excel файл сформирован")
