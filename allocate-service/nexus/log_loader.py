@@ -7,10 +7,16 @@ import logging
 from pathlib import Path
 import pandas as pd
 import json
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 
 logger = logging.getLogger("audit_loader")
 
+
+# ============================================================
+# Распаковка архивов
+# ============================================================
 
 def extract_zip(path: Path, to_dir: Path):
     try:
@@ -31,25 +37,22 @@ def extract_tar(path: Path, to_dir: Path):
 
 
 def extract_gzip_log(path: Path):
-    """
-    Распаковка audit-2025-09-14.log.gz → audit-2025-09-14.log
-    """
-    logger.info(f"Распаковка gzip-файла: {path}")
-
-    out_path = path.with_suffix("")  # удаляем .gz
+    out_path = path.with_suffix("")  # .log.gz → .log
     try:
+        logger.info(f"Распаковка gzip: {path}")
         with gzip.open(path, "rb") as gz_in:
             with open(out_path, "wb") as f_out:
                 shutil.copyfileobj(gz_in, f_out)
         return out_path
     except Exception as e:
-        logger.error(f"Ошибка при распаковке gzip: {e}")
+        logger.error(f"Ошибка gzip: {path} → {e}")
         return None
 
 
 def expand_archives(work_dir: Path):
     """
-    Распаковка ВСЕХ zip/tar/gz внутри рабочей директории.
+    Распаковывает ВСЕ архивы до тех пор,
+    пока они встречаются.
     """
     extracted_any = True
     while extracted_any:
@@ -61,93 +64,147 @@ def expand_archives(work_dir: Path):
 
             name = file.name.lower()
 
-            # ZIP
             if name.endswith(".zip"):
-                logger.info(f"Найден zip: {file}")
+                logger.info(f"ZIP найден: {file}")
                 if extract_zip(file, file.parent):
                     file.unlink()
                     extracted_any = True
                 continue
 
-            # TAR or TAR.GZ
             if name.endswith(".tar") or name.endswith(".tar.gz") or name.endswith(".tgz"):
-                logger.info(f"Найден tar: {file}")
+                logger.info(f"TAR найден: {file}")
                 if extract_tar(file, file.parent):
                     file.unlink()
                     extracted_any = True
                 continue
 
-            # GZIP LOG → .log.gz
             if name.endswith(".log.gz"):
                 new_file = extract_gzip_log(file)
-                if new_file is not None:
+                if new_file:
                     file.unlink()
                     extracted_any = True
                 continue
 
 
-def parse_json_from_log(path: Path):
-    logger.info(f"Чтение лог-файла: {path}")
+# ============================================================
+# Стриминговый парсер JSON → запись в Parquet
+# ============================================================
 
-    rows = []
-    cnt = 0
+def safe_parse_json(line: str):
+    """Безопасный парс JSON."""
+    line = line.strip()
+
+    # быстрый тест на JSON
+    if "{" not in line or "}" not in line:
+        return None
+
+    # ограничение на размер строки
+    if len(line) > 5_000_000:  # 5MB
+        return None
+
+    try:
+        return json.loads(line)
+    except Exception:
+        return None
+
+
+def stream_log_to_parquet(path: Path, writer):
+    """
+    Читает лог-файл построчно и добавляет JSON записи в Parquet writer.
+    """
+    logger.info(f"Чтение лога: {path}")
+
+    batch = []
+    batch_size = 10_000  # каждые 10k строк сбрасываем в файл
+    total = 0
 
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            
-            try:
-                obj = json.loads(line)
-                rows.append(obj)
-                cnt += 1
-            except json.JSONDecodeError:
+        for raw_line in f:
+            obj = safe_parse_json(raw_line)
+            if obj is None:
                 continue
 
-    logger.info(f" -> JSON-строк извлечено: {cnt}")
-    return rows
+            batch.append(obj)
+            total += 1
 
+            if len(batch) >= batch_size:
+                table = pa.Table.from_pylist(batch)
+                writer.write_table(table)
+                batch.clear()
+
+    # последний батч
+    if batch:
+        table = pa.Table.from_pylist(batch)
+        writer.write_table(table)
+
+    logger.info(f" → JSON записей добавлено: {total}")
+
+
+# ============================================================
+# Основная функция
+# ============================================================
 
 def load_all_audit_logs(archive_path: str):
-    project_temp = Path("temp_extract")
-    project_temp.mkdir(exist_ok=True)
-
-    logger.info(f"Рабочая директория: {project_temp}")
-
+    """
+    Обрабатывает все архивы, все audit/, все .log,
+    и сразу пишет всё в Parquet файл.
+    """
     archive_path = Path(archive_path)
 
-    if not extract_zip(archive_path, project_temp) and \
-       not extract_tar(archive_path, project_temp):
+    work_dir = Path("temp_extract")
+    if work_dir.exists():
+        shutil.rmtree(work_dir)
+    work_dir.mkdir()
+
+    parsed_dir = work_dir / "parsed"
+    parsed_dir.mkdir()
+
+    parquet_file = parsed_dir / "records.parquet"
+
+    logger.info(f"Рабочая директория: {work_dir}")
+
+    # первичная распаковка
+    if not extract_zip(archive_path, work_dir) and \
+       not extract_tar(archive_path, work_dir):
         raise Exception("Не удалось распаковать главный архив")
 
-    logger.info("Первичная распаковка завершена. Начинаем рекурсивную...")
+    expand_archives(work_dir)
 
-    expand_archives(project_temp)
+    # Поиск папок audit
+    audits = list(work_dir.rglob("audit"))
+    if not audits:
+        raise Exception("Папка audit не найдена")
+    for a in audits:
+        logger.info(f"audit найден: {a}")
 
-    logger.info("Поиск папок audit...")
-    audit_dirs = list(project_temp.rglob("audit"))
-    for d in audit_dirs:
-        logger.info(f"Найдена audit: {d}")
-
-    if not audit_dirs:
-        raise Exception("Папки audit не найдены")
-
-    logger.info("Поиск .log файлов...")
+    # поиск лог файлов
     log_files = []
-    for d in audit_dirs:
-        files = list(d.rglob("*.log"))
-        for f in files:
-            logger.info(f"Найден лог-файл: {f}")
-        log_files.extend(files)
+    for a in audits:
+        for lf in a.rglob("*.log"):
+            logger.info(f"Лог найден: {lf}")
+            log_files.append(lf)
 
     if not log_files:
-        raise Exception(" *.log файлов нет")
+        raise Exception("Нет .log файлов")
 
-    all_rows = []
+    # создаём writer
+    logger.info("Создаём Parquet writer")
+    writer = pq.ParquetWriter(
+        parquet_file,
+        schema=pa.schema([]),  # schema определяется автоматически при первой записи
+        use_dictionary=True
+    )
+
+    # потоковая обработка
     for lf in log_files:
-        all_rows.extend(parse_json_from_log(lf))
+        stream_log_to_parquet(lf, writer)
 
-    logger.info(f"Всего JSON-строк собрано: {len(all_rows)}")
+    writer.close()
 
-    return pd.DataFrame(all_rows)
+    logger.info(f"Стриминговая выгрузка завершена. Файл: {parquet_file}")
+
+    # теперь возвращаем уже parquet → df
+    logger.info("Читаем Parquet в DataFrame")
+    df = pd.read_parquet(parquet_file)
+
+    return df
