@@ -1,6 +1,7 @@
 import pandas as pd
 import json
 from datetime import timedelta
+from log_loader import load_all_audit_logs
 
 
 """
@@ -33,53 +34,58 @@ merge_gap : timedelta
 """
 
 
-# === Функции ===
-def parse_log_line(line: str):
-    """Безопасный парсинг одной строки JSONL, игнорирует служебные *TASK-записи"""
-    try:
-        d = json.loads(line)
+def parse_log_record(d: dict):
+    """Приведение сырой записи (dict) к твоему формату или пропуск"""
+    initiator = d.get("initiator", "")
 
-        initiator = d.get("initiator", "")
-        # Пропускаем системные задания Nexus (*TASK, system, scheduled и т.п.)
-        if isinstance(initiator, str) and "task" in initiator.lower():
-            return None
-        if d.get("domain") == "tasks" or d.get("type") == "scheduled":
-            return None
-
-        repo_name = d.get("attributes", {}).get("repository.name") or d.get(
-            "attributes", {}
-        ).get("repositoryName")
-
-        return {
-            "timestamp": d.get("timestamp"),
-            "initiator": initiator,
-            "repo": repo_name,
-        }
-
-    except json.JSONDecodeError:
+    # Пропускаем системные задания Nexus (*TASK, system, scheduled и т.п.)
+    if isinstance(initiator, str) and "task" in initiator.lower():
+        return None
+    if d.get("domain") == "tasks" or d.get("type") == "scheduled":
         return None
 
+    repo_name = d.get("attributes", {}).get("repository.name") or d.get(
+        "attributes", {}
+    ).get("repositoryName")
 
-def load_logs(filename):
-    """Загрузка JSONL файла и преобразование в DataFrame"""
-    with open(filename, "r", encoding="utf-8") as f:
-        records = [parse_log_line(line.strip()) for line in f if line.strip()]
-    df = pd.DataFrame([r for r in records if r])
-    if df.empty:
-        raise SystemExit(
-            f"Файл {filename} пуст или не содержит корректных JSON-записей."
-        )
-    return df
+    return {
+        "timestamp": d.get("timestamp"),
+        "initiator": initiator,
+        "repo": repo_name,
+    }
 
 
-# === 1. Чтение и подготовка ===
-df = load_logs("trash/nexus.jsonl")
+# ============================================
+# 2. Загрузка всех логов из архива
+# ============================================
+
+print("Загрузка логов из архива...")
+
+# вместо "trash/nexus.jsonl" — указываешь архив
+df_raw = load_all_audit_logs("path/to/big_archive.zip")
+
+# Парсим все записи аналогично твоей функции parse_log_line
+records = []
+for raw in df_raw.to_dict(orient="records"):
+    parsed = parse_log_record(raw)
+    if parsed:
+        records.append(parsed)
+
+df = pd.DataFrame(records)
+if df.empty:
+    raise SystemExit("Не найдено ни одной валидной записи.")
+
+
+# ============================================
+# 3. Приведение временных меток
+# ============================================
 
 df["timestamp"] = pd.to_datetime(
     df["timestamp"], format="%Y-%m-%d %H:%M:%S,%f%z", errors="coerce"
 )
 df = df.dropna(subset=["timestamp"])
 
+# Разбивка initiator на username / ip
 df[["username", "ip"]] = (
     df["initiator"].astype(str).str.extract(r"^(?:(.+?)/)?(\d+\.\d+\.\d+\.\d+)$")
 )
@@ -88,7 +94,11 @@ df = df[~df["username"].str.contains(r"\*TASK", na=False)]
 
 df = df.sort_values(by=["initiator", "repo", "timestamp"])
 
-# === 2. Формирование первичных обращений ===
+
+# ============================================
+# 4. Формирование первичных обращений
+# ============================================
+
 max_interval = timedelta(minutes=5)
 df["gap"] = (
     (df["initiator"] != df["initiator"].shift())
@@ -108,14 +118,20 @@ sessions = (
     .reset_index()
 )
 
-# === 3. Объединение коротких подряд сессий ===
+
+# ============================================
+# 5. Объединение коротких подряд сессий
+# ============================================
+
 sessions = sessions.sort_values(by=["initiator", "repo", "start_time"])
 merge_gap = timedelta(minutes=1)
+
 sessions["merge_gap"] = (
     (sessions["initiator"] != sessions["initiator"].shift())
     | (sessions["repo"] != sessions["repo"].shift())
     | ((sessions["start_time"] - sessions["end_time"].shift()) > merge_gap)
 )
+
 sessions["merged_session_id"] = sessions["merge_gap"].cumsum()
 
 sessions = (
@@ -129,7 +145,11 @@ sessions = (
     .reset_index()
 )
 
-# === 4. Идентификатор пользователя ===
+
+# ============================================
+# 6. Определение идентификатора пользователя
+# ============================================
+
 sessions["user_identity"] = sessions.apply(
     lambda r: (
         r["username"] if r["username"] not in {"anonymous", "*UNKNOWN"} else r["ip"]
@@ -137,7 +157,11 @@ sessions["user_identity"] = sessions.apply(
     axis=1,
 )
 
-# === 5. Сводка по репозиториям ===
+
+# ============================================
+# 7. Сводка по репозиториям
+# ============================================
+
 repo_stats = (
     sessions.groupby("repo")
     .agg(
@@ -148,7 +172,11 @@ repo_stats = (
 )
 
 
-# === 6. Пользователи по каждому репозиторию ===
+# ============================================
+# 8. Пользователи по каждому репозиторию
+# ============================================
+
+
 def combine_users_with_ips(group):
     mapping = {}
     for _, row in group.iterrows():
@@ -175,7 +203,11 @@ repo_users = (
     .reset_index(name="users")
 )
 
-# === 7. Пользователи и IP ===
+
+# ============================================
+# 9. Пользователи и IP
+# ============================================
+
 user_ips = (
     sessions.groupby("username")["ip"]
     .apply(lambda x: sorted([ip for ip in set(x) if pd.notna(ip)]))
@@ -187,19 +219,27 @@ anon_names = {"anonymous", "*UNKNOWN"}
 users_normal = user_ips[~user_ips["username"].isin(anon_names)]
 users_anonymous = user_ips[user_ips["username"].isin(anon_names)]
 
-# Преобразуем анонимов: по одному IP на строку
 anon_rows = []
 for _, row in users_anonymous.iterrows():
     for ip in row["ip_list"]:
         anon_rows.append({"username": row["username"], "ip": ip})
+
 users_anonymous_flat = pd.DataFrame(anon_rows)
 
-# === Убираем временную зону (Excel не поддерживает tz-aware) ===
+
+# ============================================
+# 10. Убираем временную зону для Excel
+# ============================================
+
 for col in ["start_time", "end_time"]:
-    if isinstance(sessions[col].dtype, pd.DatetimeTZDtype):
+    if hasattr(sessions[col].dtype, "tz"):
         sessions[col] = sessions[col].dt.tz_localize(None)
 
-# === 8. Формирование Excel ===
+
+# ============================================
+# 11. Экспорт в Excel
+# ============================================
+
 output_file = "nexus_report.xlsx"
 
 
@@ -249,7 +289,7 @@ with pd.ExcelWriter(output_file, engine="xlsxwriter") as writer:
     df_anon = prepend_instruction(users_anonymous_flat, text_anon)
     df_anon.to_excel(writer, sheet_name="Анонимные пользователи", index=False)
 
-    # --- Автоматическая подгонка ширины ---
+    # --- Автоширина ---
     all_sheets = {
         "Сводка по репозиториям": df_repo,
         "Пользователи по репозиторию": df_repo_users,
@@ -263,4 +303,5 @@ with pd.ExcelWriter(output_file, engine="xlsxwriter") as writer:
             max_len = max(len(str(col)), df_tmp[col].astype(str).map(len).max()) + 2
             worksheet.set_column(i, i, max_len)
 
-print(f"\n✅ Отчёт успешно сохранён: {output_file}")
+
+print(f"\nГотово: {output_file}")
