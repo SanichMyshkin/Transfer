@@ -1,4 +1,3 @@
-# main.py
 import os
 import time
 import logging
@@ -36,6 +35,7 @@ requests.packages.urllib3.disable_warnings()
 session = requests.Session()
 session.verify = False
 
+
 def login_cookie():
     r = session.post(
         f"{GRAFANA_URL}/login",
@@ -43,6 +43,7 @@ def login_cookie():
     )
     r.raise_for_status()
     time.sleep(SLEEP_BETWEEN_CALLS)
+
 
 def switch_org(org_id):
     r = session.post(f"{GRAFANA_URL}/api/user/using/{org_id}")
@@ -52,11 +53,13 @@ def switch_org(org_id):
     time.sleep(SLEEP_AFTER_SWITCH)
     return True
 
+
 def get_org_name(org_id):
     r = session.get(f"{GRAFANA_URL}/api/orgs/{org_id}")
     if r.status_code != 200:
         return f"ORG_{org_id}"
     return r.json().get("name") or f"ORG_{org_id}"
+
 
 def get_users_in_org(org_id):
     r = session.get(f"{GRAFANA_URL}/api/orgs/{org_id}/users")
@@ -66,11 +69,13 @@ def get_users_in_org(org_id):
     time.sleep(SLEEP_BETWEEN_CALLS)
     return r.json()
 
+
 def get_folders():
     r = session.get(f"{GRAFANA_URL}/api/folders", params={"limit": 5000})
     r.raise_for_status()
     time.sleep(SLEEP_BETWEEN_CALLS)
     return r.json()
+
 
 def get_dashboards_in_folder(fid):
     r = session.get(
@@ -81,6 +86,7 @@ def get_dashboards_in_folder(fid):
     time.sleep(SLEEP_BETWEEN_CALLS)
     return r.json()
 
+
 def get_all_dashboards_raw():
     r = session.get(
         f"{GRAFANA_URL}/api/search",
@@ -90,23 +96,49 @@ def get_all_dashboards_raw():
     time.sleep(SLEEP_BETWEEN_CALLS)
     return r.json()
 
+
 def get_root_dashboards():
     all_dash = get_all_dashboards_raw()
     return [d for d in all_dash if d.get("folderId") in (0, None)]
 
-def get_dashboard_panels(uid):
-    r = session.get(f"{GRAFANA_URL}/api/dashboards/uid/{uid}")
+
+# ------------------------------------------------
+#  ДОБАВЛЕНА ВАЛИДАЦИЯ И ПОДРОБНОЕ ЛОГИРОВАНИЕ
+# ------------------------------------------------
+def get_dashboard_panels(uid, origininfo=""):
+    url = f"{GRAFANA_URL}/api/dashboards/uid/{uid}"
+    r = session.get(url)
+
+    if r.status_code == 404:
+        logger.warning(
+            f"Dashboard UID '{uid}' not found (404). "
+            f"Origin: {origininfo}. URL: {url}"
+        )
+        return 0
+
+    if r.status_code == 401:
+        logger.warning(
+            f"Unauthorized (401) for dashboard UID '{uid}'. "
+            f"Origin: {origininfo}. URL: {url}"
+        )
+        return 0
+
     r.raise_for_status()
     time.sleep(SLEEP_BETWEEN_CALLS)
-    dash = r.json()["dashboard"]
+
+    dash = r.json().get("dashboard", {})
     c = 0
+
     if "panels" in dash:
         c += len(dash["panels"])
+
     if "rows" in dash:
         for row in dash["rows"]:
             if "panels" in row:
                 c += len(row["panels"])
+
     return c
+
 
 def get_all_grafana_users():
     users = []
@@ -126,6 +158,11 @@ def get_all_grafana_users():
         page += 1
         time.sleep(SLEEP_BETWEEN_CALLS)
     return users
+
+
+# ------------------------------------------------
+# ОСНОВНОЙ КОД
+# ------------------------------------------------
 
 login_cookie()
 
@@ -154,6 +191,7 @@ rows_users = []
 rows_folders = []
 rows_dashboards = []
 rows_orgs = []
+
 
 for org_id in tqdm(org_ids, desc="Организации", ncols=100):
     owner_entries = owners_clean.get(org_id, [])
@@ -212,6 +250,7 @@ for org_id in tqdm(org_ids, desc="Организации", ncols=100):
     dashboards_total = 0
     panels_total = 0
 
+    # -------- Folders dashboards --------
     for f in folders:
         fid = f["id"]
         fname = f["title"]
@@ -228,9 +267,18 @@ for org_id in tqdm(org_ids, desc="Организации", ncols=100):
         )
 
         for d in dashboards:
-            uid = d["uid"]
-            title = d["title"]
-            panels = get_dashboard_panels(uid)
+            uid = d.get("uid")
+            title = d.get("title")
+
+            logger.info(
+                f"Checking dashboard from folder '{fname}' (ID={fid}): "
+                f"UID='{uid}', title='{title}'"
+            )
+
+            panels = get_dashboard_panels(
+                uid,
+                origininfo=f"folder '{fname}' (ID={fid}), dashboard '{title}'"
+            )
             panels_total += panels
 
             rows_dashboards.append(
@@ -244,13 +292,22 @@ for org_id in tqdm(org_ids, desc="Организации", ncols=100):
                 }
             )
 
+    # -------- ROOT dashboards --------
     root_dash = get_root_dashboards()
     dashboards_total += len(root_dash)
 
     for d in root_dash:
-        uid = d["uid"]
-        title = d["title"]
-        panels = get_dashboard_panels(uid)
+        uid = d.get("uid")
+        title = d.get("title")
+
+        logger.info(
+            f"Checking ROOT dashboard: UID='{uid}', title='{title}'"
+        )
+
+        panels = get_dashboard_panels(
+            uid,
+            origininfo=f"ROOT dashboard '{title}'"
+        )
         panels_total += panels
 
         rows_dashboards.append(
@@ -274,6 +331,7 @@ for org_id in tqdm(org_ids, desc="Организации", ncols=100):
             "panels_total": panels_total,
         }
     )
+
 
 df_all_users = pd.DataFrame(rows_all_users)
 df_users = pd.DataFrame(rows_users)
