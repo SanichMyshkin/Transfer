@@ -83,18 +83,23 @@ def get_ncloc(project_key):
 
 def get_issues_count(project_key):
     url = f"{SONAR_URL}/api/issues/search"
-    params = {"projectKeys": project_key, "ps": 1}
+    params = {"componentKeys": project_key, "ps": 1}
     r = session.get(url, params=params, verify=False)
     r.raise_for_status()
     return r.json().get("total", 0)
 
 
-def get_analysis_count(project_key):
+def get_analysis_info(project_key):
     url = f"{SONAR_URL}/api/project_analyses/search"
     params = {"projects": project_key}
     r = session.get(url, params=params, verify=False)
     r.raise_for_status()
-    return len(r.json().get("analyses", []))
+    analyses = r.json().get("analyses", [])
+
+    count = len(analyses)
+    last_date = analyses[0].get("date") if analyses else None
+
+    return count, last_date
 
 
 def write_report(users, projects, filename="sonar_report.xlsx"):
@@ -124,7 +129,13 @@ def write_report(users, projects, filename="sonar_report.xlsx"):
         ws_users.write(row, 11, u.get("managed"))
 
     ws_projects = workbook.add_worksheet("projects")
-    headers_projects = ["project_name", "ncloc", "issues_total", "analyses_count"]
+    headers_projects = [
+        "project_name",
+        "ncloc",
+        "issues_total",
+        "analyses_count",
+        "last_analysis_date"
+    ]
     for col, h in enumerate(headers_projects):
         ws_projects.write(0, col, h)
 
@@ -138,13 +149,14 @@ def write_report(users, projects, filename="sonar_report.xlsx"):
 
         ncloc = get_ncloc(key)
         issues_total = get_issues_count(key)
-        analyses_count = get_analysis_count(key)
+        analyses_count, last_date = get_analysis_info(key)
         total_analyses += analyses_count
 
         ws_projects.write(row, 0, name)
         ws_projects.write(row, 1, ncloc)
         ws_projects.write(row, 2, issues_total)
         ws_projects.write(row, 3, analyses_count)
+        ws_projects.write(row, 4, last_date)
 
     ws_summary = workbook.add_worksheet("summary")
     local_users = len([u for u in users if u.get("local")])
