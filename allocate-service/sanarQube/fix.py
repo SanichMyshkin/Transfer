@@ -100,38 +100,43 @@ def get_issues_count(project_key):
 
 
 # ------------------------------------------------------------------------
-# NEW: HTML PARSER FOR RUN COUNT
+# NEW: CE ACTIVITY API (CORRECT RUN COUNT)
 # ------------------------------------------------------------------------
-def get_run_count(project_key):
+def get_ce_tasks(project_key):
     """
-    Делаем запрос на HTML-страницу /project/background_tasks?id=<key>
-    Ищем блок <output>100 of 154 shown</output>
-    Извлекаем правое число (154)
+    Возвращает:
+    - count (общее число анализов)
+    - tasks (список всех задач с ID)
     """
-    url = f"{SONAR_URL}/project/background_tasks"
-    params = {"id": project_key}
+    page = 1
+    page_size = 100
+    all_tasks = []
 
-    logger.info(f"Получение run_count из HTML для {project_key}")
+    while True:
+        url = f"{SONAR_URL}/api/ce/activity"
+        params = {
+            "status": "IN_PROGRESS,SUCCESS,FAILED,CANCELED",
+            "component": project_key,
+            "p": page,
+            "ps": page_size
+        }
 
-    r = session.get(url, params=params, verify=False)
-    r.raise_for_status()
+        logger.info(f"CE ACTIVITY GET {url} params={params}")
+        r = session.get(url, params=params, verify=False)
+        r.raise_for_status()
 
-    soup = BeautifulSoup(r.text, "html.parser")
-    output = soup.find("output")
+        data = r.json()
+        tasks = data.get("tasks", [])
+        paging_total = data.get("paging", {}).get("total", len(tasks))
 
-    if not output:
-        logger.warning(f"Не найден <output> для проекта {project_key}")
-        return 0
+        all_tasks.extend(tasks)
 
-    text = output.get_text(strip=True)  # "100 of 154 shown"
+        if page * page_size >= paging_total:
+            break
 
-    try:
-        parts = text.split("of")
-        total = parts[1].split()[0]
-        return int(total)
-    except Exception:
-        logger.error(f"Ошибка парсинга output='{text}' для {project_key}")
-        return 0
+        page += 1
+
+    return len(all_tasks), all_tasks
 
 
 # ------------------------------------------------------------------------
@@ -170,11 +175,17 @@ def write_report(users, projects, filename="sonar_report.xlsx"):
         "project_name",
         "ncloc",
         "issues_total",
-        "run_count"  # новое поле
+        "run_count"
     ]
     for col, h in enumerate(headers_projects):
         ws_projects.write(0, col, h)
 
+    # TASKS SHEET — NEW
+    ws_tasks = workbook.add_worksheet("tasks")
+    ws_tasks.write(0, 0, "project_key")
+    ws_tasks.write(0, 1, "task_id")
+
+    tasks_row = 1
     total_runs = 0
 
     for row, p in enumerate(projects, start=1):
@@ -185,13 +196,22 @@ def write_report(users, projects, filename="sonar_report.xlsx"):
 
         ncloc = get_ncloc(key)
         issues_total = get_issues_count(key)
-        run_count = get_run_count(key)
+
+        # NEW: run count from CE activity
+        run_count, task_list = get_ce_tasks(key)
         total_runs += run_count
 
+        # Пишем проект
         ws_projects.write(row, 0, name)
         ws_projects.write(row, 1, ncloc)
         ws_projects.write(row, 2, issues_total)
         ws_projects.write(row, 3, run_count)
+
+        # Пишем все task.id
+        for t in task_list:
+            ws_tasks.write(tasks_row, 0, key)
+            ws_tasks.write(tasks_row, 1, t.get("id"))
+            tasks_row += 1
 
     # SUMMARY SHEET
     ws_summary = workbook.add_worksheet("summary")
@@ -210,7 +230,7 @@ def write_report(users, projects, filename="sonar_report.xlsx"):
     ws_summary.write(3, 0, "total_projects")
     ws_summary.write(3, 1, len(projects))
 
-    ws_summary.write(4, 0, "total_run_count")
+    ws_summary.write(4, 0, "total_runs")
     ws_summary.write(4, 1, total_runs)
 
     workbook.close()
