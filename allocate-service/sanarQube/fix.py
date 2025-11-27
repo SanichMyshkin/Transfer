@@ -3,7 +3,7 @@ import logging
 import requests
 import xlsxwriter
 import urllib3
-from bs4 import BeautifulSoup
+import sqlite3
 from dotenv import load_dotenv
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -26,15 +26,66 @@ if not SONAR_URL or not TOKEN:
 session = requests.Session()
 session.auth = (TOKEN, "")
 
+DB_PATH = "sonar_history.db"
 
-# ------------------------------------------------------------------------
-# USERS
-# ------------------------------------------------------------------------
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS ce_tasks_history (
+        id TEXT PRIMARY KEY,
+        project_key TEXT,
+        status TEXT,
+        type TEXT,
+        executedAt TEXT,
+        createdAt TEXT,
+        updatedAt TEXT
+    )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def save_ce_tasks_to_db(project_key, tasks):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    new_count = 0
+    for t in tasks:
+        try:
+            cur.execute("""
+                INSERT INTO ce_tasks_history (id, project_key, status, type, executedAt, createdAt, updatedAt)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                t.get("id"),
+                project_key,
+                t.get("status"),
+                t.get("type"),
+                t.get("executionTime"),
+                t.get("submittedAt"),
+                t.get("updatedAt")
+            ))
+            new_count += 1
+        except sqlite3.IntegrityError:
+            pass
+    conn.commit()
+    conn.close()
+    return new_count
+
+
+def get_total_runs_from_db(project_key):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM ce_tasks_history WHERE project_key = ?", (project_key,))
+    total = cur.fetchone()[0]
+    conn.close()
+    return total
+
+
 def get_sonar_users():
     users = []
     page = 1
     page_size = 500
-
     while True:
         url = f"{SONAR_URL}/api/users/search"
         params = {"p": page, "ps": page_size}
@@ -48,18 +99,13 @@ def get_sonar_users():
         if page * page_size >= total:
             break
         page += 1
-
     return users
 
 
-# ------------------------------------------------------------------------
-# PROJECTS
-# ------------------------------------------------------------------------
 def get_projects():
     projects = []
     page = 1
     size = 500
-
     while True:
         url = f"{SONAR_URL}/api/projects/search"
         params = {"p": page, "ps": size}
@@ -73,13 +119,9 @@ def get_projects():
         if page * size >= total:
             break
         page += 1
-
     return projects
 
 
-# ------------------------------------------------------------------------
-# Ncloc & Issues
-# ------------------------------------------------------------------------
 def get_ncloc(project_key):
     url = f"{SONAR_URL}/api/measures/component"
     params = {"component": project_key, "metricKeys": "ncloc"}
@@ -99,19 +141,10 @@ def get_issues_count(project_key):
     return r.json().get("total", 0)
 
 
-# ------------------------------------------------------------------------
-# NEW: CE ACTIVITY API (CORRECT RUN COUNT)
-# ------------------------------------------------------------------------
 def get_ce_tasks(project_key):
-    """
-    Возвращает:
-    - count (общее число анализов)
-    - tasks (список всех задач с ID)
-    """
     page = 1
     page_size = 100
     all_tasks = []
-
     while True:
         url = f"{SONAR_URL}/api/ce/activity"
         params = {
@@ -120,32 +153,22 @@ def get_ce_tasks(project_key):
             "p": page,
             "ps": page_size
         }
-
         logger.info(f"CE ACTIVITY GET {url} params={params}")
         r = session.get(url, params=params, verify=False)
         r.raise_for_status()
-
         data = r.json()
         tasks = data.get("tasks", [])
         paging_total = data.get("paging", {}).get("total", len(tasks))
-
         all_tasks.extend(tasks)
-
         if page * page_size >= paging_total:
             break
-
         page += 1
-
     return len(all_tasks), all_tasks
 
 
-# ------------------------------------------------------------------------
-# REPORT
-# ------------------------------------------------------------------------
 def write_report(users, projects, filename="sonar_report.xlsx"):
     workbook = xlsxwriter.Workbook(filename)
 
-    # USERS SHEET
     ws_users = workbook.add_worksheet("users")
     headers_users = [
         "login", "name", "email", "active", "groups", "tokensCount",
@@ -169,18 +192,16 @@ def write_report(users, projects, filename="sonar_report.xlsx"):
         ws_users.write(row, 10, u.get("lastConnectionDate"))
         ws_users.write(row, 11, u.get("managed"))
 
-    # PROJECTS SHEET
     ws_projects = workbook.add_worksheet("projects")
     headers_projects = [
         "project_name",
-        "ncloc",
+        "lines_of_code",
         "issues_total",
-        "run_count"
+        "run_count_total"
     ]
     for col, h in enumerate(headers_projects):
         ws_projects.write(0, col, h)
 
-    # TASKS SHEET — NEW
     ws_tasks = workbook.add_worksheet("tasks")
     ws_tasks.write(0, 0, "project_key")
     ws_tasks.write(0, 1, "task_id")
@@ -197,23 +218,24 @@ def write_report(users, projects, filename="sonar_report.xlsx"):
         ncloc = get_ncloc(key)
         issues_total = get_issues_count(key)
 
-        # NEW: run count from CE activity
-        run_count, task_list = get_ce_tasks(key)
-        total_runs += run_count
+        _, task_list = get_ce_tasks(key)
 
-        # Пишем проект
+        added = save_ce_tasks_to_db(key, task_list)
+        logger.info(f"Добавлено новых задач в БД: {added}")
+
+        run_count_total = get_total_runs_from_db(key)
+        total_runs += run_count_total
+
         ws_projects.write(row, 0, name)
         ws_projects.write(row, 1, ncloc)
         ws_projects.write(row, 2, issues_total)
-        ws_projects.write(row, 3, run_count)
+        ws_projects.write(row, 3, run_count_total)
 
-        # Пишем все task.id
         for t in task_list:
             ws_tasks.write(tasks_row, 0, key)
             ws_tasks.write(tasks_row, 1, t.get("id"))
             tasks_row += 1
 
-    # SUMMARY SHEET
     ws_summary = workbook.add_worksheet("summary")
     local_users = len([u for u in users if u.get("local")])
     external_users = len([u for u in users if not u.get("local")])
@@ -237,16 +259,12 @@ def write_report(users, projects, filename="sonar_report.xlsx"):
     logger.info("Excel сформирован")
 
 
-# ------------------------------------------------------------------------
-# MAIN
-# ------------------------------------------------------------------------
 def main():
+    init_db()
     logger.info("Получение пользователей")
     users = get_sonar_users()
-
     logger.info("Получение проектов")
     projects = get_projects()
-
     write_report(users, projects)
 
 
