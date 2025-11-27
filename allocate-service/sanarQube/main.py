@@ -30,6 +30,7 @@ DB_PATH = "sonar_history.db"
 
 
 def init_db():
+    logger.info("Инициализация базы данных...")
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.cursor()
         cur.execute("""
@@ -43,6 +44,7 @@ def init_db():
             updatedAt TEXT
         )
         """)
+    logger.info("База данных готова.")
 
 
 def save_ce_tasks_to_db(project_key, tasks):
@@ -66,6 +68,7 @@ def save_ce_tasks_to_db(project_key, tasks):
                 new_count += 1
             except sqlite3.IntegrityError:
                 pass
+    logger.info(f"[DB] Новых задач добавлено: {new_count}")
     return new_count
 
 
@@ -73,48 +76,53 @@ def get_total_runs_from_db(project_key):
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.cursor()
         cur.execute("SELECT COUNT(*) FROM ce_tasks_history WHERE project_key = ?", (project_key,))
-        return cur.fetchone()[0]
+        total = cur.fetchone()[0]
+    logger.info(f"[DB] Полное количество запусков проекта {project_key}: {total}")
+    return total
 
 
 def get_sonar_users():
+    logger.info("Получение списка пользователей...")
     users = []
     page = 1
     size = 500
     while True:
-        r = session.get(
-            f"{SONAR_URL}/api/users/search",
-            params={"p": page, "ps": size},
-            verify=False
-        )
+        logger.info(f"[USERS] GET page={page}")
+        r = session.get(f"{SONAR_URL}/api/users/search", params={"p": page, "ps": size}, verify=False)
         r.raise_for_status()
         data = r.json()
-        users.extend(data.get("users", []))
+        batch = data.get("users", [])
+        users.extend(batch)
+        logger.info(f"[USERS] Получено {len(batch)} пользователей (всего: {len(users)})")
         if page * size >= data.get("paging", {}).get("total", 0):
             break
         page += 1
+    logger.info(f"Пользователи получены: {len(users)}")
     return users
 
 
 def get_projects():
+    logger.info("Получение проектов...")
     projects = []
     page = 1
     size = 500
     while True:
-        r = session.get(
-            f"{SONAR_URL}/api/projects/search",
-            params={"p": page, "ps": size},
-            verify=False
-        )
+        logger.info(f"[PROJECTS] GET page={page}")
+        r = session.get(f"{SONAR_URL}/api/projects/search", params={"p": page, "ps": size}, verify=False)
         r.raise_for_status()
         data = r.json()
-        projects.extend(data.get("components", []))
+        batch = data.get("components", [])
+        projects.extend(batch)
+        logger.info(f"[PROJECTS] Получено {len(batch)} (всего: {len(projects)})")
         if page * size >= data.get("paging", {}).get("total", 0):
             break
         page += 1
+    logger.info(f"Проекты получены: {len(projects)}")
     return projects
 
 
 def get_ncloc(project_key):
+    logger.info(f"[NCLOC] Получение строк кода для {project_key}")
     r = session.get(
         f"{SONAR_URL}/api/measures/component",
         params={"component": project_key, "metricKeys": "ncloc"},
@@ -122,7 +130,9 @@ def get_ncloc(project_key):
     )
     r.raise_for_status()
     measures = r.json().get("component", {}).get("measures", [])
-    return int(measures[0].get("value", 0)) if measures else 0
+    n = int(measures[0].get("value", 0)) if measures else 0
+    logger.info(f"[NCLOC] {project_key}: {n}")
+    return n
 
 
 def get_issues_count(project_key):
@@ -132,27 +142,33 @@ def get_issues_count(project_key):
         verify=False
     )
     r.raise_for_status()
-    return r.json().get("total", 0)
+    total = r.json().get("total", 0)
+    logger.info(f"[ISSUES] {project_key}: {total}")
+    return total
 
 
 def get_ce_tasks(project_key):
+    logger.info(f"[TASKS] Получение CE задач для {project_key}")
     page = 1
     size = 100
     tasks_all = []
     while True:
+        logger.info(f"[TASKS] GET page={page}")
         r = session.get(
             f"{SONAR_URL}/api/ce/activity",
             params={
                 "status": "IN_PROGRESS,SUCCESS,FAILED,CANCELED",
                 "component": project_key,
-                "p": page, "ps": size,
+                "p": page,
+                "ps": size,
             },
             verify=False
         )
         r.raise_for_status()
         data = r.json()
-        tasks = data.get("tasks", [])
-        tasks_all.extend(tasks)
+        batch = data.get("tasks", [])
+        tasks_all.extend(batch)
+        logger.info(f"[TASKS] Получено {len(batch)} задач (всего: {len(tasks_all)})")
         if page * size >= data.get("paging", {}).get("total", 0):
             break
         page += 1
@@ -160,6 +176,8 @@ def get_ce_tasks(project_key):
 
 
 def write_report(users, projects, filename="sonar_report.xlsx"):
+    logger.info("Формирование Excel отчёта...")
+
     workbook = xlsxwriter.Workbook(filename)
 
     ws_users = workbook.add_worksheet("users")
@@ -202,24 +220,25 @@ def write_report(users, projects, filename="sonar_report.xlsx"):
     row_tasks = 1
     total_runs = 0
 
-    for row, p in enumerate(projects, start=1):
+    for i, p in enumerate(projects, start=1):
         key = p.get("key")
         name = p.get("name")
 
+        logger.info(f"=== [{i}/{len(projects)}] Обработка проекта: {key} ===")
+
         ncloc = get_ncloc(key)
         issues = get_issues_count(key)
-        _, tasks = get_ce_tasks(key)
 
-        added = save_ce_tasks_to_db(key, tasks)
-        logger.info(f"Добавлено новых задач: {added}")
+        _, tasks = get_ce_tasks(key)
+        save_ce_tasks_to_db(key, tasks)
 
         runs_total = get_total_runs_from_db(key)
         total_runs += runs_total
 
-        ws_projects.write(row, 0, name)
-        ws_projects.write(row, 1, ncloc)
-        ws_projects.write(row, 2, issues)
-        ws_projects.write(row, 3, runs_total)
+        ws_projects.write(i, 0, name)
+        ws_projects.write(i, 1, ncloc)
+        ws_projects.write(i, 2, issues)
+        ws_projects.write(i, 3, runs_total)
 
         for t in tasks:
             ws_tasks.write(row_tasks, 0, key)
@@ -243,14 +262,16 @@ def write_report(users, projects, filename="sonar_report.xlsx"):
     ws_summary.write(4, 1, total_runs)
 
     workbook.close()
-    logger.info("Excel сформирован")
+    logger.info(f"Отчёт сформирован: {filename}")
 
 
 def main():
+    logger.info("==== START ====")
     init_db()
     users = get_sonar_users()
     projects = get_projects()
     write_report(users, projects)
+    logger.info("==== DONE ====")
 
 
 if __name__ == "__main__":
