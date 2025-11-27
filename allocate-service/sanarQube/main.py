@@ -159,8 +159,7 @@ def get_ce_tasks(project_key):
             params={
                 "status": "IN_PROGRESS,SUCCESS,FAILED,CANCELED",
                 "component": project_key,
-                "p": page,
-                "ps": size,
+                "p": page, "ps": size,
             },
             verify=False
         )
@@ -213,11 +212,6 @@ def write_report(users, projects, filename="sonar_report.xlsx"):
     for col, h in enumerate(headers_projects):
         ws_projects.write(0, col, h)
 
-    ws_tasks = workbook.add_worksheet("tasks")
-    ws_tasks.write(0, 0, "project_key")
-    ws_tasks.write(0, 1, "task_id")
-
-    row_tasks = 1
     total_runs = 0
 
     for i, p in enumerate(projects, start=1):
@@ -239,11 +233,6 @@ def write_report(users, projects, filename="sonar_report.xlsx"):
         ws_projects.write(i, 1, ncloc)
         ws_projects.write(i, 2, issues)
         ws_projects.write(i, 3, runs_total)
-
-        for t in tasks:
-            ws_tasks.write(row_tasks, 0, key)
-            ws_tasks.write(row_tasks, 1, t.get("id"))
-            row_tasks += 1
 
     ws_summary = workbook.add_worksheet("summary")
 
