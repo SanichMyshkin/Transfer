@@ -17,44 +17,48 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 
-def create_instance(name, url, token, db_suffix):
+def create_instance(name, url, token):
     session = requests.Session()
     session.auth = (token, "")
     return {
         "name": name,
         "url": url.rstrip("/"),
         "session": session,
-        "db_path": f"sonar_history_{db_suffix}.db",
+        "db_path": f"sonar_history_{name}.db",
     }
 
 
 def load_instances():
     instances = []
 
-    base_url = os.getenv("SONAR_URL")
-    base_token = os.getenv("SONAR_TOKEN")
-    if base_url and base_token:
-        instances.append(create_instance("sonar1", base_url, base_token, "1"))
+    prod_url = os.getenv("PROD_URL")
+    prod_token = os.getenv("PROD_TOKEN")
+    if prod_url and prod_token:
+        instances.append(create_instance("prod", prod_url, prod_token))
 
-    for idx in (2, 3):
-        url = os.getenv(f"SONAR{idx}_URL")
-        token = os.getenv(f"SONAR{idx}_TOKEN")
-        if url and token:
-            instances.append(create_instance(f"sonar{idx}", url, token, str(idx)))
+    fix_url = os.getenv("FIX_URL")
+    fix_token = os.getenv("FIX_TOKEN")
+    if fix_url and fix_token:
+        instances.append(create_instance("fix", fix_url, fix_token))
+
+    old_url = os.getenv("OLD_URL")
+    old_token = os.getenv("OLD_TOKEN")
+    if old_url and old_token:
+        instances.append(create_instance("old", old_url, old_token))
 
     if not instances:
-        logger.error("Не заданы переменные окружения для ни одного SonarQube")
+        logger.error("Нет ни одного настроенного SonarQube (PROD/FIX/OLD)")
         raise SystemExit(1)
 
-    logger.info(f"Найдено инстансов SonarQube: {len(instances)}")
+    logger.info(f"Загружено инстансов: {len(instances)}")
     for inst in instances:
-        logger.info(f"Инстанс: {inst['name']} url={inst['url']} db={inst['db_path']}")
+        logger.info(f"Инстанс: {inst['name']} → {inst['url']}  DB: {inst['db_path']}")
 
     return instances
 
 
 def init_db(db_path):
-    logger.info(f"Инициализация базы данных {db_path}...")
+    logger.info(f"Инициализация базы {db_path}...")
     with sqlite3.connect(db_path) as conn:
         cur = conn.cursor()
         cur.execute("""
@@ -68,7 +72,7 @@ def init_db(db_path):
             updatedAt TEXT
         )
         """)
-    logger.info(f"База данных {db_path} готова.")
+    logger.info(f"База {db_path} готова.")
 
 
 def save_ce_tasks_to_db(db_path, project_key, tasks):
@@ -92,7 +96,7 @@ def save_ce_tasks_to_db(db_path, project_key, tasks):
                 new_count += 1
             except sqlite3.IntegrityError:
                 pass
-    logger.info(f"[DB:{db_path}] Новых задач добавлено: {new_count}")
+    logger.info(f"[DB:{db_path}] Новых задач: {new_count}")
     return new_count
 
 
@@ -100,20 +104,17 @@ def get_total_runs_from_db(db_path, project_key):
     with sqlite3.connect(db_path) as conn:
         cur = conn.cursor()
         cur.execute("SELECT COUNT(*) FROM ce_tasks_history WHERE project_key = ?", (project_key,))
-        total = cur.fetchone()[0]
-    logger.info(f"[DB:{db_path}] Полное количество запусков проекта {project_key}: {total}")
-    return total
+        return cur.fetchone()[0]
 
 
-def get_sonar_users(instance):
-    logger.info(f"[{instance['name']}] Получение списка пользователей...")
+def get_sonar_users(inst):
+    logger.info(f"[{inst['name']}] Получение пользователей...")
     users = []
     page = 1
     size = 500
     while True:
-        logger.info(f"[{instance['name']}][USERS] GET page={page}")
-        r = instance["session"].get(
-            f"{instance['url']}/api/users/search",
+        r = inst["session"].get(
+            f"{inst['url']}/api/users/search",
             params={"p": page, "ps": size},
             verify=False
         )
@@ -121,23 +122,20 @@ def get_sonar_users(instance):
         data = r.json()
         batch = data.get("users", [])
         users.extend(batch)
-        logger.info(f"[{instance['name']}][USERS] Получено {len(batch)} (всего: {len(users)})")
         if page * size >= data.get("paging", {}).get("total", 0):
             break
         page += 1
-    logger.info(f"[{instance['name']}] Пользователи получены: {len(users)}")
     return users
 
 
-def get_projects(instance):
-    logger.info(f"[{instance['name']}] Получение проектов...")
+def get_projects(inst):
+    logger.info(f"[{inst['name']}] Получение проектов...")
     projects = []
     page = 1
     size = 500
     while True:
-        logger.info(f"[{instance['name']}][PROJECTS] GET page={page}")
-        r = instance["session"].get(
-            f"{instance['url']}/api/projects/search",
+        r = inst["session"].get(
+            f"{inst['url']}/api/projects/search",
             params={"p": page, "ps": size},
             verify=False
         )
@@ -145,54 +143,44 @@ def get_projects(instance):
         data = r.json()
         batch = data.get("components", [])
         projects.extend(batch)
-        logger.info(f"[{instance['name']}][PROJECTS] Получено {len(batch)} (всего: {len(projects)})")
         if page * size >= data.get("paging", {}).get("total", 0):
             break
         page += 1
-    logger.info(f"[{instance['name']}] Проекты получены: {len(projects)}")
     return projects
 
 
-def get_ncloc(instance, project_key):
-    logger.info(f"[{instance['name']}][NCLOC] Получение строк кода для {project_key}")
-    r = instance["session"].get(
-        f"{instance['url']}/api/measures/component",
+def get_ncloc(inst, project_key):
+    r = inst["session"].get(
+        f"{inst['url']}/api/measures/component",
         params={"component": project_key, "metricKeys": "ncloc"},
         verify=False
     )
     r.raise_for_status()
     measures = r.json().get("component", {}).get("measures", [])
-    n = int(measures[0].get("value", 0)) if measures else 0
-    logger.info(f"[{instance['name']}][NCLOC] {project_key}: {n}")
-    return n
+    return int(measures[0].get("value", 0)) if measures else 0
 
 
-def get_issues_count(instance, project_key):
-    r = instance["session"].get(
-        f"{instance['url']}/api/issues/search",
+def get_issues_count(inst, project_key):
+    r = inst["session"].get(
+        f"{inst['url']}/api/issues/search",
         params={"componentKeys": project_key, "ps": 1},
         verify=False
     )
     r.raise_for_status()
-    total = r.json().get("total", 0)
-    logger.info(f"[{instance['name']}][ISSUES] {project_key}: {total}")
-    return total
+    return r.json().get("total", 0)
 
 
-def get_ce_tasks(instance, project_key):
-    logger.info(f"[{instance['name']}][TASKS] Получение CE задач для {project_key}")
+def get_ce_tasks(inst, project_key):
+    tasks_all = []
     page = 1
     size = 100
-    tasks_all = []
     while True:
-        logger.info(f"[{instance['name']}][TASKS] GET page={page}")
-        r = instance["session"].get(
-            f"{instance['url']}/api/ce/activity",
+        r = inst["session"].get(
+            f"{inst['url']}/api/ce/activity",
             params={
                 "status": "IN_PROGRESS,SUCCESS,FAILED,CANCELED",
                 "component": project_key,
-                "p": page,
-                "ps": size,
+                "p": page, "ps": size
             },
             verify=False
         )
@@ -200,16 +188,14 @@ def get_ce_tasks(instance, project_key):
         data = r.json()
         batch = data.get("tasks", [])
         tasks_all.extend(batch)
-        logger.info(f"[{instance['name']}][TASKS] Получено {len(batch)} (всего: {len(tasks_all)})")
         if page * size >= data.get("paging", {}).get("total", 0):
             break
         page += 1
     return len(tasks_all), tasks_all
 
 
-def write_instance_report(workbook, instance, users, projects):
-    prefix = instance["name"]
-    logger.info(f"[{prefix}] Формирование листов в Excel...")
+def write_instance_report(workbook, inst, users, projects):
+    prefix = inst["name"]
 
     ws_users = workbook.add_worksheet(f"{prefix}_users")
     headers_users = [
@@ -252,15 +238,13 @@ def write_instance_report(workbook, instance, users, projects):
         key = p.get("key")
         name = p.get("name")
 
-        logger.info(f"[{prefix}] === [{i}/{len(projects)}] Обработка проекта: {key} ===")
+        ncloc = get_ncloc(inst, key)
+        issues = get_issues_count(inst, key)
 
-        ncloc = get_ncloc(instance, key)
-        issues = get_issues_count(instance, key)
+        _, tasks = get_ce_tasks(inst, key)
+        save_ce_tasks_to_db(inst["db_path"], key, tasks)
 
-        _, tasks = get_ce_tasks(instance, key)
-        save_ce_tasks_to_db(instance["db_path"], key, tasks)
-
-        runs_total = get_total_runs_from_db(instance["db_path"], key)
+        runs_total = get_total_runs_from_db(inst["db_path"], key)
         total_runs += runs_total
 
         ws_projects.write(i, 0, name)
@@ -282,8 +266,6 @@ def write_instance_report(workbook, instance, users, projects):
     ws_summary.write(4, 0, "total_runs")
     ws_summary.write(4, 1, total_runs)
 
-    logger.info(f"[{prefix}] Листы Excel сформированы.")
-
 
 def main():
     logger.info("==== START ====")
@@ -298,8 +280,7 @@ def main():
         write_instance_report(workbook, inst, users, projects)
 
     workbook.close()
-    logger.info("Отчёт sonar_report.xlsx сформирован.")
-    logger.info("==== DONE ====")
+    logger.info("Готово: sonar_report.xlsx")
 
 
 if __name__ == "__main__":
