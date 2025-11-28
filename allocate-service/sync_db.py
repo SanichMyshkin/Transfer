@@ -4,6 +4,7 @@ import sqlite3
 import pymssql
 from dotenv import load_dotenv
 from datetime import datetime, date, time
+from openpyxl import Workbook
 
 load_dotenv()
 
@@ -122,6 +123,25 @@ def log_first_20_rows():
             logger.info(str(r))
 
 
+def export_to_excel(columns):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Data"
+
+    with sqlite3.connect(SQLITE_FILE) as conn:
+        cur = conn.cursor()
+        cur.execute(f"SELECT * FROM {SQLITE_TABLE}")
+        rows = cur.fetchall()
+
+    ws.append(columns)
+
+    for r in rows:
+        ws.append(list(r))
+
+    wb.save("export.xlsx")
+    logger.info("Excel файл export.xlsx создан.")
+
+
 def main():
     logger.info("Старт обработки.")
     columns, rows, types = fetch_mssql_data()
@@ -131,6 +151,7 @@ def main():
     ensure_table_exists(columns, types)
     load_into_sqlite(columns, rows)
     log_first_20_rows()
+    export_to_excel(columns)
 
     logger.info("Готово.")
 
