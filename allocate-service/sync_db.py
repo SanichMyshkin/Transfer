@@ -7,12 +7,18 @@ from datetime import datetime, date, time
 
 load_dotenv()
 
-logging.basicConfig(
-    filename="sync.log",
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    encoding="utf-8"
-)
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+file_handler = logging.FileHandler("sync.log", encoding="utf-8")
+console_handler = logging.StreamHandler()
+
+formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+file_handler.setFormatter(formatter)
+console_handler.setFormatter(formatter)
+
+logger.addHandler(file_handler)
+logger.addHandler(console_handler)
 
 SQLITE_FILE = os.getenv("SQLITE_FILE")
 SQLITE_TABLE = os.getenv("SQLITE_TABLE")
@@ -64,23 +70,21 @@ def ensure_table_exists(columns, types):
             (SQLITE_TABLE,),
         )
         if cur.fetchone():
-            logging.info(f"Таблица {SQLITE_TABLE} существует, создание не требуется.")
+            logger.info(f"Таблица {SQLITE_TABLE} существует.")
             return
 
-        logging.info(f"Таблица {SQLITE_TABLE} отсутствует, создание.")
-        defs = []
-        for name, tp in zip(columns, types):
-            defs.append(f"{name} {map_sql_type(tp)}")
+        logger.info(f"Создание таблицы {SQLITE_TABLE}.")
+        defs = [f"{n} {map_sql_type(t)}" for n, t in zip(columns, types)]
         create_sql = f"CREATE TABLE {SQLITE_TABLE} ({', '.join(defs)});"
         cur.execute(create_sql)
         conn.commit()
-        logging.info(f"Таблица {SQLITE_TABLE} создана.")
+        logger.info(f"Таблица {SQLITE_TABLE} создана.")
 
 
 def load_into_sqlite(columns, rows):
     with sqlite3.connect(SQLITE_FILE) as conn:
         cur = conn.cursor()
-        logging.info(f"Очистка таблицы {SQLITE_TABLE}.")
+        logger.info(f"Очистка таблицы {SQLITE_TABLE}.")
         cur.execute(f"DELETE FROM {SQLITE_TABLE}")
 
         placeholders = ", ".join(["?"] * len(columns))
@@ -97,15 +101,15 @@ def load_into_sqlite(columns, rows):
 
             if len(batch) >= BATCH_SIZE:
                 cur.executemany(insert_sql, batch)
-                logging.info(f"Вставлено {count} строк...")
+                logger.info(f"Вставлено строк: {count}")
                 batch = []
 
         if batch:
             cur.executemany(insert_sql, batch)
-            logging.info(f"Вставлено {count} строк.")
+            logger.info(f"Вставлено строк: {count}")
 
         conn.commit()
-        logging.info("Загрузка данных завершена.")
+        logger.info("Загрузка завершена.")
 
 
 def log_first_20_rows():
@@ -113,22 +117,22 @@ def log_first_20_rows():
         cur = conn.cursor()
         cur.execute(f"SELECT * FROM {SQLITE_TABLE} LIMIT 20")
         rows = cur.fetchall()
-        logging.info("Первые 20 строк таблицы:")
+        logger.info("Первые 20 строк таблицы:")
         for r in rows:
-            logging.info(str(r))
+            logger.info(str(r))
 
 
 def main():
-    logging.info("Старт обработки.")
+    logger.info("Старт обработки.")
     columns, rows, types = fetch_mssql_data()
-    logging.info(f"Получено строк из MSSQL: {len(rows)}")
-    logging.info(f"Колонки: {columns}")
+    logger.info(f"Получено строк: {len(rows)}")
+    logger.info(f"Колонки: {columns}")
 
     ensure_table_exists(columns, types)
     load_into_sqlite(columns, rows)
     log_first_20_rows()
 
-    logging.info("Готово. Таблица обновлена.")
+    logger.info("Готово.")
 
 
 if __name__ == "__main__":
