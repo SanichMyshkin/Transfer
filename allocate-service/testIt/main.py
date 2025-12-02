@@ -2,11 +2,12 @@ import os
 import logging
 import psycopg2
 from psycopg2.extras import RealDictCursor
-
+from dotenv import load_dotenv
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 
+load_dotenv()
 DB_HOST = os.getenv("PG_HOST")
 DB_PORT = os.getenv("PG_PORT")
 DB_NAME = os.getenv("PG_DB")
@@ -61,9 +62,7 @@ def main():
 
     logging.info("Opening DB connection")
 
-    # подключение открываем один раз
     with psycopg2.connect(**db_config) as conn:
-        # пример выполнения одного запроса
         users = exec_query(conn, QUERY_USERS)
         logging.info("Loaded users: %d", len(users))
 
