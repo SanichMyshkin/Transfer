@@ -9,33 +9,21 @@ import sqlite3
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 load_dotenv()
 
-# ------------------------
-# SHARED CONNECTION SETTINGS
-# ------------------------
+
 PG_HOST = os.getenv("PG_HOST")
 PG_PORT = os.getenv("PG_PORT")
 PG_USER = os.getenv("PG_USER")
 PG_PASSWORD = os.getenv("PG_PASSWORD")
-
-# DB #1 (auth users)
 PG_DB = os.getenv("PG_DB")
-
-# DB #2 (projects)
 PG_DB2 = os.getenv("PG_DB2")
 
 
-# -------------------------------------------------------------
-# Helper: execute PG query
-# -------------------------------------------------------------
 def exec_query(conn, query):
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(query)
         return cur.fetchall()
 
 
-# -------------------------------------------------------------
-# Query 1: Users from AUTH DB
-# -------------------------------------------------------------
 QUERY_USERS = """
 SELECT 
     u."Id" AS user_id,
@@ -61,9 +49,6 @@ ORDER BY u."UserName";
 """
 
 
-# -------------------------------------------------------------
-# Query 2: Projects with all metrics
-# -------------------------------------------------------------
 QUERY_PROJECTS = """
 SELECT
     p."Id",
@@ -156,9 +141,6 @@ ORDER BY p."Id";
 """
 
 
-# -------------------------------------------------------------
-# Excel helpers
-# -------------------------------------------------------------
 def write_sheet(workbook, sheet_name, rows):
     sheet = workbook.add_worksheet(sheet_name)
     if not rows:
@@ -195,59 +177,42 @@ def write_summary(workbook, users, projects):
         sheet.write(i, 1, value)
 
 
-# -------------------------------------------------------------
-# Main
-# -------------------------------------------------------------
 def main():
-
-    # -------------------- USERS (PG) --------------------
     logging.info("Connecting to AUTH DB...")
     with psycopg2.connect(
-        host=PG_HOST, port=PG_PORT,
-        dbname=PG_DB,
-        user=PG_USER, password=PG_PASSWORD
+        host=PG_HOST, port=PG_PORT, dbname=PG_DB, user=PG_USER, password=PG_PASSWORD
     ) as conn_users:
-
         users = exec_query(conn_users, QUERY_USERS)
 
     logging.info("Loaded users: %d", len(users))
 
-    # -------------------- PROJECTS (PG2) --------------------
     logging.info("Connecting to PROJECT DB...")
     with psycopg2.connect(
-        host=PG_HOST, port=PG_PORT,
-        dbname=PG_DB2,
-        user=PG_USER, password=PG_PASSWORD
+        host=PG_HOST, port=PG_PORT, dbname=PG_DB2, user=PG_USER, password=PG_PASSWORD
     ) as conn_proj:
-
         projects = exec_query(conn_proj, QUERY_PROJECTS)
 
     logging.info("Loaded projects: %d", len(projects))
 
-    # -------------------- BK SQLITE --------------------
     logging.info("Loading BK SQLite database...")
 
     conn_bk = sqlite3.connect("bk.sqlite")
     conn_bk.row_factory = sqlite3.Row
 
-    # ❗ изменить "Users" на реальное имя таблицы
-    bk_rows = conn_bk.execute("SELECT * FROM Users").fetchall()
+    bk_rows = conn_bk.execute("SELECT * FROM bk").fetchall()
     conn_bk.close()
 
     bk_users = [dict(r) for r in bk_rows]
     logging.info("Loaded BK users: %d", len(bk_users))
 
-    # -------------------- MATCH BK ↔ PG --------------------
     pg_usernames = {u["UserName"] for u in users}
 
     matched_bk_users = [
-        row for row in bk_users
-        if row.get("sAMAccountName") in pg_usernames
+        row for row in bk_users if row.get("sAMAccountName") in pg_usernames
     ]
 
     logging.info("Matched BK users: %d", len(matched_bk_users))
 
-    # -------------------- WRITE EXCEL --------------------
     workbook = xlsxwriter.Workbook("testIt_report.xlsx")
 
     write_sheet(workbook, "Users", users)
@@ -259,6 +224,5 @@ def main():
     logging.info("Excel report saved: testIt_report.xlsx")
 
 
-# -------------------------------------------------------------
 if __name__ == "__main__":
     main()
