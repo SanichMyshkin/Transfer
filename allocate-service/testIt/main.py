@@ -30,10 +30,10 @@ QUERY_USERS = """
 SELECT 
     u."Id" AS user_id,
     u."UserName",
+    u."Email",
     u."FirstName",
     u."MiddleName",
     u."LastName",
-    u."Email",
     u."CreatedBy",
     u."UserType", 
     u."DistinguishedName",
@@ -44,9 +44,9 @@ LEFT JOIN "UserGroups" ug ON u."Id" = ug."UserId"
 LEFT JOIN "Groups" g ON ug."GroupId" = g."Id"
 INNER JOIN "UserRoles" ur ON u."Id" = ur."UserId"
 INNER JOIN "AspNetRoles" r ON ur."RoleId" = r."Id"
-GROUP BY u."Id", u."UserName", u."FirstName", u."MiddleName", 
-         u."LastName", u."Email", u."CreatedBy", u."UserType", 
-         u."DistinguishedName"
+GROUP BY u."Id", u."UserName", u."Email", u."FirstName",
+         u."MiddleName", u."LastName",
+         u."CreatedBy", u."UserType", u."DistinguishedName"
 ORDER BY u."UserName";
 """
 
@@ -180,21 +180,24 @@ def main():
     bk_users = [dict(r) for r in bk_rows]
     logging.info(f"BK users loaded: {len(bk_users)}")
 
-    pg_usernames = {u["UserName"] for u in users}
+    bk_emails = {u.get("Email", "").strip().lower(): u for u in bk_users}
+
     matched_bk_users = []
 
-    logging.info("Matching BK users to PostgreSQL users...\n")
+    logging.info("Matching BK users to PostgreSQL users (by Email)...\n")
 
-    for bk in bk_users:
-        sam = bk.get("sAMAccountName")
-        if not sam:
+    for u in users:
+        email = (u["Email"] or "").strip().lower()
+
+        if not email:
+            logging.info(f"⚠ Нет Email → {u['UserName']}")
             continue
 
-        if sam in pg_usernames:
-            logging.info(f"✔ Найден пользователь: {sam}")
-            matched_bk_users.append(bk)
+        if email in bk_emails:
+            logging.info(f"✔ Найден пользователь по email: {email}")
+            matched_bk_users.append(bk_emails[email])
         else:
-            logging.info(f"⚠ Не найден в BK (возможная тех. учётка): {sam}")
+            logging.info(f"⚠ Не найден по Email (возможная тех. учётка): {email}")
 
     logging.info(f"\nMatched BK users total: {len(matched_bk_users)}")
 
