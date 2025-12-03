@@ -3,18 +3,27 @@ import logging
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from dotenv import load_dotenv
+import xlsxwriter
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-
 load_dotenv()
-DB_HOST = os.getenv("PG_HOST")
-DB_PORT = os.getenv("PG_PORT")
-DB_NAME = os.getenv("PG_DB")
-DB_USER = os.getenv("PG_USER")
-DB_PASSWORD = os.getenv("PG_PASSWORD")
+
+PG_HOST = os.getenv("PG_HOST")
+PG_PORT = os.getenv("PG_PORT")
+PG_USER = os.getenv("PG_USER")
+PG_PASSWORD = os.getenv("PG_PASSWORD")
+PG_DB = os.getenv("PG_DB")      # база для юзеров
+PG_DB2 = os.getenv("PG_DB2")    # база для проектов
 
 
+def exec_query(conn, query):
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(query)
+        return cur.fetchall()
+
+
+# ------------------------ SQL: Users ------------------------
 QUERY_USERS = """
 SELECT
     u."Id" AS user_id,
@@ -42,35 +51,149 @@ ORDER BY u."UserName";
 """
 
 
-def exec_query(conn, query: str, params=None):
-    """Выполняет SQL и возвращает данные."""
-    with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute(query, params or {})
-        rows = cur.fetchall()
-        logging.info("Query returned %d rows", len(rows))
-        return rows
+# ------------------------ SQL: Projects report ------------------------
+QUERY_PROJECTS = """
+SELECT
+    p."Id",
+    p."Name",
+    p."Description",
+
+    COUNT(at."Id") AS "AutotestsCount",
+
+    (
+        SELECT COALESCE(SUM(jsonb_array_length(d2."Widgets")), 0)
+        FROM "Dashboards" d2
+        WHERE d2."ProjectId" = p."Id"
+    ) AS "WidgetsCount",
+
+    (
+        SELECT COALESCE(SUM(tr."RunCount"), 0)
+        FROM "TestRuns" tr
+        WHERE tr."ProjectId" = p."Id"
+          AND tr."IsAutomated" = TRUE
+          AND (tr."IsDeleted" = FALSE OR tr."IsDeleted" IS NULL)
+    ) AS "AutoTestRunsCount",
+
+    (
+        SELECT COUNT(wi."Id")
+        FROM "WorkItems" wi
+        WHERE wi."ProjectId" = p."Id"
+          AND wi."EntityTypeName" = 'TestCases'
+          AND (wi."IsDeleted" = FALSE OR wi."IsDeleted" IS NULL)
+          AND (wi."IsActual" = TRUE OR wi."IsActual" IS NULL)
+    ) AS "TestCasesCount",
+
+    (
+        SELECT COUNT(wi."Id")
+        FROM "WorkItems" wi
+        WHERE wi."ProjectId" = p."Id"
+          AND wi."EntityTypeName" = 'CheckLists'
+          AND (wi."IsDeleted" = FALSE OR wi."IsDeleted" IS NULL)
+          AND (wi."IsActual" = TRUE OR wi."IsActual" IS NULL)
+    ) AS "CheckListsCount",
+
+    (
+        SELECT COUNT(wi."Id")
+        FROM "WorkItems" wi
+        WHERE wi."ProjectId" = p."Id"
+          AND wi."EntityTypeName" = 'SharedSteps'
+          AND (wi."IsDeleted" = FALSE OR wi."IsDeleted" IS NULL)
+          AND (wi."IsActual" = TRUE OR wi."IsActual" IS NULL)
+    ) AS "SharedStepsCount",
+
+    (
+        SELECT COUNT(DISTINCT wi."Id")
+        FROM "WorkItems" wi
+        LEFT JOIN "WorkItemVersions" wiv
+            ON wiv."WorkItemId" = wi."Id"
+        LEFT JOIN "TestSuitesWorkItems" tswi
+            ON tswi."WorkItemVersionId" = wiv."VersionId"
+            AND (tswi."IsDeleted" = FALSE OR tswi."IsDeleted" IS NULL)
+        WHERE wi."ProjectId" = p."Id"
+          AND wi."IsDeleted" = FALSE
+          AND wiv."VersionId" IS NOT NULL
+          AND tswi."WorkItemVersionId" IS NOT NULL
+    ) AS "LibraryTestsCount",
+
+    (
+        SELECT COUNT(tp."Id")
+        FROM "TestPlans" tp
+        WHERE tp."ProjectId" = p."Id"
+          AND (tp."IsDeleted" = FALSE OR tp."IsDeleted" IS NULL)
+    ) AS "TestPlansCount"
+
+FROM "Projects" p
+LEFT JOIN "AutoTests" at ON at."ProjectId" = p."Id"
+GROUP BY p."Id", p."Name", p."Description"
+ORDER BY p."Id";
+"""
 
 
+# ------------------------ Excel helpers ------------------------
+def write_sheet(workbook, sheet_name, rows):
+    sheet = workbook.add_worksheet(sheet_name)
+    if not rows:
+        return
+
+    headers = list(rows[0].keys())
+    for c, h in enumerate(headers):
+        sheet.write(0, c, h)
+
+    for r, row in enumerate(rows, start=1):
+        for c, h in enumerate(headers):
+            sheet.write(r, c, str(row[h]) if row[h] is not None else "")
+
+
+def write_summary(workbook, users, projects):
+    sheet = workbook.add_worksheet("Summary")
+    sheet.write(0, 0, "Metric")
+    sheet.write(0, 1, "Value")
+
+    metrics = [
+        ("Users count", len(users)),
+        ("Projects count", len(projects)),
+        ("Total test-cases", sum(p["TestCasesCount"] for p in projects)),
+        ("Total autotests", sum(p["AutotestsCount"] for p in projects)),
+        ("Total test-plans", sum(p["TestPlansCount"] for p in projects)),
+        ("Total library tests", sum(p["LibraryTestsCount"] for p in projects)),
+    ]
+
+    for i, (name, value) in enumerate(metrics, start=1):
+        sheet.write(i, 0, name)
+        sheet.write(i, 1, value)
+
+
+# ------------------------ Main ------------------------
 def main():
-    db_config = {
-        "host": DB_HOST,
-        "port": DB_PORT,
-        "dbname": DB_NAME,
-        "user": DB_USER,
-        "password": DB_PASSWORD,
-    }
+    logging.info("Connecting to AUTH DB...")
 
-    logging.info("Opening DB connection")
+    conn_users = psycopg2.connect(
+        host=PG_HOST, port=PG_PORT, dbname=PG_DB,
+        user=PG_USER, password=PG_PASSWORD
+    )
+    users = exec_query(conn_users, QUERY_USERS)
+    conn_users.close()
+    logging.info("Loaded users: %d", len(users))
 
-    with psycopg2.connect(**db_config) as conn:
-        users = exec_query(conn, QUERY_USERS)
-        logging.info("Loaded users: %d", len(users))
+    logging.info("Connecting to PROJECT DB...")
 
-        # сюда потом добавятся другие запросы
-        # data2 = exec_query(conn, QUERY_2)
-        # data3 = exec_query(conn, QUERY_3)
+    conn_proj = psycopg2.connect(
+        host=PG_HOST, port=PG_PORT, dbname=PG_DB2,
+        user=PG_USER, password=PG_PASSWORD
+    )
+    projects = exec_query(conn_proj, QUERY_PROJECTS)
+    conn_proj.close()
+    logging.info("Loaded projects: %d", len(projects))
 
-        # ничего не делаем с данными — пока
+    # Excel output
+    workbook = xlsxwriter.Workbook("testIt_report.xlsx")
+
+    write_sheet(workbook, "Users", users)
+    write_sheet(workbook, "Projects", projects)
+    write_summary(workbook, users, projects)
+
+    workbook.close()
+    logging.info("testIt_report.xlsx created")
 
 
 if __name__ == "__main__":
