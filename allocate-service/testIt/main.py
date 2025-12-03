@@ -50,6 +50,7 @@ GROUP BY u."Id", u."UserName", u."FirstName", u."MiddleName",
 ORDER BY u."UserName";
 """
 
+
 QUERY_PROJECTS = """
 SELECT
     p."Id",
@@ -156,45 +157,46 @@ def write_summary(workbook, users, projects):
 
 
 def main():
-    logging.info("Connecting to AUTH DB")
+    logging.info("Connecting to AUTH DB...")
     with psycopg2.connect(
         host=PG_HOST, port=PG_PORT, dbname=PG_DB, user=PG_USER, password=PG_PASSWORD
     ) as conn_users:
         users = exec_query(conn_users, QUERY_USERS)
-    logging.info("Users loaded: %d", len(users))
+    logging.info(f"Users loaded: {len(users)}")
 
-    logging.info("Connecting to PROJECT DB")
+    logging.info("Connecting to PROJECT DB...")
     with psycopg2.connect(
         host=PG_HOST, port=PG_PORT, dbname=PG_DB2, user=PG_USER, password=PG_PASSWORD
     ) as conn_proj:
         projects = exec_query(conn_proj, QUERY_PROJECTS)
-    logging.info("Projects loaded: %d", len(projects))
+    logging.info(f"Projects loaded: {len(projects)}")
 
-    logging.info("Loading BK SQLite database")
+    logging.info("Opening BK SQLite database...")
     conn_bk = sqlite3.connect("bk.sqlite")
     conn_bk.row_factory = sqlite3.Row
-    bk_rows = conn_bk.execute("SELECT * FROM bk").fetchall()
+    bk_rows = conn_bk.execute("SELECT * FROM Users").fetchall()
     conn_bk.close()
 
     bk_users = [dict(r) for r in bk_rows]
-    logging.info("BK users loaded: %d", len(bk_users))
+    logging.info(f"BK users loaded: {len(bk_users)}")
 
     pg_usernames = {u["UserName"] for u in users}
     matched_bk_users = []
 
-    logging.info("Matching BK users with PG users")
+    logging.info("Matching BK users to PostgreSQL users...\n")
 
     for bk in bk_users:
         sam = bk.get("sAMAccountName")
-        logging.info(f"Checking BK user: {sam}")
+        if not sam:
+            continue
 
         if sam in pg_usernames:
-            logging.info(f" MATCH → {sam}")
+            logging.info(f"✔ Найден пользователь: {sam}")
             matched_bk_users.append(bk)
         else:
-            logging.info(f" TECH ACCOUNT / SKIPPED → {sam}")
+            logging.info(f"⚠ Не найден в BK (возможная тех. учётка): {sam}")
 
-    logging.info(f"Matched BK users: {len(matched_bk_users)}")
+    logging.info(f"\nMatched BK users total: {len(matched_bk_users)}")
 
     workbook = xlsxwriter.Workbook("testIt_report.xlsx")
 
