@@ -5,8 +5,14 @@ import requests
 import humanize
 
 from config import (
-    DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASS,
-    NEXUS_URL, NEXUS_USER, NEXUS_PASS
+    DB_HOST,
+    DB_PORT,
+    DB_NAME,
+    DB_USER,
+    DB_PASS,
+    NEXUS_URL,
+    NEXUS_USER,
+    NEXUS_PASS,
 )
 
 logger = logging.getLogger("nexus_api")
@@ -16,13 +22,10 @@ logger = logging.getLogger("nexus_api")
 # PostgreSQL
 # ============================================================
 
+
 def pg_connect():
     return psycopg2.connect(
-        host=DB_HOST,
-        port=DB_PORT,
-        dbname=DB_NAME,
-        user=DB_USER,
-        password=DB_PASS
+        host=DB_HOST, port=DB_PORT, dbname=DB_NAME, user=DB_USER, password=DB_PASS
     )
 
 
@@ -42,6 +45,7 @@ def pg_execute_custom(fn):
 # Размеры репозиториев
 # ============================================================
 
+
 def get_repository_sizes():
     """
     Возвращает:
@@ -51,22 +55,37 @@ def get_repository_sizes():
             "size_human": "117.74 MB"
         }
     }
+
+    Теперь подробно логируем ВСЕ шаги.
     """
 
+    logger.info("=== Получение размеров репозиториев ===")
+
     def _exec(cur):
-        cur.execute("""
+        logger.info("Запрос списка таблиц *_content_repository …")
+
+        cur.execute(
+            """
             SELECT tablename
             FROM pg_catalog.pg_tables
             WHERE tablename LIKE %s;
-        """, ("%_content_repository",))
+        """,
+            ("%_content_repository",),
+        )
 
         table_names = [row[0] for row in cur.fetchall()]
+
+        logger.info(f"Найдено {len(table_names)} таблиц контента:")
+        for t in table_names:
+            logger.info(f"  - {t}")
+
         repo_sizes = {}
 
         for table in table_names:
             repo_type = table.replace("_content_repository", "")
-            logger.info(f"Сканируем репозитории типа: {repo_type}")
+            logger.info(f"→ Обработка формата: {repo_type}")
 
+            # Генерация SQL запроса
             query = sql.SQL("""
                 SELECT r.name, SUM(blob_size)
                 FROM {} AS blob
@@ -77,18 +96,32 @@ def get_repository_sizes():
             """).format(
                 sql.Identifier(f"{repo_type}_asset_blob"),
                 sql.Identifier(f"{repo_type}_asset"),
-                sql.Identifier(f"{repo_type}_content_repository")
+                sql.Identifier(f"{repo_type}_content_repository"),
             )
 
-            cur.execute(query)
+            logger.info(f"SQL для формата {repo_type} сгенерирован, выполняем…")
 
-            for repo_name, size in cur.fetchall():
-                size = size or 0
+            cur.execute(query)
+            rows = cur.fetchall()
+
+            logger.info(f"Получено {len(rows)} строк для формата {repo_type}")
+
+            for repo_name, size in rows:
+                if size is None:
+                    logger.warning(
+                        f"!!! Репозиторий {repo_name} имеет NULL size — записываем 0"
+                    )
+                    size = 0
+                logger.info(
+                    f"  Репозиторий {repo_name}: size = {size} bytes ({humanize.naturalsize(size)})"
+                )
+
                 repo_sizes[repo_name] = {
                     "size_bytes": size,
-                    "size_human": humanize.naturalsize(size)
+                    "size_human": humanize.naturalsize(size),
                 }
 
+        logger.info("=== Завершено получение размеров репозиториев ===")
         return repo_sizes
 
     return pg_execute_custom(_exec)
@@ -98,6 +131,7 @@ def get_repository_sizes():
 # Roles API
 # ============================================================
 
+
 def nexus_session():
     s = requests.Session()
     s.auth = (NEXUS_USER, NEXUS_PASS)
@@ -106,67 +140,70 @@ def nexus_session():
 
 def get_roles():
     url = f"{NEXUS_URL}/service/rest/v1/security/roles"
-    logger.info("Запрашиваем роли Nexus...")
+    logger.info("Запрашиваем роли Nexus…")
     resp = nexus_session().get(url)
     resp.raise_for_status()
+    logger.info(f"Получено {len(resp.json())} ролей")
     return resp.json()
 
 
 # ============================================================
-# AD-группы → репозитории
+# AD-группы → репозитории (default roles)
 # ============================================================
+
 
 def extract_ad_group_repo_mapping(roles):
     """
     Возвращает список:
     [
-        {"ad_group": "UNAITP-15473_SRE", "repository": "docker-test-minio"},
+        {"ad_group": "...", "repository": "..."},
         ...
     ]
 
-    Берём только source == "default".
-    Репозитории достаём из привилегий вида:
-    nx-repository-<perm>-<format>-<repo-name-with-dashes>-<action>
+    Фильтруем:
+    - source == "default"
+    - НЕ включаем nx-admin*
+    - НЕ включаем nx-anonymous*
     """
 
+    logger.info("=== Обрабатываем AD-группы ===")
     mappings = []
 
     for role in roles:
-        if role.get("source") != "default":
+        source = role.get("source")
+        if source != "default":
             continue
 
         ad_group = role["id"]
-        privileges = role.get("privileges", [])
 
+        # 🔥 СКИПАЕМ системные роли
+        if ad_group.startswith("nx-admin") or ad_group.startswith("nx-anonymous"):
+            logger.info(f"Пропускаем системную роль: {ad_group}")
+            continue
+
+        privileges = role.get("privileges", [])
         repos = set()
+
+        logger.info(f"Роль AD: {ad_group}, привилегий: {len(privileges)}")
 
         for p in privileges:
             if not p.startswith("nx-repository-"):
                 continue
 
             parts = p.split("-")
-            # пример:
-            # nx-repository-view-docker-docker-test-minio-*
-            # 0: nx
-            # 1: repository
-            # 2: view
-            # 3: docker
-            # 4..-2: части имени репозитория
-            # -1: action (*, read, write...)
             if len(parts) < 6:
+                logger.warning(f"Неполная привилегия: {p}")
                 continue
 
+            # Правильный разбор имени репо (учёт дефисов!)
             repo_name = "-".join(parts[4:-1])
-            if not repo_name:
-                continue
+
+            logger.info(f"  Привилегия: {p} → репозиторий: {repo_name}")
 
             repos.add(repo_name)
 
         for repo in sorted(repos):
-            mappings.append({
-                "ad_group": ad_group,
-                "repository": repo
-            })
+            mappings.append({"ad_group": ad_group, "repository": repo})
 
-    logger.info(f"Найдено {len(mappings)} связей AD-группа → репозиторий")
+    logger.info(f"=== Найдено {len(mappings)} связей AD → repo ===")
     return mappings
