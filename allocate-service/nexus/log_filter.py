@@ -1,228 +1,227 @@
 import sqlite3
-import pandas as pd
-from datetime import timedelta, datetime
-from dateutil import parser
 import logging
+from datetime import timedelta
 
-from config import MAX_SESSION_INTERVAL_MIN, MERGE_SESSION_GAP_MIN
-
+import pandas as pd
 
 log = logging.getLogger("log_filter")
 
 
-"""
-Анализ логов Nexus: группировка обращений пользователей по репозиториям.
+def parse_log_record(d: dict):
+    """
+    Приведение сырой записи (dict) к целевому формату или пропуск.
 
-Механизм работы:
-----------------
-1. Логи сортируются по инициатору, репозиторию и времени.
-2. Каждое обращение (session) — последовательность запросов от одного
-   initiator к одному repo без пауз дольше max_interval.
-3. Если пауза между сессиями меньше merge_gap — они объединяются.
+    d — запись из SQLite (колонки: id, timestamp, initiator, repo).
+    """
+    initiator = d.get("initiator", "")
 
-Параметры:
------------
-MAX_SESSION_INTERVAL_MIN – допустимая пауза внутри одной сессии.
-MERGE_SESSION_GAP_MIN    – допустимая пауза между соседними сессиями.
-
-Итог:
-------
-Возвращает словарь:
-- sessions        — итоговые объединённые сессии
-- repo_stats      — количество обращений по репозиториям
-- users_by_repo   — пользователи каждого репозитория
-- normal_users    — пользователи с именами
-- anonymous_users — записи, где initiator = IP
-"""
-
-
-# ============================================================
-# Умный парсер timestamp
-# ============================================================
-
-KNOWN_FORMATS = [
-    "%Y-%m-%d %H:%M:%S,%f%z",      # 2025-08-26 00:00:00,035+0000
-    "%Y-%m-%dT%H:%M:%S.%fZ",       # ISO-8601
-    "%Y-%m-%dT%H:%M:%S%z",
-    "%Y-%m-%d %H:%M:%S%z",
-    "%Y-%m-%d %H:%M:%S",
-]
-
-def parse_ts_smart(ts):
-    ts = str(ts).strip()
-    if not ts:
+    # Пропускаем системные задания Nexus (*TASK, system, scheduled и т.п.)
+    if isinstance(initiator, str) and "task" in initiator.lower():
         return None
 
-    # пробуем точные форматы
-    for fmt in KNOWN_FORMATS:
-        try:
-            return datetime.strptime(ts, fmt)
-        except:
-            pass
-
-    # fallback
-    try:
-        return parser.parse(ts)
-    except:
+    # Эти поля сейчас отсутствуют, но логика старая — оставляем
+    if d.get("domain") == "tasks" or d.get("type") == "scheduled":
         return None
 
+    repo_name = d.get("repo")
 
-# ============================================================
-# Извлечение username / IP
-# ============================================================
+    return {
+        "timestamp": d.get("timestamp"),
+        "initiator": initiator,
+        "repo": repo_name,
+    }
 
-def extract_user_ip(initiator: str):
+
+def analyze_logs(db_path: str):
     """
-    Разбирает строки формата:
-    - "user/ip"
-    - "ip"
-    - "user"
+    Выполняет ровно ту же логику, что была в твоём main:
+
+    - фильтрация
+    - парсинг timestamp в %Y-%m-%d %H:%M:%S,%f%z
+    - сессии + объединение
+    - repo_stats
+    - repo_users
+    - users_normal / users_anonymous_flat
     """
-    s = str(initiator).strip()
 
-    if "/" in s:
-        user, ip = s.split("/", 1)
-        return user or "anonymous", ip
-
-    # чистый IPv4
-    if s.count(".") == 3 and all(part.isdigit() for part in s.split(".")):
-        return "anonymous", s
-
-    if s:
-        return s, None
-
-    return "anonymous", None
-
-
-# ============================================================
-# Основная функция обработки логов
-# ============================================================
-
-def process_logs(db_path: str):
-    log.info("Чтение raw_logs из SQLite")
-
+    log.info("Читаем данные из SQLite")
     conn = sqlite3.connect(db_path)
-    df = pd.read_sql_query(
-        "SELECT timestamp, initiator, repo FROM raw_logs",
-        conn
+
+    df_raw = pd.read_sql_query(
+        "SELECT id, timestamp, initiator, repo FROM raw_logs", conn
     )
     conn.close()
 
-    log.info(f"Всего записей: {len(df)}")
+    log.info(f"Всего строк в raw_logs: {len(df_raw)}")
 
-    # ----------------------------------------------------
-    # Фильтрация задач Nexus (task)
-    # ----------------------------------------------------
-    df = df[~df["initiator"].astype(str).str.contains("task", case=False, na=False)]
-    df = df[df["repo"].notna()]
+    # 3. Фильтрация и приведение к рабочему формату
+    log.info("Фильтруем и приводим записи к рабочему виду")
 
-    log.info(f"После фильтрации системных задач: {len(df)}")
+    records = []
+    for raw in df_raw.to_dict(orient="records"):
+        parsed = parse_log_record(raw)
+        if parsed:
+            records.append(parsed)
 
-    # ----------------------------------------------------
-    # Парсинг timestamp
-    # ----------------------------------------------------
-    df["timestamp"] = df["timestamp"].apply(parse_ts_smart)
+    df = pd.DataFrame(records)
+    log.info(f"После фильтрации валидных записей: {len(df)}")
+
+    if df.empty:
+        log.error("Не найдено ни одной валидной записи")
+        raise SystemExit("Нет данных для анализа")
+
+    # 4. Приведение временных меток
+    log.info("Преобразуем timestamp в datetime")
+
+    df["timestamp"] = pd.to_datetime(
+        df["timestamp"], format="%Y-%m-%d %H:%M:%S,%f%z", errors="coerce"
+    )
+
+    before = len(df)
     df = df.dropna(subset=["timestamp"])
+    after = len(df)
 
-    log.info(f"После нормализации timestamp: {len(df)}")
+    log.info(f"Удалено строк с некорректным timestamp: {before - after}")
 
-    # ----------------------------------------------------
-    # Разбор initiator: username + ip
-    # ----------------------------------------------------
-    df[["username", "ip"]] = df["initiator"].apply(
-        lambda x: pd.Series(extract_user_ip(x))
+    # Разбивка initiator на username / ip
+    log.info("Извлекаем username и IP из initiator")
+
+    df[["username", "ip"]] = (
+        df["initiator"].astype(str).str.extract(r"^(?:(.+?)/)?(\d+\.\d+\.\d+\.\d+)$")
     )
 
-    # ----------------------------------------------------
-    # Сортировка
-    # ----------------------------------------------------
-    df = df.sort_values(by=["username", "repo", "timestamp"])
+    df["username"] = df["username"].fillna("anonymous")
+    df = df[~df["username"].str.contains(r"\*TASK", na=False)]
 
-    # ============================================================
-    # Формирование первичных сессий
-    # ============================================================
+    df = df.sort_values(by=["initiator", "repo", "timestamp"])
+    log.info(f"После сортировки и фильтрации осталось {len(df)} строк")
 
-    max_interval = timedelta(minutes=MAX_SESSION_INTERVAL_MIN)
+    # 5. Формирование первичных сессий
+    log.info("Формируем первичные сессии")
 
-    df["new_session"] = (
-        (df["username"] != df["username"].shift()) |
-        (df["repo"] != df["repo"].shift()) |
-        ((df["timestamp"] - df["timestamp"].shift()) > max_interval)
+    max_interval = timedelta(minutes=5)
+    df["gap"] = (
+        (df["initiator"] != df["initiator"].shift())
+        | (df["repo"] != df["repo"].shift())
+        | ((df["timestamp"] - df["timestamp"].shift()) > max_interval)
     )
-
-    df["session_id"] = df["new_session"].cumsum()
+    df["session_id"] = df["gap"].cumsum()
 
     sessions = (
-        df.groupby(["username", "repo", "session_id"])
+        df.groupby(["initiator", "repo", "session_id"])
         .agg(
             start_time=("timestamp", "min"),
             end_time=("timestamp", "max"),
-            ip=("ip", "first")
-        )
-        .reset_index()
-    )
-
-    # ============================================================
-    # Объединение коротких последовательных сессий
-    # ============================================================
-
-    merge_gap = timedelta(minutes=MERGE_SESSION_GAP_MIN)
-
-    sessions = sessions.sort_values(["username", "repo", "start_time"])
-
-    sessions["is_new"] = (
-        (sessions["username"] != sessions["username"].shift()) |
-        (sessions["repo"] != sessions["repo"].shift()) |
-        ((sessions["start_time"] - sessions["end_time"].shift()) > merge_gap)
-    )
-
-    sessions["merged_id"] = sessions["is_new"].cumsum()
-
-    merged = (
-        sessions.groupby(["username", "repo", "merged_id"])
-        .agg(
-            start_time=("start_time", "min"),
-            end_time=("end_time", "max"),
+            username=("username", "first"),
             ip=("ip", "first"),
         )
         .reset_index()
     )
 
-    # ============================================================
-    # Статистика по репозиториям
-    # ============================================================
+    log.info(f"Первичных сессий: {len(sessions)}")
 
-    repo_stats = (
-        merged.groupby("repo")
+    # 6. Объединение коротких подряд идущих сессий
+    log.info("Объединяем короткие подряд идущие сессии")
+
+    sessions = sessions.sort_values(by=["initiator", "repo", "start_time"])
+    merge_gap = timedelta(minutes=1)
+
+    sessions["merge_gap"] = (
+        (sessions["initiator"] != sessions["initiator"].shift())
+        | (sessions["repo"] != sessions["repo"].shift())
+        | ((sessions["start_time"] - sessions["end_time"].shift()) > merge_gap)
+    )
+
+    sessions["merged_session_id"] = sessions["merge_gap"].cumsum()
+
+    sessions = (
+        sessions.groupby(["initiator", "repo", "merged_session_id"])
         .agg(
-            total_sessions=("merged_id", "count"),
-            unique_users=("username", pd.Series.nunique)
+            start_time=("start_time", "min"),
+            end_time=("end_time", "max"),
+            username=("username", "first"),
+            ip=("ip", "first"),
         )
         .reset_index()
     )
 
-    # ============================================================
-    # Список пользователей по каждому репозиторию
-    # (исправленный, без FutureWarning)
-    # ============================================================
+    log.info(f"Сессий после объединения: {len(sessions)}")
 
-    users_by_repo = (
-        merged.groupby("repo")["username"]
-        .agg(lambda x: sorted(set(x)))
+    # 7. user_identity
+    log.info("Формируем user_identity")
+
+    sessions["user_identity"] = sessions.apply(
+        lambda r: (
+            r["username"] if r["username"] not in {"anonymous", "*UNKNOWN"} else r["ip"]
+        ),
+        axis=1,
+    )
+
+    # 8. Сводка по репозиториям
+    log.info("Считаем сводку по репозиториям")
+
+    repo_stats = (
+        sessions.groupby("repo")
+        .agg(
+            total_requests=("merged_session_id", "count"),
+            total_users=("user_identity", pd.Series.nunique),
+        )
+        .reset_index()
+    )
+
+    # 9. Пользователи по репозиторию
+    log.info("Формируем список пользователей по репозиторию")
+
+    def combine_users_with_ips(group):
+        mapping = {}
+        for _, row in group.iterrows():
+            u = row["username"]
+            ip = row["ip"]
+            if pd.isna(ip) and u in {"anonymous", "*UNKNOWN"}:
+                continue
+            if u in {"anonymous", "*UNKNOWN"}:
+                mapping[ip] = None
+            else:
+                mapping[u] = ip
+        parts = []
+        for user, ip in sorted([(u, i) for u, i in mapping.items() if u is not None]):
+            if ip:
+                parts.append(f"{user} ({ip})")
+            else:
+                parts.append(user)
+        return ", ".join(parts)
+
+    repo_users = (
+        sessions.groupby("repo", group_keys=False)[["username", "ip"]]
+        .apply(combine_users_with_ips)
         .reset_index(name="users")
     )
 
-    # ============================================================
-    # Разделение пользователей
-    # ============================================================
+    # 10. Пользователи и IP
+    log.info("Формируем список пользователей и их IP")
 
-    normal_users = merged[merged["username"] != "anonymous"]
-    anonymous_users = merged[merged["username"] == "anonymous"]
+    user_ips = (
+        sessions.groupby("username")["ip"]
+        .apply(lambda x: sorted([ip for ip in set(x) if pd.notna(ip)]))
+        .reset_index()
+        .rename(columns={"ip": "ip_list"})
+    )
+
+    anon_names = {"anonymous", "*UNKNOWN"}
+    users_normal = user_ips[~user_ips["username"].isin(anon_names)]
+    users_anonymous = user_ips[user_ips["username"].isin(anon_names)]
+
+    anon_rows = []
+    for _, row in users_anonymous.iterrows():
+        for ip in row["ip_list"]:
+            anon_rows.append({"username": row["username"], "ip": ip})
+
+    users_anonymous_flat = pd.DataFrame(anon_rows)
 
     return {
-        "sessions": merged,
+        "sessions": sessions,
         "repo_stats": repo_stats,
-        "users_by_repo": users_by_repo,
-        "normal_users": normal_users,
-        "anonymous_users": anonymous_users
+        "repo_users": repo_users,
+        "users_normal": users_normal,
+        "users_anonymous_flat": users_anonymous_flat,
     }

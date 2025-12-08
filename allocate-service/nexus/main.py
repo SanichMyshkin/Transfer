@@ -1,9 +1,10 @@
 import logging
+
+from config import ARCHIVE_PATH, REPORT_PATH
 from log_loader import load_all_audit_logs
-from log_filter import process_logs
+from log_filter import analyze_logs
 from nexus_api import get_repository_sizes, get_roles, extract_ad_group_repo_mapping
-from excel_report import build_excel_report
-from config import REPORT_PATH
+from excel_report import build_full_report
 
 
 logging.basicConfig(
@@ -14,45 +15,28 @@ log = logging.getLogger("main")
 
 
 def main():
-    log.info("Запуск анализа Nexus...")
+    log.info("Старт анализа Nexus")
 
-    # ============================================================
-    # 1. Загрузка логов
-    # ============================================================
-    archive_path = "path/to/archive.zip"  # заменить
-    sqlite_path = load_all_audit_logs(archive_path)
-    log.info(f"SQLite база логов: {sqlite_path}")
+    log.info(f"Архив с логами: {ARCHIVE_PATH}")
+    db_path = load_all_audit_logs(ARCHIVE_PATH)
+    log.info(f"SQLite база: {db_path}")
 
-    # ============================================================
-    # 2. Фильтрация логов
-    # ============================================================
-    log_stats = process_logs(sqlite_path)
-    log.info("Логи обработаны")
+    stats = analyze_logs(str(db_path))
 
-    # ============================================================
-    # 3. Получение размеров репозиториев
-    # ============================================================
     repo_sizes = get_repository_sizes()
-    log.info("Размеры репозиториев получены")
 
-    # ============================================================
-    # 4. Получение AD-групп (default roles)
-    # ============================================================
     roles = get_roles()
     ad_group_repo_map = extract_ad_group_repo_mapping(roles)
 
-    # ============================================================
-    # 5. Генерация Excel
-    # ============================================================
-    build_excel_report(
+    build_full_report(
+        stats=stats,
         repo_sizes=repo_sizes,
-        log_stats=log_stats,
         ad_group_repo_map=ad_group_repo_map,
         output_file=REPORT_PATH,
+        db_path=str(db_path),
     )
 
-    log.info(f"Отчёт готов: {REPORT_PATH}")
-    log.info("Готово!")
+    log.info(f"Отчёт сформирован: {REPORT_PATH}")
 
 
 if __name__ == "__main__":

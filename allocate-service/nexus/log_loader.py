@@ -1,4 +1,3 @@
-# log_loader.py
 import os
 import shutil
 import gzip
@@ -9,9 +8,12 @@ import logging
 from pathlib import Path
 import json
 
-logger = logging.getLogger("log_loader")
+logger = logging.getLogger("audit_loader")
 
 
+# ================================
+# Создание базы
+# ================================
 def init_db(db_path: Path):
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
@@ -28,6 +30,10 @@ def init_db(db_path: Path):
     conn.commit()
     return conn
 
+
+# ================================
+# Вспомогательные функции
+# ================================
 
 def safe_json_parse(line: str):
     """Безопасный json.loads"""
@@ -69,20 +75,16 @@ def extract_gzip(path: Path):
         return None
 
 
+# ================================
+# Рекурсивная распаковка
+# ================================
 def expand_archives(root: Path):
-    """
-    Рекурсивно извлекает zip/tar/gz.
-    Останавливается, когда новых файлов больше не появляется.
-    """
-    processed = set()
-
-    while True:
+    changed = True
+    while changed:
         changed = False
 
         for file in list(root.rglob("*")):
             if not file.is_file():
-                continue
-            if file in processed:
                 continue
 
             name = file.name.lower()
@@ -90,19 +92,13 @@ def expand_archives(root: Path):
             if name.endswith(".zip"):
                 logger.info(f"ZIP → {file}")
                 if extract_zip(file, file.parent):
-                    processed.add(file)
                     file.unlink()
                     changed = True
                 continue
 
-            if (
-                name.endswith(".tar")
-                or name.endswith(".tar.gz")
-                or name.endswith(".tgz")
-            ):
+            if name.endswith(".tar") or name.endswith(".tar.gz") or name.endswith(".tgz"):
                 logger.info(f"TAR → {file}")
                 if extract_tar(file, file.parent):
-                    processed.add(file)
                     file.unlink()
                     changed = True
                 continue
@@ -111,15 +107,14 @@ def expand_archives(root: Path):
                 logger.info(f"GZIP LOG → {file}")
                 out = extract_gzip(file)
                 if out:
-                    processed.add(file)
                     file.unlink()
                     changed = True
                 continue
 
-        if not changed:
-            break
 
-
+# ================================
+# Обработка одного лог-файла
+# ================================
 def load_log_file(path: Path, conn):
     logger.info(f"Чтение: {path}")
 
@@ -133,34 +128,30 @@ def load_log_file(path: Path, conn):
             if not jl:
                 continue
 
-            batch.append(
-                (
-                    jl.get("timestamp"),
-                    jl.get("initiator"),
-                    jl.get("attributes", {}).get("repository.name")
-                    or jl.get("attributes", {}).get("repositoryName"),
-                )
-            )
+            batch.append((
+                jl.get("timestamp"),
+                jl.get("initiator"),
+                jl.get("attributes", {}).get("repository.name")
+                or jl.get("attributes", {}).get("repositoryName")
+            ))
 
             count += 1
 
             if len(batch) >= 10_000:
-                cur.executemany(
-                    "INSERT INTO raw_logs(timestamp, initiator, repo) VALUES (?, ?, ?)",
-                    batch,
-                )
+                cur.executemany("INSERT INTO raw_logs(timestamp, initiator, repo) VALUES (?, ?, ?)", batch)
                 conn.commit()
                 batch.clear()
 
     if batch:
-        cur.executemany(
-            "INSERT INTO raw_logs(timestamp, initiator, repo) VALUES (?, ?, ?)", batch
-        )
+        cur.executemany("INSERT INTO raw_logs(timestamp, initiator, repo) VALUES (?, ?, ?)", batch)
         conn.commit()
 
     logger.info(f" → JSON строк: {count}")
 
 
+# ================================
+# Главная функция
+# ================================
 def load_all_audit_logs(archive_path: str):
     project_dir = Path(".")
     extract_dir = project_dir / "temp_extract"
@@ -172,11 +163,10 @@ def load_all_audit_logs(archive_path: str):
     logger.info(f"Создаём SQLite: {db_path}")
     conn = init_db(db_path)
 
+    # первичное извлечение
     logger.info(f"Извлечение архива: {archive_path}")
-
-    if not extract_zip(Path(archive_path), extract_dir) and not extract_tar(
-        Path(archive_path), extract_dir
-    ):
+    if not extract_zip(Path(archive_path), extract_dir) and \
+       not extract_tar(Path(archive_path), extract_dir):
         raise Exception("Не удалось распаковать главный архив")
 
     expand_archives(extract_dir)
