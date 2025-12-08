@@ -154,19 +154,21 @@ def get_roles():
 
 def extract_ad_group_repo_mapping(roles):
     """
-    Возвращает список:
+    Возвращает:
+    - ВСЕ default роли (кроме nx-admin* и nx-anonymous*)
+    - Для каждой — список репозиториев (может быть пустым)
+
+    Формат:
     [
-        {"ad_group": "...", "repository": "..."},
+        {"ad_group": "GROUP1", "repository": "repo1"},
+        {"ad_group": "GROUP1", "repository": None},
+        {"ad_group": "GROUP2", "repository": "docker-prod"},
         ...
     ]
-
-    Фильтруем:
-    - source == "default"
-    - НЕ включаем nx-admin*
-    - НЕ включаем nx-anonymous*
     """
 
-    logger.info("=== Обрабатываем AD-группы ===")
+    logger.info("=== Обрабатываем AD-группы (source=default) ===")
+
     mappings = []
 
     for role in roles:
@@ -176,15 +178,14 @@ def extract_ad_group_repo_mapping(roles):
 
         ad_group = role["id"]
 
-        # 🔥 СКИПАЕМ системные роли
+        # 🔥 Пропускаем системные роли
         if ad_group.startswith("nx-admin") or ad_group.startswith("nx-anonymous"):
             logger.info(f"Пропускаем системную роль: {ad_group}")
             continue
 
+        # Всегда добавляем роль в список, даже если у неё НЕТ репозиториев
         privileges = role.get("privileges", [])
         repos = set()
-
-        logger.info(f"Роль AD: {ad_group}, привилегий: {len(privileges)}")
 
         for p in privileges:
             if not p.startswith("nx-repository-"):
@@ -192,17 +193,21 @@ def extract_ad_group_repo_mapping(roles):
 
             parts = p.split("-")
             if len(parts) < 6:
-                logger.warning(f"Неполная привилегия: {p}")
                 continue
 
             repo_name = "-".join(parts[4:-1])
-
-            logger.info(f"  Привилегия: {p} → репозиторий: {repo_name}")
-
             repos.add(repo_name)
 
-        for repo in sorted(repos):
-            mappings.append({"ad_group": ad_group, "repository": repo})
+        # Если реп нет → создаём запись с пустым значением
+        if not repos:
+            mappings.append({"ad_group": ad_group, "repository": None})
+        else:
+            for repo in sorted(repos):
+                mappings.append({"ad_group": ad_group, "repository": repo})
 
-    logger.info(f"=== Найдено {len(mappings)} связей AD → repo ===")
+    logger.info(
+        f"=== Всего default AD-групп: {len({m['ad_group'] for m in mappings})} ==="
+    )
+    logger.info(f"=== Всего связей AD → repo: {len(mappings)} ===")
+
     return mappings
