@@ -1,68 +1,133 @@
-# excel_report.py
-
+import os
+import shutil
 import pandas as pd
-import xlsxwriter
+from pathlib import Path
 from config import REPORT_PATH
 
 
+# =====================================================
+#  Удаление временных директорий
+# =====================================================
+
+def cleanup_temp_dirs():
+    paths = [Path("temp_extract"), Path("temp_db")]
+    for p in paths:
+        if p.exists():
+            try:
+                shutil.rmtree(p, ignore_errors=True)
+                print(f"[CLEANUP] Удалена временная директория: {p}")
+            except Exception as e:
+                print(f"[CLEANUP] Не удалось удалить {p}: {e}")
+
+
+# =====================================================
+#  Убираем timezone из datetime (Excel не поддерживает TZ)
+# =====================================================
+
+def strip_tz(df: pd.DataFrame):
+    """Удаляет TZ из всех datetime колонок DataFrame."""
+    for col in df.columns:
+        if pd.api.types.is_datetime64_any_dtype(df[col]):
+            try:
+                df[col] = df[col].dt.tz_localize(None)
+            except Exception:
+                pass
+    return df
+
+
+# =====================================================
+#  Универсальная запись DataFrame в Excel
+# =====================================================
+
+def write_sheet(writer, sheet_name: str, df: pd.DataFrame):
+    """Безопасная запись листа с автошириной."""
+    df = strip_tz(df.copy())
+
+    df.to_excel(writer, sheet_name=sheet_name, index=False)
+    worksheet = writer.sheets[sheet_name]
+
+    # автоширина
+    for idx, col in enumerate(df.columns):
+        column_len = max(
+            len(str(col)),
+            df[col].astype(str).apply(len).max() if len(df) else len(str(col))
+        )
+        worksheet.set_column(idx, idx, column_len + 2)
+
+
+# =====================================================
+#  Главная функция формирования Excel отчёта
+# =====================================================
+
 def build_excel_report(
-    repo_sizes, repo_data, role_repo_map, ad_map, log_stats, output_file=REPORT_PATH
+    repo_sizes,
+    repo_data,
+    role_repo_map,
+    ad_map,
+    log_stats,
+    output_file=REPORT_PATH
 ):
     """
-    repo_sizes: dict {repo: size_bytes}
-    repo_data: list[{...}]
-    role_repo_map: dict {role_id: [repo1, repo2]}
-    ad_map: dict {role_id: AD_group}
-    log_stats: dict из log_filter.process_logs()
+    Формирует многостраничный Excel-отчёт:
+    - Repo Sizes
+    - Repository Info
+    - Roles → AD Groups
+    - Role → Repositories
+    - Repository Stats
+    - Users by Repository
+    - Normal Users
+    - Anonymous Users
+    - Sessions (полная разбивка)
     """
 
+    print("[REPORT] Формируем Excel отчёт...")
+
+    # ---------------------------------------------
+    # Подготовка данных
+    # ---------------------------------------------
+
     df_repo_sizes = pd.DataFrame(
-        [{"repository": r, "size_bytes": size} for r, size in repo_sizes.items()]
+        [{"repository": repo, "size_bytes": size} for repo, size in repo_sizes.items()]
     )
 
-    df_repo_data = pd.DataFrame(repo_data)
+    df_repo_info = pd.DataFrame(repo_data)
 
-    df_roles = pd.DataFrame(
-        [
-            {
-                "role_id": role,
-                "ad_group": ad_map.get(role, ""),
-                "repositories": ", ".join(repos),
-            }
-            for role, repos in role_repo_map.items()
-        ]
-    )
+    df_roles = pd.DataFrame([
+        {
+            "role_id": role,
+            "ad_group": ad_map.get(role, ""),
+            "repositories": ", ".join(repos)
+        }
+        for role, repos in role_repo_map.items()
+    ])
 
     df_repo_stats = log_stats["repo_stats"]
     df_users_by_repo = log_stats["users_by_repo"]
-    df_normal = log_stats["normal_users"]
-    df_anonymous = log_stats["anonymous_users"]
+    df_normal_users = log_stats["normal_users"]
+    df_anon_users = log_stats["anonymous_users"]
+    df_sessions = log_stats["sessions"]
 
+    # ---------------------------------------------
+    # Генерация Excel
+    # ---------------------------------------------
     with pd.ExcelWriter(output_file, engine="xlsxwriter") as writer:
-        df_repo_sizes.to_excel(writer, sheet_name="Repo Sizes", index=False)
-        df_repo_data.to_excel(writer, sheet_name="Repositories", index=False)
-        df_roles.to_excel(writer, sheet_name="Roles → AD → Repos", index=False)
 
-        df_repo_stats.to_excel(writer, sheet_name="Repo Stats", index=False)
-        df_users_by_repo.to_excel(writer, sheet_name="Users by Repo", index=False)
+        write_sheet(writer, "Repo Sizes", df_repo_sizes)
+        write_sheet(writer, "Repo Info", df_repo_info)
+        write_sheet(writer, "Roles", df_roles)
 
-        df_normal.to_excel(writer, sheet_name="Normal Users", index=False)
-        df_anonymous.to_excel(writer, sheet_name="Anonymous Users", index=False)
+        write_sheet(writer, "Repo Stats", df_repo_stats)
+        write_sheet(writer, "Users by Repo", df_users_by_repo)
 
-        # автоподгон ширины
-        for sheet_name, df in {
-            "Repo Sizes": df_repo_sizes,
-            "Repositories": df_repo_data,
-            "Roles → AD → Repos": df_roles,
-            "Repo Stats": df_repo_stats,
-            "Users by Repo": df_users_by_repo,
-            "Normal Users": df_normal,
-            "Anonymous Users": df_anonymous,
-        }.items():
-            worksheet = writer.sheets[sheet_name]
-            for i, col in enumerate(df.columns):
-                width = max(df[col].astype(str).map(len).max(), len(col)) + 2
+        write_sheet(writer, "Normal Users", df_normal_users)
+        write_sheet(writer, "Anonymous Users", df_anon_users)
+        write_sheet(writer, "Sessions", df_sessions)
 
-                worksheet.set_column(i, i, width)
+    print(f"[REPORT] Excel сохранён: {output_file}")
 
-    print(f"📊 Отчёт создан: {output_file}")
+    # ---------------------------------------------
+    # Удаляем временные директории
+    # ---------------------------------------------
+    cleanup_temp_dirs()
+
+    print("[REPORT] Отчёт завершён, временные файлы очищены.")
