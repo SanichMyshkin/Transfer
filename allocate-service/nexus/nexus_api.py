@@ -19,7 +19,6 @@ logger = logging.getLogger("nexus_api")
 
 
 def pg_connect():
-    """Создание подключения к PostgreSQL (Nexus DB)."""
     return psycopg2.connect(
         host=DB_HOST, port=DB_PORT, dbname=DB_NAME, user=DB_USER, password=DB_PASS
     )
@@ -45,6 +44,16 @@ def pg_execute_custom(fn):
 
 
 def get_repository_sizes():
+    """
+    Возвращает словарь:
+    {
+        "repo_name": {
+            "size_bytes": int,
+            "size_human": "117.74 MB"
+        }
+    }
+    """
+
     def _exec(cur):
         cur.execute(
             """
@@ -60,7 +69,7 @@ def get_repository_sizes():
 
         for table in table_names:
             repo_type = table.replace("_content_repository", "")
-            logger.info(f"📦 Сканируем репозитории типа: {repo_type}")
+            logger.info(f"Сканируем репозитории типа: {repo_type}")
 
             query = sql.SQL("""
                 SELECT r.name, SUM(blob_size)
@@ -79,8 +88,8 @@ def get_repository_sizes():
 
             for repo_name, size in cur.fetchall():
                 repo_sizes[repo_name] = {
-                    "size_bytes": size,
-                    "size_human": humanize.naturalsize(size) if size else "0 B",
+                    "size_bytes": size or 0,
+                    "size_human": humanize.naturalsize(size or 0),
                 }
 
         return repo_sizes
@@ -88,41 +97,17 @@ def get_repository_sizes():
     return pg_execute_custom(_exec)
 
 
-def get_repository_data():
-    rows = pg_query("""
-        SELECT 
-            r.name AS repository_name,
-            SPLIT_PART(r.recipe_name, '-', 1) AS format,
-            SPLIT_PART(r.recipe_name, '-', 2) AS repository_type,
-            r.attributes->'storage'->>'blobStoreName' AS blob_store_name,
-            COALESCE(r.attributes->'cleanup'->>'policyName', '') AS cleanup_policy
-        FROM repository r
-        ORDER BY format, repository_type, repository_name;
-    """)
-
-    columns = [
-        "repository_name",
-        "format",
-        "repository_type",
-        "blob_store_name",
-        "cleanup_policy",
-    ]
-    return [dict(zip(columns, row)) for row in rows]
-
-
 def nexus_session():
-    session = requests.Session()
-    session.auth = (NEXUS_USER, NEXUS_PASS)
-    return session
+    s = requests.Session()
+    s.auth = (NEXUS_USER, NEXUS_PASS)
+    return s
 
 
 def get_roles():
     url = f"{NEXUS_URL}/service/rest/v1/security/roles"
-    logger.info("Запрашиваем роли Nexus ...")
-
+    logger.info("Запрашиваем роли Nexus...")
     resp = nexus_session().get(url)
     resp.raise_for_status()
-
     return resp.json()
 
 
@@ -131,9 +116,9 @@ def extract_ad_group_repo_mapping(roles):
 
     for role in roles:
         if role.get("source") != "default":
-            continue
+            continue  # только AD-группы
 
-        ad_group = role["id"]
+        ad = role["id"]
         privileges = role.get("privileges", [])
 
         repos = set()
@@ -144,6 +129,7 @@ def extract_ad_group_repo_mapping(roles):
 
             parts = p.split("-")
 
+            # пример:
             if len(parts) < 6:
                 continue
 
@@ -151,7 +137,7 @@ def extract_ad_group_repo_mapping(roles):
             repos.add(repo_name)
 
         for repo in sorted(repos):
-            mappings.append({"ad_group": ad_group, "repository": repo})
+            mappings.append({"ad_group": ad, "repository": repo})
 
-    logger.info(f"Извлечено {len(mappings)} связей AD-группа → репозиторий")
+    logger.info(f"Найдено {len(mappings)} связей AD-группа → репозиторий")
     return mappings

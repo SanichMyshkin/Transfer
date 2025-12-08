@@ -4,9 +4,12 @@ import pandas as pd
 from pathlib import Path
 from config import REPORT_PATH
 
-
 log = logging.getLogger("excel_report")
 
+
+# ============================================================
+#  Очистка временных директорий
+# ============================================================
 
 def cleanup_temp_dirs():
     temp_dirs = [Path("temp_extract"), Path("temp_db")]
@@ -21,7 +24,8 @@ def cleanup_temp_dirs():
 
 
 # ============================================================
-
+#  Удаление TZ (Excel не поддерживает)
+# ============================================================
 
 def strip_tz(df: pd.DataFrame):
     for col in df.columns:
@@ -33,82 +37,80 @@ def strip_tz(df: pd.DataFrame):
     return df
 
 
+# ============================================================
+#  Универсальная запись листа
+# ============================================================
+
 def write_sheet(writer, sheet_name: str, df: pd.DataFrame):
     df = strip_tz(df.copy())
-
     df.to_excel(writer, sheet_name=sheet_name, index=False)
-    worksheet = writer.sheets[sheet_name]
+    ws = writer.sheets[sheet_name]
 
-    # автоширина
+    # Автоширина
     for idx, col in enumerate(df.columns):
         try:
             max_len = max(
                 len(str(col)),
-                df[col].astype(str).map(len).max() if not df.empty else len(str(col)),
+                df[col].astype(str).map(len).max() if len(df) else len(str(col))
             )
-        except Exception:
+        except:
             max_len = len(str(col))
+        ws.set_column(idx, idx, max_len + 2)
 
-        worksheet.set_column(idx, idx, max_len + 2)
 
+# ============================================================
+#  Основная функция формирования отчёта
+# ============================================================
 
 def build_excel_report(
-    repo_sizes, log_stats, ad_group_repo_map, output_file=REPORT_PATH
+    repo_sizes,
+    log_stats,
+    ad_group_repo_map,
+    output_file=REPORT_PATH
 ):
-    """
-    Генерирует итоговый Excel отчёт со всеми листами:
-
-    - Repo Sizes
-    - AD Groups
-    - Repo Stats
-    - Users by Repo
-    - Normal Users
-    - Anonymous Users
-    - Sessions
-    """
-
-    log.info("Начинаем формирование Excel отчёта")
-
-    df_repo_sizes = pd.DataFrame(
-        [
-            {
-                "repository": repo,
-                "size_bytes": data["size_bytes"],
-                "size_human": data["size_human"],
-            }
-            for repo, data in repo_sizes.items()
-        ]
-    )
-
-    df_ad_groups = pd.DataFrame(ad_group_repo_map)
-
-    df_repo_stats = strip_tz(log_stats["repo_stats"])
-    df_users_by_repo = strip_tz(log_stats["users_by_repo"])
-    df_normal_users = strip_tz(log_stats["normal_users"])
-    df_anonymous = strip_tz(log_stats["anonymous_users"])
-    df_sessions = strip_tz(log_stats["sessions"])
-
-    try:
-        with pd.ExcelWriter(output_file, engine="xlsxwriter") as writer:
-            write_sheet(writer, "Repo Sizes", df_repo_sizes)
-            write_sheet(writer, "AD Groups", df_ad_groups)
-
-            write_sheet(writer, "Repo Stats", df_repo_stats)
-            write_sheet(writer, "Users by Repo", df_users_by_repo)
-
-            write_sheet(writer, "Normal Users", df_normal_users)
-            write_sheet(writer, "Anonymous Users", df_anonymous)
-
-            write_sheet(writer, "Sessions", df_sessions)
-
-        log.info(f"Excel отчёт успешно записан: {output_file}")
-
-    except Exception as e:
-        log.error(f"Ошибка при записи Excel: {e}")
-        raise
+    log.info("Формируем Excel отчёт")
 
     # --------------------------------------------------------
-    # Очистка временных директорий
+    # AD Repo Usage (объединённый лист)
     # --------------------------------------------------------
+    rows = []
+
+    for mapping in ad_group_repo_map:
+        ad = mapping["ad_group"]
+        repo = mapping["repository"]
+
+        size_info = repo_sizes.get(repo, {"size_human": "0 B"})
+
+        rows.append({
+            "ad_group": ad,
+            "repository": repo,
+            "size": size_info["size_human"]
+        })
+
+    df_ad_repo_usage = pd.DataFrame(rows)
+
+    # --------------------------------------------------------
+    # Остальные листы из логов
+    # --------------------------------------------------------
+
+    df_repo_stats     = strip_tz(log_stats["repo_stats"])
+    df_users_by_repo  = strip_tz(log_stats["users_by_repo"])
+    df_normal_users   = strip_tz(log_stats["normal_users"])
+    df_anonymous      = strip_tz(log_stats["anonymous_users"])
+
+    # --------------------------------------------------------
+    # Записываем Excel
+    # --------------------------------------------------------
+
+    with pd.ExcelWriter(output_file, engine="xlsxwriter") as writer:
+
+        write_sheet(writer, "AD Repo Usage", df_ad_repo_usage)
+        write_sheet(writer, "Repo Stats", df_repo_stats)
+        write_sheet(writer, "Users by Repo", df_users_by_repo)
+        write_sheet(writer, "Normal Users", df_normal_users)
+        write_sheet(writer, "Anonymous Users", df_anonymous)
+
+    log.info(f"Отчёт создан: {output_file}")
+
     cleanup_temp_dirs()
-    log.info("Очистка временных директорий завершена")
+    log.info("Очищены временные директории")
