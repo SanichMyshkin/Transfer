@@ -1,189 +1,56 @@
 import logging
 import psycopg2
 from psycopg2 import sql
-import requests
+from config import PG_HOST, PG_PORT, PG_USER, PG_PASSWORD, PG_DATABASE
 import humanize
 
-from config import (
-    DB_HOST,
-    DB_PORT,
-    DB_NAME,
-    DB_USER,
-    DB_PASS,
-    NEXUS_URL,
-    NEXUS_USER,
-    NEXUS_PASS,
-)
 
 logger = logging.getLogger("nexus_api")
 
 
 # ============================================================
-# PostgreSQL
+# 1. Получение всех ролей из Nexus API
 # ============================================================
-
-
-def pg_connect():
-    return psycopg2.connect(
-        host=DB_HOST, port=DB_PORT, dbname=DB_NAME, user=DB_USER, password=DB_PASS
-    )
-
-
-def pg_execute_custom(fn):
-    with pg_connect() as conn:
-        with conn.cursor() as cur:
-            try:
-                result = fn(cur)
-                conn.commit()
-                return result
-            except Exception:
-                conn.rollback()
-                raise
-
-
-# ============================================================
-# Размеры репозиториев
-# ============================================================
-
-
-def get_repository_sizes():
-    """
-    Возвращает:
-    {
-        "repo_name": {
-            "size_bytes": int,
-            "size_human": "117.74 MB"
-        }
-    }
-
-    Теперь подробно логируем ВСЕ шаги.
-    """
-
-    logger.info("=== Получение размеров репозиториев ===")
-
-    def _exec(cur):
-        logger.info("Запрос списка таблиц *_content_repository …")
-
-        cur.execute(
-            """
-            SELECT tablename
-            FROM pg_catalog.pg_tables
-            WHERE tablename LIKE %s;
-        """,
-            ("%_content_repository",),
-        )
-
-        table_names = [row[0] for row in cur.fetchall()]
-
-        logger.info(f"Найдено {len(table_names)} таблиц контента:")
-        for t in table_names:
-            logger.info(f"  - {t}")
-
-        repo_sizes = {}
-
-        for table in table_names:
-            repo_type = table.replace("_content_repository", "")
-            logger.info(f"→ Обработка формата: {repo_type}")
-
-            # Генерация SQL запроса
-            query = sql.SQL("""
-                SELECT r.name, SUM(blob_size)
-                FROM {} AS blob
-                JOIN {} AS asset ON blob.asset_blob_id = asset.asset_blob_id
-                JOIN {} AS content_repo ON content_repo.repository_id = asset.repository_id
-                JOIN repository r ON content_repo.config_repository_id = r.id
-                GROUP BY r.name;
-            """).format(
-                sql.Identifier(f"{repo_type}_asset_blob"),
-                sql.Identifier(f"{repo_type}_asset"),
-                sql.Identifier(f"{repo_type}_content_repository"),
-            )
-
-            logger.info(f"SQL для формата {repo_type} сгенерирован, выполняем…")
-
-            cur.execute(query)
-            rows = cur.fetchall()
-
-            logger.info(f"Получено {len(rows)} строк для формата {repo_type}")
-
-            for repo_name, size in rows:
-                if size is None:
-                    logger.warning(
-                        f"!!! Репозиторий {repo_name} имеет NULL size — записываем 0"
-                    )
-                    size = 0
-                logger.info(
-                    f"  Репозиторий {repo_name}: size = {size} bytes ({humanize.naturalsize(size)})"
-                )
-
-                repo_sizes[repo_name] = {
-                    "size_bytes": size,
-                    "size_human": humanize.naturalsize(size),
-                }
-
-        logger.info("=== Завершено получение размеров репозиториев ===")
-        return repo_sizes
-
-    return pg_execute_custom(_exec)
-
-
-# ============================================================
-# Roles API
-# ============================================================
-
-
-def nexus_session():
-    s = requests.Session()
-    s.auth = (NEXUS_USER, NEXUS_PASS)
-    return s
-
 
 def get_roles():
-    url = f"{NEXUS_URL}/service/rest/v1/security/roles"
-    logger.info("Запрашиваем роли Nexus…")
-    resp = nexus_session().get(url)
+    from config import NEXUS_API_URL, NEXUS_USER, NEXUS_PASSWORD
+    import requests
+
+    logger.info("Запрашиваем роли из Nexus API...")
+
+    url = f"{NEXUS_API_URL}/security/roles"
+    resp = requests.get(url, auth=(NEXUS_USER, NEXUS_PASSWORD), timeout=30)
+
     resp.raise_for_status()
-    logger.info(f"Получено {len(resp.json())} ролей")
-    return resp.json()
+    roles = resp.json()
+
+    logger.info(f"Получено ролей: {len(roles)}")
+
+    return roles
 
 
 # ============================================================
-# AD-группы → репозитории (default roles)
+# 2. Правильная выборка: только роли с репозиториями
 # ============================================================
-
 
 def extract_ad_group_repo_mapping(roles):
     """
-    Возвращает:
-    - ВСЕ default роли (кроме nx-admin* и nx-anonymous*)
-    - Для каждой — список репозиториев (может быть пустым)
-
-    Формат:
-    [
-        {"ad_group": "GROUP1", "repository": "repo1"},
-        {"ad_group": "GROUP1", "repository": None},
-        {"ad_group": "GROUP2", "repository": "docker-prod"},
-        ...
-    ]
+    Возвращает ТОЛЬКО те default роли, у которых есть привилегии nx-repository-*.
+    Эти данные нужны для листа RepoUsage.
     """
-
-    logger.info("=== Обрабатываем AD-группы (source=default) ===")
 
     mappings = []
 
     for role in roles:
-        source = role.get("source")
-        if source != "default":
+        if role.get("source") != "default":
             continue
 
         ad_group = role["id"]
 
-        # 🔥 Пропускаем системные роли
+        # пропускаем системные
         if ad_group.startswith("nx-admin") or ad_group.startswith("nx-anonymous"):
-            logger.info(f"Пропускаем системную роль: {ad_group}")
             continue
 
-        # Всегда добавляем роль в список, даже если у неё НЕТ репозиториев
         privileges = role.get("privileges", [])
         repos = set()
 
@@ -198,16 +65,97 @@ def extract_ad_group_repo_mapping(roles):
             repo_name = "-".join(parts[4:-1])
             repos.add(repo_name)
 
-        # Если реп нет → создаём запись с пустым значением
-        if not repos:
-            mappings.append({"ad_group": ad_group, "repository": None})
-        else:
-            for repo in sorted(repos):
-                mappings.append({"ad_group": ad_group, "repository": repo})
+        # ВАЖНО: сюда добавляем ТОЛЬКО роли с репозиториями
+        for repo in sorted(repos):
+            mappings.append({
+                "ad_group": ad_group,
+                "repository": repo
+            })
 
-    logger.info(
-        f"=== Всего default AD-групп: {len({m['ad_group'] for m in mappings})} ==="
-    )
-    logger.info(f"=== Всего связей AD → repo: {len(mappings)} ===")
+    logger.info(f"AD групп с репозиториями: {len({m['ad_group'] for m in mappings})}")
+    logger.info(f"Всего связок AD → repo: {len(mappings)}")
 
     return mappings
+
+
+# ============================================================
+# 3. Все default роли (для LDAP)
+# ============================================================
+
+def extract_all_default_groups(roles):
+    """
+    Возвращает ВСЕ default роли, кроме admin/anonymous.
+    Эти группы пойдут в LDAP.
+    """
+
+    groups = set()
+
+    for role in roles:
+        if role.get("source") != "default":
+            continue
+
+        ad_group = role["id"]
+
+        if ad_group.startswith("nx-admin") or ad_group.startswith("nx-anonymous"):
+            continue
+
+        groups.add(ad_group)
+
+    logger.info(f"Всего default AD групп для LDAP: {len(groups)}")
+
+    return sorted(groups)
+
+
+# ============================================================
+# 4. Получение размеров репозиториев
+# ============================================================
+
+def get_repository_sizes():
+    logger.info("Подключаемся к PostgreSQL чтобы получить размеры репозиториев...")
+
+    repo_sizes = {}
+
+    conn = psycopg2.connect(
+        host=PG_HOST,
+        port=PG_PORT,
+        user=PG_USER,
+        password=PG_PASSWORD,
+        dbname=PG_DATABASE
+    )
+
+    with conn:
+        with conn.cursor() as cur:
+
+            # находим таблицы репозиториев
+            cur.execute(
+                "SELECT tablename FROM pg_catalog.pg_tables WHERE tablename LIKE %s;",
+                ("%_content_repository",)
+            )
+            table_names = [x[0] for x in cur.fetchall()]
+
+            for table in table_names:
+                repo_type = table.replace("_content_repository", "")
+
+                logger.info(f"📦 Читаем репозитории типа: {repo_type}")
+
+                query = sql.SQL("""
+                    SELECT r.name, SUM(blob_size)
+                    FROM {} AS blob
+                    JOIN {} AS asset ON blob.asset_blob_id = asset.asset_blob_id
+                    JOIN {} AS content_repo ON content_repo.repository_id = asset.repository_id
+                    JOIN repository r ON content_repo.config_repository_id = r.id
+                    GROUP BY r.name;
+                """).format(
+                    sql.Identifier(f"{repo_type}_asset_blob"),
+                    sql.Identifier(f"{repo_type}_asset"),
+                    sql.Identifier(table),
+                )
+
+                cur.execute(query)
+
+                for repo_name, size_bytes in cur.fetchall():
+                    repo_sizes[repo_name] = humanize.naturalsize(size_bytes or 0, binary=True)
+
+    logger.info(f"Размеры репозиториев получены: {len(repo_sizes)} шт.")
+
+    return repo_sizes
