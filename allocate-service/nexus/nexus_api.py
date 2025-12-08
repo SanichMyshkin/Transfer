@@ -195,7 +195,6 @@ def extract_ad_group_repo_mapping(roles):
                 logger.warning(f"Неполная привилегия: {p}")
                 continue
 
-            # Правильный разбор имени репо (учёт дефисов!)
             repo_name = "-".join(parts[4:-1])
 
             logger.info(f"  Привилегия: {p} → репозиторий: {repo_name}")
