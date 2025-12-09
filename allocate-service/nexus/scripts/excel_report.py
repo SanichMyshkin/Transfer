@@ -21,22 +21,73 @@ def prepend_instruction(df, text_lines):
     return pd.concat([pd.DataFrame(rows), df], ignore_index=True)
 
 
+def assemble_bk_users_sheet(matched, no_email, not_found):
+    """
+    Формирует ОДИН лист BK Users со структурой:
+
+    === FOUND IN BK ===
+    данные...
+
+    === TECH ACCOUNTS ===
+    данные...
+
+    === NOT FOUND (FIRED) ===
+    данные...
+    """
+
+    rows = []
+
+    def add_separator(text):
+        rows.append({"__SECTION__": text})
+
+    # FOUND
+    add_separator("=== FOUND IN BK ===")
+    for u in matched:
+        row = {k: v for k, v in u.items() if k != "__CATEGORY__"}
+        rows.append(row)
+
+    # TECH ACCOUNTS
+    add_separator("=== TECH ACCOUNTS ===")
+    for u in no_email:
+        row = {k: v for k, v in u.items() if k != "__CATEGORY__"}
+        rows.append(row)
+
+    # NOT FOUND
+    add_separator("=== NOT FOUND (FIRED) ===")
+    for u in not_found:
+        row = {k: v for k, v in u.items() if k != "__CATEGORY__"}
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
+
+    # Первая колонка всегда __SECTION__ либо нормальные поля
+    if "__SECTION__" not in df.columns:
+        df["__SECTION__"] = None
+
+    # Переносим __SECTION__ в начало листа
+    cols = ["__SECTION__"] + [c for c in df.columns if c != "__SECTION__"]
+    df = df[cols]
+
+    return df
+
+
 def build_full_report(
     log_stats,
     ad_repo_map,
     repo_sizes,
     users_with_groups,
-    bk_users,
+    bk_users,  # теперь tuple: (matched, no_email, not_found)
     output_file,
     db_path,
 ):
     log.info(f"Создаём Excel: {output_file}")
 
+    matched, no_email, not_found = bk_users
+
     # =============================
-    # 1. AD Repo Usage (repo → size + ad_groups)
+    # 1. AD Repo Usage
     # =============================
     ad_rows = []
-
     for repo, groups in ad_repo_map.items():
         size_info = repo_sizes.get(repo, {"size_human": "0 B"})
         ad_rows.append(
@@ -57,7 +108,7 @@ def build_full_report(
     # =============================
     # 3. BK Users
     # =============================
-    df_bk_users = pd.DataFrame(bk_users)
+    df_bk_users = assemble_bk_users_sheet(matched, no_email, not_found)
 
     # =============================
     # 4. ЛОГИ
@@ -120,7 +171,7 @@ def build_full_report(
         df_anon.to_excel(writer, sheet_name="Анонимные пользователи", index=False)
 
         # -------------------------
-        # Автоширина колонок
+        # Автоширина
         # -------------------------
         for sheet_name, df_tmp in {
             "AD Repo Usage": df_ad_usage,
@@ -139,7 +190,7 @@ def build_full_report(
     log.info("Excel готов")
 
     # =============================
-    # Удаление временных директорий
+    # Очистка временных файлов
     # =============================
     log.info("Чистим временные файлы")
 

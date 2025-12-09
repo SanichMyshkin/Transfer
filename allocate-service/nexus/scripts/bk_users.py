@@ -1,13 +1,12 @@
 import logging
 import sqlite3
 
+
 logger = logging.getLogger("bk_users")
 
 
 def load_bk_table():
-    """
-    Загружает таблицу Users из bk.sqlite
-    """
+
     logger.info("Загружаем BK SQLite таблицу Users...")
 
     conn = sqlite3.connect("bk.sqlite")
