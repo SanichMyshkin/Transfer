@@ -1,6 +1,8 @@
 import logging
 import sqlite3
 import re
+from credentials.config import BK_SQLITE_PATH
+
 
 logger = logging.getLogger("bk_users")
 
@@ -8,20 +10,16 @@ logger = logging.getLogger("bk_users")
 def load_bk_table():
     logger.info("Загружаем BK SQLite таблицу Users...")
 
-    conn = sqlite3.connect("bk.sqlite")
+    conn = sqlite3.connect(BK_SQLITE_PATH)
     conn.row_factory = sqlite3.Row
 
-    rows = conn.execute("SELECT * FROM Users").fetchall()
+    rows = conn.execute("SELECT * FROM bk").fetchall()
     conn.close()
 
     logger.info(f"Количество записей BK: {len(rows)}")
 
     return [dict(r) for r in rows]
 
-
-# -----------------------------
-# Проверка на техническую учётку
-# -----------------------------
 
 def is_cyrillic(s: str) -> bool:
     return bool(re.search(r"[а-яА-Я]", s))
@@ -53,7 +51,7 @@ def classify_tech_account(ad_user: dict) -> bool:
     """
 
     email = (ad_user.get("mail") or "").strip().lower()
-    display = (ad_user.get("displayName") or "")
+    display = ad_user.get("displayName") or ""
     login = ad_user.get("ad_user") or ""
 
     if not email:
@@ -69,14 +67,13 @@ def classify_tech_account(ad_user: dict) -> bool:
 # Основной процесс сопоставления
 # -----------------------------
 
+
 def match_bk_users(users_with_groups):
     bk_users = load_bk_table()
 
     # Хэш по email для BK
     bk_by_email = {
-        (u.get("Email") or "").strip().lower(): u
-        for u in bk_users
-        if u.get("Email")
+        (u.get("Email") or "").strip().lower(): u for u in bk_users if u.get("Email")
     }
 
     matched = []

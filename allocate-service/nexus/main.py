@@ -62,7 +62,7 @@ def main():
         ad_repo_map=ad_repo_map,
         repo_sizes=repo_sizes,
         users_with_groups=users_with_groups,
-        bk_users=bk_users,
+        bk_users_tuple=bk_users,
         output_file=REPORT_PATH,
         db_path=str(db_path),
     )

@@ -19,6 +19,7 @@ DB_PASS = os.getenv("DB_PASS", "password")
 ARCHIVE_PATH = os.getenv("NEXUS_AUDIT_ARCHIVE", "path/to/big_archive.zip")
 
 REPORT_PATH = os.getenv("REPORT_PATH", "nexus_report.xlsx")
+BK_SQLITE_PATH = os.getenv("BK_SQLITE_PATH")
 
 # LDAP / AD
 AD_SERVER = os.getenv("AD_SERVER")
