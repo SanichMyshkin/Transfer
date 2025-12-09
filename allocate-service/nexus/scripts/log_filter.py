@@ -1,7 +1,6 @@
 import sqlite3
 import logging
 from datetime import timedelta
-
 import pandas as pd
 
 log = logging.getLogger("log_filter")
@@ -9,33 +8,23 @@ log = logging.getLogger("log_filter")
 
 def parse_log_record(d: dict):
     initiator = d.get("initiator", "")
-
     if isinstance(initiator, str) and "task" in initiator.lower():
         return None
     if d.get("domain") == "tasks" or d.get("type") == "scheduled":
         return None
-
-    repo_name = d.get("repo")
-
     return {
         "timestamp": d.get("timestamp"),
         "initiator": initiator,
-        "repo": repo_name,
+        "repo": d.get("repo"),
     }
 
 
 def analyze_logs(db_path: str):
-    log.info("Читаем данные из SQLite")
     conn = sqlite3.connect(db_path)
-
     df_raw = pd.read_sql_query(
         "SELECT id, timestamp, initiator, repo FROM raw_logs", conn
     )
     conn.close()
-
-    log.info(f"Всего строк в raw_logs: {len(df_raw)}")
-
-    log.info("Фильтруем и приводим записи к рабочему виду")
 
     records = []
     for raw in df_raw.to_dict(orient="records"):
@@ -44,44 +33,26 @@ def analyze_logs(db_path: str):
             records.append(parsed)
 
     df = pd.DataFrame(records)
-    log.info(f"После фильтрации валидных записей: {len(df)}")
-
     if df.empty:
-        log.error("Не найдено ни одной валидной записи")
         raise SystemExit("Нет данных для анализа")
-
-    log.info("Преобразуем timestamp в datetime")
 
     df["timestamp"] = pd.to_datetime(
         df["timestamp"], format="%Y-%m-%d %H:%M:%S,%f%z", errors="coerce"
     )
-
-    before = len(df)
     df = df.dropna(subset=["timestamp"])
-    after = len(df)
-
-    log.info(f"Удалено строк с некорректным timestamp: {before - after}")
-    log.info("Принудительно приводим initiator к формату user/ip")
 
     df["initiator"] = df["initiator"].astype(str)
-
-    # Если нет "/", считаем это username без ip → добавляем фиктивный IP
-    df.loc[~df["initiator"].str.contains("/"), "initiator"] = (
-        df["initiator"] + "/0.0.0.0"
-    )
-
-    log.info("Извлекаем username и IP из initiator (жёсткий разбор)")
-
     df[["username", "ip"]] = df["initiator"].str.extract(
-        r"^([^/]+)/(\d+\.\d+\.\d+\.\d+)$"
+        r"^(?:(.+?)/)?(\d+\.\d+\.\d+\.\d+)$"
     )
+
+    df = df[(df["username"].notna()) | (df["ip"].notna())]
+    if df.empty:
+        raise SystemExit("Нет данных: не найдено ни одного пользователя")
 
     df["username"] = df["username"].fillna("anonymous")
-    df = df[~df["username"].str.contains(r"\*TASK", na=False)]
 
     df = df.sort_values(by=["initiator", "repo", "timestamp"])
-    log.info(f"После сортировки и фильтрации осталось {len(df)} строк")
-    log.info("Формируем первичные сессии")
 
     max_interval = timedelta(minutes=5)
     df["gap"] = (
@@ -102,8 +73,7 @@ def analyze_logs(db_path: str):
         .reset_index()
     )
 
-    log.info(f"Первичных сессий: {len(sessions)}")
-    log.info("Объединяем короткие подряд идущие сессии")
+    sessions = sessions[(sessions["username"].notna()) | (sessions["ip"].notna())]
 
     sessions = sessions.sort_values(by=["initiator", "repo", "start_time"])
     merge_gap = timedelta(minutes=1)
@@ -113,7 +83,6 @@ def analyze_logs(db_path: str):
         | (sessions["repo"] != sessions["repo"].shift())
         | ((sessions["start_time"] - sessions["end_time"].shift()) > merge_gap)
     )
-
     sessions["merged_session_id"] = sessions["merge_gap"].cumsum()
 
     sessions = (
@@ -127,13 +96,10 @@ def analyze_logs(db_path: str):
         .reset_index()
     )
 
-    log.info(f"Сессий после объединения: {len(sessions)}")
-    log.info("Формируем user_identity")
-
-    # Теперь всегда есть username и ip → identity всегда корректен
-    sessions["user_identity"] = sessions["username"] + "/" + sessions["ip"]
-
-    log.info("Считаем сводку по репозиториям")
+    sessions["user_identity"] = sessions.apply(
+        lambda r: r["username"] if r["username"] != "anonymous" else r["ip"],
+        axis=1,
+    )
 
     repo_stats = (
         sessions.groupby("repo")
@@ -144,16 +110,11 @@ def analyze_logs(db_path: str):
         .reset_index()
     )
 
-    log.info("Формируем список пользователей по репозиторию")
-
     def combine_users_with_ips(group):
         mapping = {}
         for _, row in group.iterrows():
             mapping[row["username"]] = row["ip"]
-        parts = []
-        for user, ip in sorted(mapping.items()):
-            parts.append(f"{user} ({ip})")
-        return ", ".join(parts)
+        return ", ".join(f"{u} ({i})" for u, i in sorted(mapping.items()))
 
     repo_users = (
         sessions.groupby("repo", group_keys=False)[["username", "ip"]]
@@ -161,11 +122,9 @@ def analyze_logs(db_path: str):
         .reset_index(name="users")
     )
 
-    log.info("Формируем список пользователей и их IP")
-
     user_ips = (
         sessions.groupby("username")["ip"]
-        .apply(lambda x: sorted([ip for ip in set(x) if pd.notna(ip)]))
+        .apply(lambda x: sorted(set(i for i in x if pd.notna(i))))
         .reset_index()
         .rename(columns={"ip": "ip_list"})
     )
