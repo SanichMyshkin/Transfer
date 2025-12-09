@@ -1,16 +1,24 @@
 import logging
 
 from credentials.config import ARCHIVE_PATH, REPORT_PATH
+
 from log_loader import load_all_audit_logs
 from log_filter import analyze_logs
+
 from nexus_api import (
     get_roles,
-    extract_ad_group_repo_mapping,
+    extract_group_repo_relation,
     extract_all_default_groups,
     get_repository_sizes,
 )
-from nexus_ldap import fetch_ldap_group_members, aggregate_users_by_groups
+
+from nexus_ldap import (
+    fetch_ldap_group_members,
+    aggregate_users_by_groups,
+)
+
 from bk_users import match_bk_users
+
 from excel_report import build_full_report
 
 
@@ -30,10 +38,10 @@ def main():
     log.info("=== Шаг 3: Получаем роли Nexus ===")
     roles = get_roles()
 
-    log.info("=== Шаг 4: Определяем AD-группы с репозиториями ===")
-    ad_repo_map = extract_ad_group_repo_mapping(roles)
+    log.info("=== Шаг 4: Строим отображение repo → ad_groups ===")
+    ad_repo_map = extract_group_repo_relation(roles)
 
-    log.info("=== Шаг 5: Получаем ВСЕ default AD-группы ===")
+    log.info("=== Шаг 5: Собираем ВСЕ default AD-группы ===")
     ad_groups_all = extract_all_default_groups(roles)
 
     log.info("=== Шаг 6: Получаем размеры репозиториев ===")
@@ -49,13 +57,12 @@ def main():
     bk_users = match_bk_users(users_with_groups)
 
     log.info("=== Шаг 10: Формируем Excel отчёт ===")
-
     build_full_report(
-        log_stats=log_stats,  # 4 листа логов
-        ad_repo_map=ad_repo_map,  # AD → repo
-        repo_sizes=repo_sizes,  # размеры реп
-        users_with_groups=users_with_groups,  # AD Users
-        bk_users=bk_users,  # BK Users
+        log_stats=log_stats,
+        ad_repo_map=ad_repo_map,
+        repo_sizes=repo_sizes,
+        users_with_groups=users_with_groups,
+        bk_users=bk_users,
         output_file=REPORT_PATH,
         db_path=str(db_path),
     )
