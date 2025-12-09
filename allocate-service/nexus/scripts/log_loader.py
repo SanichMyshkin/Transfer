@@ -113,16 +113,57 @@ def load_log_file(path: Path, conn):
     batch = []
     count = 0
 
+    # --- Диагностика формата initiator ---
+    diagnostics = {
+        "initiator_missing": 0,
+        "initiator_string": 0,
+        "initiator_dict": 0,
+        "initiator_other": 0,
+        "principal_found": 0,
+        "createdBy_found": 0,
+    }
+
+    sample_print_limit = 10
+    samples_printed = 0
+    # --------------------------------------
+
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
         for raw_line in f:
             jl = safe_json_parse(raw_line.strip())
             if not jl:
                 continue
 
+            # --- Диагностика initiator ---
+            ini = jl.get("initiator")
+
+            if ini is None:
+                diagnostics["initiator_missing"] += 1
+                # Печатаем примеры "пустых" инициаторов
+                if samples_printed < sample_print_limit:
+                    logger.warning("\n=== SAMPLE: initiator MISSING ===")
+                    logger.warning(raw_line.strip())
+                    samples_printed += 1
+
+            elif isinstance(ini, str):
+                diagnostics["initiator_string"] += 1
+
+            elif isinstance(ini, dict):
+                diagnostics["initiator_dict"] += 1
+
+            else:
+                diagnostics["initiator_other"] += 1
+
+            if jl.get("authentication", {}).get("principal"):
+                diagnostics["principal_found"] += 1
+
+            if jl.get("createdBy"):
+                diagnostics["createdBy_found"] += 1
+            # ------------------------------------
+
             batch.append(
                 (
                     jl.get("timestamp"),
-                    jl.get("initiator"),
+                    jl.get("initiator"),  # <-- пока сохраняем как есть
                     jl.get("attributes", {}).get("repository.name")
                     or jl.get("attributes", {}).get("repositoryName"),
                 )
@@ -145,6 +186,12 @@ def load_log_file(path: Path, conn):
         conn.commit()
 
     logger.info(f" → JSON строк: {count}")
+
+    # --- Вывод итоговой диагностики ---
+    logger.warning("\n======== DIAGNOSTICS: initiator format analysis ========")
+    for k, v in diagnostics.items():
+        logger.warning(f"{k}: {v}")
+    logger.warning("========================================================\n")
 
 
 def load_all_audit_logs(archive_path: str):
