@@ -18,14 +18,9 @@ from config import (
 logger = logging.getLogger("nexus_api")
 
 
-# ============================================================
-# PostgreSQL
-# ============================================================
-
 def pg_connect():
     return psycopg2.connect(
-        host=DB_HOST, port=DB_PORT,
-        dbname=DB_NAME, user=DB_USER, password=DB_PASS
+        host=DB_HOST, port=DB_PORT, dbname=DB_NAME, user=DB_USER, password=DB_PASS
     )
 
 
@@ -41,21 +36,7 @@ def pg_execute_custom(fn):
                 raise
 
 
-# ============================================================
-# Размеры репозиториев
-# ============================================================
-
 def get_repository_sizes():
-    """
-    Возвращает структуру:
-    {
-        "repo_name": {
-            "size_bytes": int,
-            "size_human": "117.4 MB"
-        }
-    }
-    """
-
     logger.info("=== Получение размеров репозиториев ===")
 
     def _exec(cur):
@@ -106,10 +87,6 @@ def get_repository_sizes():
     return pg_execute_custom(_exec)
 
 
-# ============================================================
-# Nexus Roles API
-# ============================================================
-
 def nexus_session():
     s = requests.Session()
     s.auth = (NEXUS_USER, NEXUS_PASS)
@@ -128,78 +105,39 @@ def get_roles():
     return roles
 
 
-# ============================================================
-# AD-группы → репозитории (только группы, имеющие репозитории)
-# ============================================================
-
 def extract_ad_group_repo_mapping(roles):
-    """
-    Возвращает ТОЛЬКО default роли, у которых есть repo-привилегии.
-    Эти данные идут в лист Excel "RepoUsage".
-
-    Пример результата:
-    [
-        {"ad_group": "UNAITP-DEV", "repository": "docker-test"},
-        {"ad_group": "UNAITP-DEV", "repository": "docker-prod"},
-    ]
-    """
-
     logger.info("=== Извлекаем default AD-группы с репозиториями ===")
-
     mappings = []
-
     for role in roles:
         if role.get("source") != "default":
             continue
-
         ad_group = role["id"]
-
-        # Системные роли исключаем
         if ad_group.startswith("nx-admin") or ad_group.startswith("nx-anonymous"):
             continue
-
         privileges = role.get("privileges", [])
         repos = set()
-
-        # Парсим repo-privileges
         for p in privileges:
             if not p.startswith("nx-repository-"):
                 continue
-
             parts = p.split("-")
-
             if len(parts) < 6:
                 continue
-
             repo_name = "-".join(parts[4:-1])
             repos.add(repo_name)
-
-        # Если нет репозиториев → этот AD-group сюда НЕ попадает
         for repo in sorted(repos):
-            mappings.append({
-                "ad_group": ad_group,
-                "repository": repo,
-            })
-
+            mappings.append(
+                {
+                    "ad_group": ad_group,
+                    "repository": repo,
+                }
+            )
     logger.info(f"AD-групп с репозиториями: {len({m['ad_group'] for m in mappings})}")
     logger.info(f"Всего связок AD → repo: {len(mappings)}")
 
     return mappings
 
 
-# ============================================================
-# ВСЕ default AD-группы (для LDAP)
-# ============================================================
-
 def extract_all_default_groups(roles):
-    """
-    Возвращает ВСЕ default роли.
-    Эти группы идут в LDAP поиск пользователей.
-
-    Пример:
-        ["UNAITP-DEV", "UNAITP-QA", "UNAITP-SRE"]
-    """
-
     logger.info("=== Извлекаем ВСЕ default AD-группы ===")
 
     groups = set()
@@ -209,8 +147,6 @@ def extract_all_default_groups(roles):
             continue
 
         group = role["id"]
-
-        # исключаем системные
         if group.startswith("nx-admin") or group.startswith("nx-anonymous"):
             continue
 

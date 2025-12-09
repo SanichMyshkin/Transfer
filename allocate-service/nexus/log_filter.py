@@ -8,18 +8,10 @@ log = logging.getLogger("log_filter")
 
 
 def parse_log_record(d: dict):
-    """
-    Приведение сырой записи (dict) к целевому формату или пропуск.
-
-    d — запись из SQLite (колонки: id, timestamp, initiator, repo).
-    """
     initiator = d.get("initiator", "")
 
-    # Пропускаем системные задания Nexus (*TASK, system, scheduled и т.п.)
     if isinstance(initiator, str) and "task" in initiator.lower():
         return None
-
-    # Эти поля сейчас отсутствуют, но логика старая — оставляем
     if d.get("domain") == "tasks" or d.get("type") == "scheduled":
         return None
 
@@ -33,17 +25,6 @@ def parse_log_record(d: dict):
 
 
 def analyze_logs(db_path: str):
-    """
-    Выполняет ровно ту же логику, что была в твоём main:
-
-    - фильтрация
-    - парсинг timestamp в %Y-%m-%d %H:%M:%S,%f%z
-    - сессии + объединение
-    - repo_stats
-    - repo_users
-    - users_normal / users_anonymous_flat
-    """
-
     log.info("Читаем данные из SQLite")
     conn = sqlite3.connect(db_path)
 
@@ -54,7 +35,6 @@ def analyze_logs(db_path: str):
 
     log.info(f"Всего строк в raw_logs: {len(df_raw)}")
 
-    # 3. Фильтрация и приведение к рабочему формату
     log.info("Фильтруем и приводим записи к рабочему виду")
 
     records = []
@@ -70,7 +50,6 @@ def analyze_logs(db_path: str):
         log.error("Не найдено ни одной валидной записи")
         raise SystemExit("Нет данных для анализа")
 
-    # 4. Приведение временных меток
     log.info("Преобразуем timestamp в datetime")
 
     df["timestamp"] = pd.to_datetime(
@@ -82,8 +61,6 @@ def analyze_logs(db_path: str):
     after = len(df)
 
     log.info(f"Удалено строк с некорректным timestamp: {before - after}")
-
-    # Разбивка initiator на username / ip
     log.info("Извлекаем username и IP из initiator")
 
     df[["username", "ip"]] = (
@@ -95,8 +72,6 @@ def analyze_logs(db_path: str):
 
     df = df.sort_values(by=["initiator", "repo", "timestamp"])
     log.info(f"После сортировки и фильтрации осталось {len(df)} строк")
-
-    # 5. Формирование первичных сессий
     log.info("Формируем первичные сессии")
 
     max_interval = timedelta(minutes=5)
@@ -119,8 +94,6 @@ def analyze_logs(db_path: str):
     )
 
     log.info(f"Первичных сессий: {len(sessions)}")
-
-    # 6. Объединение коротких подряд идущих сессий
     log.info("Объединяем короткие подряд идущие сессии")
 
     sessions = sessions.sort_values(by=["initiator", "repo", "start_time"])
@@ -146,8 +119,6 @@ def analyze_logs(db_path: str):
     )
 
     log.info(f"Сессий после объединения: {len(sessions)}")
-
-    # 7. user_identity
     log.info("Формируем user_identity")
 
     sessions["user_identity"] = sessions.apply(
@@ -157,7 +128,6 @@ def analyze_logs(db_path: str):
         axis=1,
     )
 
-    # 8. Сводка по репозиториям
     log.info("Считаем сводку по репозиториям")
 
     repo_stats = (
@@ -169,7 +139,6 @@ def analyze_logs(db_path: str):
         .reset_index()
     )
 
-    # 9. Пользователи по репозиторию
     log.info("Формируем список пользователей по репозиторию")
 
     def combine_users_with_ips(group):
@@ -197,7 +166,6 @@ def analyze_logs(db_path: str):
         .reset_index(name="users")
     )
 
-    # 10. Пользователи и IP
     log.info("Формируем список пользователей и их IP")
 
     user_ips = (

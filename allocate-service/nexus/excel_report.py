@@ -9,6 +9,9 @@ log = logging.getLogger("excel_report")
 
 def prepend_instruction(df, text_lines):
     """Добавляет строки-инструкции перед таблицей, без смещения столбцов."""
+    if df is None or df.empty:
+        return df
+
     blank_row = {col: None for col in df.columns}
     instruction_rows = []
     for line in text_lines:
@@ -19,33 +22,29 @@ def prepend_instruction(df, text_lines):
     return pd.concat([pd.DataFrame(instruction_rows), df], ignore_index=True)
 
 
-# =============================================================================
-# ОСНОВНОЙ ОТЧЁТ (все листы)
-# =============================================================================
 def build_full_report(
     log_stats,
     ad_repo_map,
     repo_sizes,
     users_with_groups,
+    bk_users,
     output_file,
-    db_path
+    db_path,
 ):
     """
     Формирует Excel отчёт, включающий:
 
     1. AD Repo Usage
     2. AD Users
-    3. Сводка по репозиториям (логи)
-    4. Пользователи по репозиторию (логи)
-    5. Обычные пользователи (логи)
-    6. Анонимные пользователи (логи)
+    3. BK Users
+    4. Сводка по репозиториям (логи)
+    5. Пользователи по репозиторию (логи)
+    6. Обычные пользователи (логи)
+    7. Анонимные пользователи (логи)
     """
 
     log.info(f"Создаём Excel: {output_file}")
 
-    # =============================
-    # 1. AD Repo Usage
-    # =============================
     ad_rows = []
 
     for m in ad_repo_map:
@@ -53,92 +52,79 @@ def build_full_report(
         repo = m["repository"]
 
         size_info = repo_sizes.get(repo)
-        if size_info:
-            size_human = size_info["size_human"]
-        else:
-            size_human = "0 B"
+        size_human = size_info["size_human"] if size_info else "0 B"
 
-        ad_rows.append({
-            "ad_group": ad_group,
-            "repository": repo,
-            "size": size_human
-        })
+        ad_rows.append({"ad_group": ad_group, "repository": repo, "size": size_human})
 
     df_ad_usage = pd.DataFrame(ad_rows)
 
-
-    # =============================
-    # 2. AD Users
-    # =============================
     df_ad_users = pd.DataFrame(users_with_groups)
 
+    df_bk_users = pd.DataFrame(bk_users)
 
-    # =============================
-    # 3. Логи (как раньше)
-    # =============================
     sessions = log_stats["sessions"]
     repo_stats = log_stats["repo_stats"]
     repo_users = log_stats["repo_users"]
     users_normal = log_stats["users_normal"]
     users_anonymous_flat = log_stats["users_anonymous_flat"]
 
-    # Убираем TZ
     for col in ["start_time", "end_time"]:
         if col in sessions.columns and hasattr(sessions[col].dtype, "tz"):
             sessions[col] = sessions[col].dt.tz_localize(None)
 
-
-    # =============================
-    # Пишем Excel
-    # =============================
     with pd.ExcelWriter(output_file, engine="xlsxwriter") as writer:
-
-        # -- Лист 1: AD Repo Usage
         df_ad_usage.to_excel(writer, sheet_name="AD Repo Usage", index=False)
 
-        # -- Лист 2: AD Users
         df_ad_users.to_excel(writer, sheet_name="AD Users", index=False)
 
-        # -- Лист 3: Сводка по репозиториям
-        df_repo_summary = prepend_instruction(repo_stats, [
-            "Эта таблица показывает, сколько обращений было к каждому репозиторию.",
-            "Поля: total_requests — количество обращений, total_users — уникальных пользователей.",
-            ""
-        ])
-        df_repo_summary.to_excel(writer, sheet_name="Сводка по репозиториям", index=False)
+        df_bk_users.to_excel(writer, sheet_name="BK Users", index=False)
 
-        # -- Лист 4: Пользователи по репозиторию
-        df_repo_users = prepend_instruction(repo_users, [
-            "Здесь видно, кто именно обращался к каждому репозиторию.",
-            "Формат: username (ip). Если только IP — пользователь анонимный.",
-            ""
-        ])
-        df_repo_users.to_excel(writer, sheet_name="Пользователи по репозиторию", index=False)
+        df_repo_summary = prepend_instruction(
+            repo_stats,
+            [
+                "Эта таблица показывает, сколько обращений было к каждому репозиторию.",
+                "Поля: total_requests — количество обращений, total_users — уникальных пользователей.",
+                "",
+            ],
+        )
+        df_repo_summary.to_excel(
+            writer, sheet_name="Сводка по репозиториям", index=False
+        )
 
-        # -- Лист 5: Обычные пользователи
-        df_normal = prepend_instruction(users_normal, [
-            "Список зарегистрированных пользователей и IP-адресов, с которых они подключались.",
-            ""
-        ])
+        df_repo_users = prepend_instruction(
+            repo_users,
+            [
+                "Здесь видно, кто именно обращался к каждому репозиторию.",
+                "Формат: username (ip). Если только IP — пользователь анонимный.",
+                "",
+            ],
+        )
+        df_repo_users.to_excel(
+            writer, sheet_name="Пользователи по репозиторию", index=False
+        )
+        df_normal = prepend_instruction(
+            users_normal,
+            [
+                "Список зарегистрированных пользователей и IP-адресов, с которых они подключались.",
+                "",
+            ],
+        )
         df_normal.to_excel(writer, sheet_name="Обычные пользователи", index=False)
 
-        # -- Лист 6: Анонимные пользователи
-        df_anon = prepend_instruction(users_anonymous_flat, [
-            "Анонимные подключения без логина. Каждый IP — отдельная строка.",
-            ""
-        ])
+        df_anon = prepend_instruction(
+            users_anonymous_flat,
+            ["Анонимные подключения без логина. Каждый IP — отдельная строка.", ""],
+        )
         df_anon.to_excel(writer, sheet_name="Анонимные пользователи", index=False)
 
-        # -------------------------
-        # Автоширина
-        # -------------------------
         for sheet_name, df_tmp in {
             "AD Repo Usage": df_ad_usage,
             "AD Users": df_ad_users,
+            "BK Users": df_bk_users,
             "Сводка по репозиториям": df_repo_summary,
             "Пользователи по репозиторию": df_repo_users,
             "Обычные пользователи": df_normal,
-            "Анонимные пользователи": df_anon
+            "Анонимные пользователи": df_anon,
         }.items():
             worksheet = writer.sheets[sheet_name]
             for i, col in enumerate(df_tmp.columns):
@@ -147,9 +133,6 @@ def build_full_report(
 
     log.info("Excel готов")
 
-    # =============================
-    # Удаляем временные файлы
-    # =============================
     log.info("Чистим временные файлы")
 
     try:
