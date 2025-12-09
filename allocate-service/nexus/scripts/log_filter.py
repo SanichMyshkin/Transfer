@@ -61,7 +61,16 @@ def analyze_logs(db_path: str):
     after = len(df)
 
     log.info(f"Удалено строк с некорректным timestamp: {before - after}")
-    log.info("Извлекаем username и IP из initiator")
+    log.info("Принудительно приводим initiator к формату user/ip")
+
+    df["initiator"] = df["initiator"].astype(str)
+
+    # Если нет "/", считаем это username без ip → добавляем фиктивный IP
+    df.loc[~df["initiator"].str.contains("/"), "initiator"] = (
+        df["initiator"] + "/0.0.0.0"
+    )
+
+    log.info("Извлекаем username и IP из initiator (жёсткий разбор)")
 
     df[["username", "ip"]] = df["initiator"].str.extract(
         r"^([^/]+)/(\d+\.\d+\.\d+\.\d+)$"
@@ -121,12 +130,8 @@ def analyze_logs(db_path: str):
     log.info(f"Сессий после объединения: {len(sessions)}")
     log.info("Формируем user_identity")
 
-    sessions["user_identity"] = sessions.apply(
-        lambda r: (
-            r["username"] if r["username"] not in {"anonymous", "*UNKNOWN"} else r["ip"]
-        ),
-        axis=1,
-    )
+    # Теперь всегда есть username и ip → identity всегда корректен
+    sessions["user_identity"] = sessions["username"] + "/" + sessions["ip"]
 
     log.info("Считаем сводку по репозиториям")
 
@@ -144,20 +149,10 @@ def analyze_logs(db_path: str):
     def combine_users_with_ips(group):
         mapping = {}
         for _, row in group.iterrows():
-            u = row["username"]
-            ip = row["ip"]
-            if pd.isna(ip) and u in {"anonymous", "*UNKNOWN"}:
-                continue
-            if u in {"anonymous", "*UNKNOWN"}:
-                mapping[ip] = None
-            else:
-                mapping[u] = ip
+            mapping[row["username"]] = row["ip"]
         parts = []
-        for user, ip in sorted([(u, i) for u, i in mapping.items() if u is not None]):
-            if ip:
-                parts.append(f"{user} ({ip})")
-            else:
-                parts.append(user)
+        for user, ip in sorted(mapping.items()):
+            parts.append(f"{user} ({ip})")
         return ", ".join(parts)
 
     repo_users = (
