@@ -1,46 +1,71 @@
 import logging
 import sqlite3
-from credentials.config import BK_SQLITE_PATH
 
 logger = logging.getLogger("bk_users")
 
 
-def match_bk_users(ad_users):
-    logger.info("=== Сопоставление BK Users с AD Users по email ===")
-    logger.info(f"Открываем BK SQLite: {BK_SQLITE_PATH}")
+def load_bk_table():
+    """
+    Загружает таблицу Users из bk.sqlite
+    """
+    logger.info("Загружаем BK SQLite таблицу Users...")
 
-    conn = sqlite3.connect(BK_SQLITE_PATH)
+    conn = sqlite3.connect("bk.sqlite")
     conn.row_factory = sqlite3.Row
 
     rows = conn.execute("SELECT * FROM Users").fetchall()
     conn.close()
 
-    bk_users = [dict(r) for r in rows]
-    logger.info(f"Загружено BK пользователей: {len(bk_users)}")
+    logger.info(f"Количество записей BK: {len(rows)}")
 
-    bk_by_email = {(u.get("Email") or "").strip().lower(): u for u in bk_users}
+    return [dict(r) for r in rows]
+
+
+def match_bk_users(users_with_groups):
+    """
+    Возвращает ТРИ списка:
+
+    1. matched      — найденные в BK по email
+    2. no_email     — учётки из AD без email (технические)
+    3. not_found    — есть email, но нет совпадения в BK (уволенные)
+    """
+
+    bk_users = load_bk_table()
+
+    # Хэш таблица по email из BK
+    bk_by_email = {
+        (u.get("Email") or "").strip().lower(): u for u in bk_users if u.get("Email")
+    }
 
     matched = []
-    found_count = 0
-    not_found_count = 0
+    no_email = []
+    not_found = []
 
-    logger.info("=== Начинаем поиск совпадений AD mail ↔ BK Email ===")
+    logger.info("=== Начинаем сопоставление AD Users → BK Users ===")
 
-    for u in ad_users:
-        mail = (u.get("mail") or "").strip().lower()
-        if not mail:
-            logger.warning(f"AD пользователь без email: {u}")
+    for ad_user in users_with_groups:
+        email = (ad_user.get("mail") or "").strip().lower()
+        ad_login = ad_user.get("ad_user")
+
+        if not email:
+            logger.info(f"Техническая учётка без email → {ad_login}")
+            entry = {"__CATEGORY__": "TECH ACCOUNT", **ad_user}
+            no_email.append(entry)
             continue
 
-        if mail in bk_by_email:
-            bk_user = bk_by_email[mail]
-            matched.append(bk_user)
-            found_count += 1
-            logger.info(f"✔ Найден BK пользователь: {mail} → {bk_user.get('UserName')}")
+        if email in bk_by_email:
+            logger.info(f"✔ Найден в BK: {email}")
+            entry = {**ad_user, **bk_by_email[email], "__CATEGORY__": "FOUND"}
+            matched.append(entry)
         else:
-            not_found_count += 1
-            logger.info(f"⚠ BK пользователь НЕ найден по email: {mail}")
+            logger.info(f"❌ НЕ найден в BK (уволен?) → {email}")
+            entry = {"__CATEGORY__": "NOT FOUND", **ad_user}
+            not_found.append(entry)
 
-    logger.info(f"=== Совпадений найдено: {found_count}, не найдено: {not_found_count}")
+    logger.info(
+        f"ИТОГО: найдено = {len(matched)}, "
+        f"без email = {len(no_email)}, "
+        f"не найдено = {len(not_found)}"
+    )
 
-    return matched
+    return matched, no_email, not_found
