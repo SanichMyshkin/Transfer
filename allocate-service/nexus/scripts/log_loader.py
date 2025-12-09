@@ -11,36 +11,6 @@ import json
 logger = logging.getLogger("audit_loader")
 
 
-"""
-Анализ логов Nexus: группировка обращений пользователей по репозиториям.
-
-Механизм работы:
-----------------
-1. Логи сортируются по инициатору, репозиторию и времени.
-2. Каждое обращение (session) — это последовательность запросов
-   от одного инициатора к одному репозиторию без пауз дольше max_interval.
-   Если пауза между соседними логами больше max_interval — начинается новое обращение.
-3. После первичной группировки короткие подряд идущие обращения
-   объединяются, если пауза между ними меньше merge_gap.
-
-Параметры:
------------
-max_interval : timedelta
-    Максимально допустимая пауза между логами внутри одного обращения.
-merge_gap : timedelta
-    Максимально допустимая пауза между соседними обращениями,
-    чтобы они считались одной логической сессией пользователя.
-
-Итог:
-------
-На выходе формируется Excel-файл с несколькими таблицами:
-- Сводка по репозиториям
-- Пользователи по каждому репозиторию
-- Обычные пользователи (логины + IP)
-- Анонимные пользователи (IP)
-"""
-
-
 def init_db(db_path: Path):
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
@@ -149,30 +119,6 @@ def load_log_file(path: Path, conn):
             if not jl:
                 continue
 
-            # === DEBUG ANACONDA ===
-            # если строка имеет отношение к anaconda — выводим всё
-            raw_lower = raw_line.lower()
-            if "anaconda" in raw_lower:
-                logger.warning("===== [ANACONDA MATCH] RAW LOG LINE =====")
-                logger.warning(raw_line.strip())
-                logger.warning("===== PARSED JSON =====")
-                logger.warning(jl)
-
-                # показываем, что именно пойдёт в БД
-                extracted_timestamp = jl.get("timestamp")
-                extracted_initiator = jl.get("initiator")
-                extracted_repo = (
-                    jl.get("attributes", {}).get("repository.name")
-                    or jl.get("attributes", {}).get("repositoryName")
-                )
-
-                logger.warning("===== DB VALUES WE WILL INSERT =====")
-                logger.warning(f"timestamp: {extracted_timestamp}")
-                logger.warning(f"initiator: {extracted_initiator}")
-                logger.warning(f"repo: {extracted_repo}")
-                logger.warning("=====================================\n")
-
-            # === обычная загрузка ===
             batch.append(
                 (
                     jl.get("timestamp"),
@@ -194,13 +140,11 @@ def load_log_file(path: Path, conn):
 
     if batch:
         cur.executemany(
-            "INSERT INTO raw_logs(timestamp, initiator, repo) VALUES (?, ?, ?)",
-            batch
+            "INSERT INTO raw_logs(timestamp, initiator, repo) VALUES (?, ?, ?)", batch
         )
         conn.commit()
 
     logger.info(f" → JSON строк: {count}")
-
 
 
 def load_all_audit_logs(archive_path: str):
