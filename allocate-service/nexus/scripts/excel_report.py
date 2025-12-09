@@ -7,6 +7,17 @@ import pandas as pd
 log = logging.getLogger("excel_report")
 
 
+def prepend_section(df, title):
+    """
+    Добавляет строку-заголовок перед секцией BK Users.
+    """
+    if df is None or df.empty:
+        return df
+
+    header = pd.DataFrame([[title] + [""] * (df.shape[1] - 1)], columns=df.columns)
+    return pd.concat([header, df], ignore_index=True)
+
+
 def prepend_instruction(df, text_lines):
     if df is None or df.empty:
         return df
@@ -26,18 +37,17 @@ def build_full_report(
     ad_repo_map,
     repo_sizes,
     users_with_groups,
-    bk_users,  # tuple: (matched, no_email, not_found)
+    bk_users_tuple,
     output_file,
     db_path,
 ):
     log.info(f"Создаём Excel: {output_file}")
 
-    matched, no_email, not_found = bk_users
-
-    # =============================
-    # 1. AD Repo Usage (repo → size + ad_groups)
-    # =============================
+    # --------------------------
+    # 1. AD Repo Usage
+    # --------------------------
     ad_rows = []
+
     for repo, groups in ad_repo_map.items():
         size_info = repo_sizes.get(repo, {"size_human": "0 B"})
         ad_rows.append(
@@ -47,23 +57,37 @@ def build_full_report(
                 "ad_groups": ", ".join(groups),
             }
         )
+
     df_ad_usage = pd.DataFrame(ad_rows)
 
-    # =============================
+    # --------------------------
     # 2. AD Users
-    # =============================
+    # --------------------------
     df_ad_users = pd.DataFrame(users_with_groups)
 
-    # =============================
-    # 3. BK Users (три секции)
-    # =============================
-    df_bk_matched = pd.DataFrame(matched)
-    df_bk_no_email = pd.DataFrame(no_email)
-    df_bk_not_found = pd.DataFrame(not_found)
+    # --------------------------
+    # 3. BK Users (3 секции)
+    # --------------------------
+    matched, tech, not_found = bk_users_tuple
 
-    # =============================
-    # 4. ЛОГИ
-    # =============================
+    df_matched = pd.DataFrame(matched)
+    df_tech = pd.DataFrame(tech)
+    df_not_found = pd.DataFrame(not_found)
+
+    df_bk_full = pd.DataFrame()
+
+    if not df_matched.empty:
+        df_bk_full = pd.concat([df_bk_full, prepend_section(df_matched, "FOUND IN BK")])
+
+    if not df_tech.empty:
+        df_bk_full = pd.concat([df_bk_full, prepend_section(df_tech, "TECH ACCOUNTS")])
+
+    if not df_not_found.empty:
+        df_bk_full = pd.concat([df_bk_full, prepend_section(df_not_found, "NOT FOUND")])
+
+    # --------------------------
+    # 4. Логи
+    # --------------------------
     sessions = log_stats["sessions"]
     repo_stats = log_stats["repo_stats"]
     repo_users = log_stats["repo_users"]
@@ -74,66 +98,14 @@ def build_full_report(
         if col in sessions.columns and hasattr(sessions[col].dtype, "tz"):
             sessions[col] = sessions[col].dt.tz_localize(None)
 
-    # =============================
-    # 5. Excel запись
-    # =============================
+    # --------------------------
+    # 5. Excel
+    # --------------------------
     with pd.ExcelWriter(output_file, engine="xlsxwriter") as writer:
-        # AD Repo Usage
         df_ad_usage.to_excel(writer, sheet_name="AD Repo Usage", index=False)
-
-        # AD Users
         df_ad_users.to_excel(writer, sheet_name="AD Users", index=False)
+        df_bk_full.to_excel(writer, sheet_name="BK Users", index=False)
 
-        # BK Users — вручную, секциями
-        workbook = writer.book
-        ws_bk = workbook.add_worksheet("BK Users")
-        writer.sheets["BK Users"] = ws_bk
-
-        start_row = 0
-
-        # FOUND
-        if not df_bk_matched.empty:
-            ws_bk.write(start_row, 0, "FOUND IN BK")
-            df_bk_matched.to_excel(
-                writer,
-                sheet_name="BK Users",
-                startrow=start_row + 1,
-                index=False,
-            )
-            start_row += len(df_bk_matched) + 3
-        else:
-            ws_bk.write(start_row, 0, "FOUND IN BK: NO DATA")
-            start_row += 2
-
-        # TECH ACCOUNTS (NO EMAIL)
-        if not df_bk_no_email.empty:
-            ws_bk.write(start_row, 0, "TECH ACCOUNTS (NO EMAIL)")
-            df_bk_no_email.to_excel(
-                writer,
-                sheet_name="BK Users",
-                startrow=start_row + 1,
-                index=False,
-            )
-            start_row += len(df_bk_no_email) + 3
-        else:
-            ws_bk.write(start_row, 0, "TECH ACCOUNTS (NO EMAIL): NO DATA")
-            start_row += 2
-
-        # NOT FOUND (FIRED)
-        if not df_bk_not_found.empty:
-            ws_bk.write(start_row, 0, "NOT FOUND IN BK (FIRED)")
-            df_bk_not_found.to_excel(
-                writer,
-                sheet_name="BK Users",
-                startrow=start_row + 1,
-                index=False,
-            )
-            start_row += len(df_bk_not_found) + 3
-        else:
-            ws_bk.write(start_row, 0, "NOT FOUND IN BK (FIRED): NO DATA")
-            start_row += 2
-
-        # Сводка по репозиториям
         df_repo_summary = prepend_instruction(
             repo_stats,
             [
@@ -146,7 +118,6 @@ def build_full_report(
             writer, sheet_name="Сводка по репозиториям", index=False
         )
 
-        # Пользователи по репозиторию
         df_repo_users = prepend_instruction(
             repo_users,
             [
@@ -159,36 +130,23 @@ def build_full_report(
             writer, sheet_name="Пользователи по репозиторию", index=False
         )
 
-        # Обычные пользователи
         df_normal = prepend_instruction(
             users_normal,
-            [
-                "Список зарегистрированных пользователей и IP-адресов, с которых они подключались.",
-                "",
-            ],
+            ["Список зарегистрированных пользователей и их IP.", ""],
         )
         df_normal.to_excel(writer, sheet_name="Обычные пользователи", index=False)
 
-        # Анонимные пользователи
         df_anon = prepend_instruction(
             users_anonymous_flat,
-            ["Анонимные подключения без логина. Каждый IP — отдельная строка.", ""],
+            ["Анонимные подключения (только IP).", ""],
         )
         df_anon.to_excel(writer, sheet_name="Анонимные пользователи", index=False)
 
-        # -------------------------
-        # Автоширина колонок
-        # -------------------------
-        # Для BK Users — берём первую не пустую таблицу, чтобы оценить колонки
-        bk_cols_source = None
-        for df_src in (df_bk_matched, df_bk_no_email, df_bk_not_found):
-            if not df_src.empty:
-                bk_cols_source = df_src
-                break
-
+        # Автоширина
         for sheet_name, df_tmp in {
             "AD Repo Usage": df_ad_usage,
             "AD Users": df_ad_users,
+            "BK Users": df_bk_full,
             "Сводка по репозиториям": df_repo_summary,
             "Пользователи по репозиторию": df_repo_users,
             "Обычные пользователи": df_normal,
@@ -199,22 +157,9 @@ def build_full_report(
                 max_len = max(len(str(col)), df_tmp[col].astype(str).map(len).max()) + 2
                 worksheet.set_column(i, i, max_len)
 
-        # Автоширина для BK Users
-        if bk_cols_source is not None:
-            for i, col in enumerate(bk_cols_source.columns):
-                max_len = len(str(col))
-                for df_src in (df_bk_matched, df_bk_no_email, df_bk_not_found):
-                    if col in df_src.columns and not df_src.empty:
-                        col_max = df_src[col].astype(str).map(len).max()
-                        if col_max > max_len:
-                            max_len = col_max
-                ws_bk.set_column(i, i, max_len + 2)
-
     log.info("Excel готов")
 
-    # =============================
-    # Удаление временных директорий
-    # =============================
+    # -------------------------
     log.info("Чистим временные файлы")
 
     try:
