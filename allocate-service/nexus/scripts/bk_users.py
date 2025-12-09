@@ -1,6 +1,6 @@
 import logging
 import sqlite3
-from config import BK_SQLITE_PATH
+from credentials.config import BK_SQLITE_PATH
 
 logger = logging.getLogger("bk_users")
 

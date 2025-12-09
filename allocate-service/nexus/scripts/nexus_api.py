@@ -3,16 +3,9 @@ import psycopg2
 from psycopg2 import sql
 import requests
 import humanize
-
-from config import (
-    DB_HOST,
-    DB_PORT,
-    DB_NAME,
-    DB_USER,
-    DB_PASS,
-    NEXUS_URL,
-    NEXUS_USER,
-    NEXUS_PASS,
+from credentials.config import (
+    DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASS,
+    NEXUS_URL, NEXUS_USER, NEXUS_PASS,
 )
 
 logger = logging.getLogger("nexus_api")
@@ -27,36 +20,25 @@ def pg_connect():
 def pg_execute_custom(fn):
     with pg_connect() as conn:
         with conn.cursor() as cur:
-            try:
-                result = fn(cur)
-                conn.commit()
-                return result
-            except Exception:
-                conn.rollback()
-                raise
+            result = fn(cur)
+            conn.commit()
+            return result
 
 
 def get_repository_sizes():
-    logger.info("=== Получение размеров репозиториев ===")
+    logger.info("Получение размеров репозиториев")
 
     def _exec(cur):
         cur.execute(
-            """
-            SELECT tablename
-            FROM pg_catalog.pg_tables
-            WHERE tablename LIKE %s;
-            """,
+            'SELECT tablename FROM pg_catalog.pg_tables WHERE tablename LIKE %s;',
             ("%_content_repository",),
         )
-
         table_names = [row[0] for row in cur.fetchall()]
-        logger.info(f"Найдено таблиц форматов: {len(table_names)}")
 
         repo_sizes = {}
 
         for table in table_names:
             repo_type = table.replace("_content_repository", "")
-            logger.info(f"→ Обработка формата: {repo_type}")
 
             query = sql.SQL("""
                 SELECT r.name, SUM(blob_size)
@@ -72,16 +54,13 @@ def get_repository_sizes():
             )
 
             cur.execute(query)
-            rows = cur.fetchall()
-
-            for repo_name, size in rows:
+            for repo_name, size in cur.fetchall():
                 size = size or 0
                 repo_sizes[repo_name] = {
                     "size_bytes": size,
                     "size_human": humanize.naturalsize(size, binary=True),
                 }
 
-        logger.info("Размеры репозиториев собраны.")
         return repo_sizes
 
     return pg_execute_custom(_exec)
@@ -95,62 +74,73 @@ def nexus_session():
 
 def get_roles():
     url = f"{NEXUS_URL}/service/rest/v1/security/roles"
-    logger.info("Получаем роли Nexus…")
-
     resp = nexus_session().get(url)
     resp.raise_for_status()
-    roles = resp.json()
-
-    logger.info(f"Получено {len(roles)} ролей.")
-    return roles
+    return resp.json()
 
 
 def extract_ad_group_repo_mapping(roles):
-    logger.info("=== Извлекаем default AD-группы с репозиториями ===")
     mappings = []
+
     for role in roles:
         if role.get("source") != "default":
             continue
+
         ad_group = role["id"]
         if ad_group.startswith("nx-admin") or ad_group.startswith("nx-anonymous"):
             continue
-        privileges = role.get("privileges", [])
+
         repos = set()
-        for p in privileges:
-            if not p.startswith("nx-repository-"):
-                continue
-            parts = p.split("-")
-            if len(parts) < 6:
-                continue
-            repo_name = "-".join(parts[4:-1])
-            repos.add(repo_name)
-        for repo in sorted(repos):
-            mappings.append(
-                {
-                    "ad_group": ad_group,
-                    "repository": repo,
-                }
-            )
-    logger.info(f"AD-групп с репозиториями: {len({m['ad_group'] for m in mappings})}")
-    logger.info(f"Всего связок AD → repo: {len(mappings)}")
+        for p in role.get("privileges", []):
+            if p.startswith("nx-repository-"):
+                parts = p.split("-")
+                if len(parts) >= 6:
+                    repo_name = "-".join(parts[4:-1])
+                    repos.add(repo_name)
+
+        for repo in repos:
+            mappings.append({"ad_group": ad_group, "repository": repo})
 
     return mappings
 
 
 def extract_all_default_groups(roles):
-    logger.info("=== Извлекаем ВСЕ default AD-группы ===")
-
     groups = set()
-
     for role in roles:
         if role.get("source") != "default":
             continue
-
         group = role["id"]
-        if group.startswith("nx-admin") or group.startswith("nx-anonymous"):
-            continue
-
-        groups.add(group)
-
-    logger.info(f"Всего default AD-групп: {len(groups)}")
+        if not group.startswith(("nx-admin", "nx-anonymous")):
+            groups.add(group)
     return sorted(groups)
+
+
+def invert_repo_mapping(mappings):
+    repo_to_groups = {}
+    for m in mappings:
+        repo = m["repository"]
+        ad = m["ad_group"]
+        repo_to_groups.setdefault(repo, set()).add(ad)
+    return repo_to_groups
+
+
+def build_final_repo_table():
+    roles = get_roles()
+    mappings = extract_ad_group_repo_mapping(roles)
+    repo_sizes = get_repository_sizes()
+    repo_to_groups = invert_repo_mapping(mappings)
+
+    final = []
+
+    for repo, size_info in repo_sizes.items():
+        ad_groups = repo_to_groups.get(repo, set())
+
+        final.append({
+            "repository": repo,
+            "ad_groups": ", ".join(sorted(ad_groups)) if ad_groups else "",
+            "size_human": size_info["size_human"],
+            "size_bytes": size_info["size_bytes"],
+        })
+
+    final.sort(key=lambda x: x["repository"])
+    return final

@@ -1,6 +1,6 @@
 import logging
 
-from config import ARCHIVE_PATH, REPORT_PATH
+from credentials.config import ARCHIVE_PATH, REPORT_PATH
 from log_loader import load_all_audit_logs
 from log_filter import analyze_logs
 from nexus_api import (

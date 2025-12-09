@@ -5,7 +5,7 @@ import logging
 from ldap3 import Server, Connection, ALL, SUBTREE, Tls
 from ldap3.utils.conv import escape_filter_chars
 
-from config import AD_SERVER, AD_USER, AD_PASSWORD, AD_BASE, CA_CERT
+from credentials.config import AD_SERVER, AD_USER, AD_PASSWORD, AD_BASE, CA_CERT
 
 log = logging.getLogger("nexus_ldap")
 
