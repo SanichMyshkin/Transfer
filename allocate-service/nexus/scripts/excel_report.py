@@ -8,18 +8,17 @@ log = logging.getLogger("excel_report")
 
 
 def prepend_instruction(df, text_lines):
-    """Добавляет строки-инструкции перед таблицей, без смещения столбцов."""
     if df is None or df.empty:
         return df
 
     blank_row = {col: None for col in df.columns}
-    instruction_rows = []
+    rows = []
     for line in text_lines:
         row = blank_row.copy()
-        first_col = list(df.columns)[0]
-        row[first_col] = line
-        instruction_rows.append(row)
-    return pd.concat([pd.DataFrame(instruction_rows), df], ignore_index=True)
+        row[list(df.columns)[0]] = line
+        rows.append(row)
+
+    return pd.concat([pd.DataFrame(rows), df], ignore_index=True)
 
 
 def build_full_report(
@@ -31,37 +30,38 @@ def build_full_report(
     output_file,
     db_path,
 ):
-    """
-    Формирует Excel отчёт, включающий:
-
-    1. AD Repo Usage
-    2. AD Users
-    3. BK Users
-    4. Сводка по репозиториям (логи)
-    5. Пользователи по репозиторию (логи)
-    6. Обычные пользователи (логи)
-    7. Анонимные пользователи (логи)
-    """
-
     log.info(f"Создаём Excel: {output_file}")
 
+    # =============================
+    # 1. AD Repo Usage (repo → size + ad_groups)
+    # =============================
     ad_rows = []
 
-    for m in ad_repo_map:
-        ad_group = m["ad_group"]
-        repo = m["repository"]
-
-        size_info = repo_sizes.get(repo)
-        size_human = size_info["size_human"] if size_info else "0 B"
-
-        ad_rows.append({"ad_group": ad_group, "repository": repo, "size": size_human})
+    for repo, groups in ad_repo_map.items():
+        size_info = repo_sizes.get(repo, {"size_human": "0 B"})
+        ad_rows.append(
+            {
+                "repository": repo,
+                "size": size_info["size_human"],
+                "ad_groups": ", ".join(groups),
+            }
+        )
 
     df_ad_usage = pd.DataFrame(ad_rows)
 
+    # =============================
+    # 2. AD Users
+    # =============================
     df_ad_users = pd.DataFrame(users_with_groups)
 
+    # =============================
+    # 3. BK Users
+    # =============================
     df_bk_users = pd.DataFrame(bk_users)
 
+    # =============================
+    # 4. ЛОГИ
+    # =============================
     sessions = log_stats["sessions"]
     repo_stats = log_stats["repo_stats"]
     repo_users = log_stats["repo_users"]
@@ -72,11 +72,12 @@ def build_full_report(
         if col in sessions.columns and hasattr(sessions[col].dtype, "tz"):
             sessions[col] = sessions[col].dt.tz_localize(None)
 
+    # =============================
+    # 5. Excel запись
+    # =============================
     with pd.ExcelWriter(output_file, engine="xlsxwriter") as writer:
         df_ad_usage.to_excel(writer, sheet_name="AD Repo Usage", index=False)
-
         df_ad_users.to_excel(writer, sheet_name="AD Users", index=False)
-
         df_bk_users.to_excel(writer, sheet_name="BK Users", index=False)
 
         df_repo_summary = prepend_instruction(
@@ -102,6 +103,7 @@ def build_full_report(
         df_repo_users.to_excel(
             writer, sheet_name="Пользователи по репозиторию", index=False
         )
+
         df_normal = prepend_instruction(
             users_normal,
             [
@@ -117,6 +119,9 @@ def build_full_report(
         )
         df_anon.to_excel(writer, sheet_name="Анонимные пользователи", index=False)
 
+        # -------------------------
+        # Автоширина колонок
+        # -------------------------
         for sheet_name, df_tmp in {
             "AD Repo Usage": df_ad_usage,
             "AD Users": df_ad_users,
@@ -133,6 +138,9 @@ def build_full_report(
 
     log.info("Excel готов")
 
+    # =============================
+    # Удаление временных директорий
+    # =============================
     log.info("Чистим временные файлы")
 
     try:

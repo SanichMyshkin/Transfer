@@ -2,24 +2,24 @@ import logging
 
 from credentials.config import ARCHIVE_PATH, REPORT_PATH
 
-from log_loader import load_all_audit_logs
-from log_filter import analyze_logs
+from scripts.log_loader import load_all_audit_logs
+from scripts.log_filter import analyze_logs
 
-from nexus_api import (
+from scripts.nexus_api import (
     get_roles,
     extract_group_repo_relation,
     extract_all_default_groups,
     get_repository_sizes,
 )
 
-from nexus_ldap import (
+from scripts.nexus_ldap import (
     fetch_ldap_group_members,
     aggregate_users_by_groups,
 )
 
-from bk_users import match_bk_users
+from scripts.bk_users import match_bk_users
 
-from excel_report import build_full_report
+from scripts.excel_report import build_full_report
 
 
 logging.basicConfig(
