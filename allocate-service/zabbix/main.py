@@ -12,7 +12,7 @@ OUTPUT_FILE = "zabbix_full_report.xlsx"
 
 logger = logging.getLogger("zabbix_report")
 logger.setLevel(logging.INFO)
-fmt = logging.Formatter("%(asctime)s | %(message)s", "%H:%M:%S")
+fmt = logging.Formatter("%H:%M:%S | %(message)s")
 ch = logging.StreamHandler()
 ch.setFormatter(fmt)
 logger.addHandler(ch)
@@ -23,7 +23,7 @@ if not ZABBIX_URL or not ZABBIX_TOKEN:
 logger.info("Подключение к Zabbix...")
 api = ZabbixAPI(url=ZABBIX_URL)
 api.login(token=ZABBIX_TOKEN)
-logger.info("OK")
+logger.info("ОК")
 
 logger.info("Получаю пользователей...")
 users = api.user.get(
@@ -48,9 +48,11 @@ user_data = []
 for u in users:
     medias = []
     for m in u.get("medias", []):
-        v = m.get("sendto")
-        if v:
-            medias.append(v)
+        sendto = m.get("sendto")
+        if isinstance(sendto, list):
+            medias.extend(str(x) for x in sendto)
+        elif isinstance(sendto, str):
+            medias.append(sendto)
     email = ", ".join(medias) if medias else "—"
 
     groups = ", ".join(g["name"] for g in u.get("usrgrps", [])) or "—"
@@ -86,7 +88,7 @@ for u in users:
         "Rows per page": u.get("rows_per_page", "—")
     })
 
-logger.info("Загружаю группы пользователей...")
+logger.info("Получаю группы пользователей...")
 groups = api.usergroup.get(
     output=["usrgrpid", "name", "gui_access", "users_status"],
     selectUsers=["username"]
@@ -107,7 +109,7 @@ for g in groups:
 summary_data = [
     ["Дата", datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
     ["Пользователей", len(user_data)],
-    ["Групп пользователей", len(group_data)],
+    ["Групп пользователей", len(group_data)]
 ]
 
 summary_df = pd.DataFrame(summary_data, columns=["Показатель", "Значение"])
