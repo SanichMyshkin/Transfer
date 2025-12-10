@@ -239,6 +239,45 @@ def main():
     write_sheet(workbook, "Projects", projects)
     write_summary(workbook, users, projects)
 
+    logging.info("Writing Tech_And_Fired sheet...")
+
+    sheet = workbook.add_worksheet("Tech_And_Fired")
+    tech_users = [u for u in users if u.get("Status") == "Tech"]
+    fired_users = [u for u in users if u.get("Status") == "Fired"]
+    headers = list(users[0].keys()) if users else []
+
+    row = 0
+    sheet.write(row, 0, "Технические учётки")
+    row += 2
+
+    if tech_users and headers:
+        for col, h in enumerate(headers):
+            sheet.write(row, col, h)
+        row += 1
+        for u in tech_users:
+            for col, h in enumerate(headers):
+                sheet.write(row, col, str(u[h]) if u[h] is not None else "")
+            row += 1
+    else:
+        sheet.write(row, 0, "Нет данных")
+        row += 2
+
+    row += 1
+    sheet.write(row, 0, "Уволенные")
+    row += 2
+
+    if fired_users and headers:
+        for col, h in enumerate(headers):
+            sheet.write(row, col, h)
+        row += 1
+        for u in fired_users:
+            for col, h in enumerate(headers):
+                sheet.write(row, col, str(u[h]) if u[h] is not None else "")
+            row += 1
+    else:
+        sheet.write(row, 0, "Нет данных")
+        row += 1
+
     workbook.close()
     logging.info("Excel report saved: testIt_report.xlsx")
 
