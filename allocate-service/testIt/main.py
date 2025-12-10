@@ -20,7 +20,7 @@ PG_PASSWORD = os.getenv("PG_PASSWORD")
 PG_DB = os.getenv("PG_DB")
 PG_DB2 = os.getenv("PG_DB2")
 
-BK_SQLITE_PATH = os.getenv("BK_SQLITE_PATH")
+BK_SQLITE_PATH = os.getenv('BK_SQLITE_PATH')
 
 def exec_query(conn, query):
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -150,6 +150,9 @@ def write_summary(workbook, users, projects):
         ("Total library tests", sum(p["LibraryTestsCount"] for p in projects)),
         ("Total webhooks created", sum(p["WebHooksCount"] for p in projects)),
         ("Total webhook runs", sum(p["WebHookLogsCount"] for p in projects)),
+        ("Active users (in BK)", len([u for u in users if u.get("Status") == "Active"])),
+        ("Fired users", len([u for u in users if u.get("Status") == "Fired"])),
+        ("Tech accounts", len([u for u in users if u.get("Status") == "Tech"])),
     ]
     sheet.write(0, 0, "Metric")
     sheet.write(0, 1, "Value")
@@ -201,6 +204,8 @@ def main():
 
     bk_emails = {u.get("Email", "").strip().lower(): u for u in bk_users}
 
+    matched_bk_users = []
+
     logging.info("Matching users...")
 
     for u in users:
@@ -219,14 +224,18 @@ def main():
 
         if email in bk_emails:
             u["Status"] = "Active"
-            logging.info(f"Active: {email}")
+            matched_bk_users.append(bk_emails[email])
+            logging.info(f"Active (in BK): {email}")
         else:
             u["Status"] = "Fired"
             logging.info(f"Fired (not in BK): {email}")
 
+    logging.info(f"Matched BK users total: {len(matched_bk_users)}")
+
     workbook = xlsxwriter.Workbook("testIt_report.xlsx")
 
     write_sheet(workbook, "Users", users)
+    write_sheet(workbook, "BK_Users", matched_bk_users)
     write_sheet(workbook, "Projects", projects)
     write_summary(workbook, users, projects)
 
