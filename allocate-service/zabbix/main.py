@@ -11,7 +11,7 @@ load_dotenv()
 ZABBIX_URL = os.getenv("ZABBIX_URL")
 ZABBIX_TOKEN = os.getenv("ZABBIX_TOKEN")
 BK_SQLITE_PATH = os.getenv("BK_SQLITE_PATH")
-OUTPUT_FILE = "zabbix_full_report.xlsx"
+OUTPUT_FILE = "zabbix_report.xlsx"
 
 logger = logging.getLogger("zabbix_report")
 logger.setLevel(logging.INFO)
@@ -88,26 +88,47 @@ for u in users:
             "Имя": f"{u.get('name', '')} {u.get('surname', '')}".strip() or "—",
             "Email": email,
             "Группы": groups,
-            "Role ID": role_id,
+            "ID роли": role_id,
             "Роль": role_name,
-            "IP last unsuccessful login": u.get("attempt_ip", "—"),
+            "IP последней неуспешной попытки": u.get("attempt_ip", "—"),
             "Автовход": "Да" if u.get("autologin") == "1" else "Нет",
             "Язык интерфейса": u.get("lang", "—"),
             "Тема": u.get("theme", "—"),
-            "Обновление": u.get("refresh", "—"),
+            "Интервал обновления": u.get("refresh", "—"),
             "Часовой пояс": u.get("timezone", "—"),
             "Rows per page": u.get("rows_per_page", "—"),
             "Provisioned": u.get("provisioned", "—"),
             "TS Provisioned": u.get("ts_provisioned", "—"),
             "URL": u.get("url", "—"),
-            "User Directory ID": u.get("userdirectoryid", "—"),
+            "UserDirectory ID": u.get("userdirectoryid", "—"),
+        }
+    )
+
+logger.info("Получаю группы пользователей...")
+groups = api.usergroup.get(
+    output=["usrgrpid", "name", "gui_access", "users_status"],
+    selectUsers=["alias", "username"],
+)
+
+group_data = []
+for g in groups:
+    members = ", ".join(
+        u.get("alias") or u.get("username") or "—" for u in g.get("users", [])
+    )
+    group_data.append(
+        {
+            "ID": g.get("usrgrpid"),
+            "Группа": g.get("name", "—"),
+            "GUI доступ": g.get("gui_access", "—"),
+            "Статус": g.get("users_status", "—"),
+            "Пользователи": members or "—",
         }
     )
 
 logger.info("Подключаюсь к BK SQLite...")
 bk_conn = sqlite3.connect(BK_SQLITE_PATH)
 bk_conn.row_factory = sqlite3.Row
-bk_rows = bk_conn.execute("SELECT * FROM Users").fetchall()
+bk_rows = bk_conn.execute("SELECT * FROM bk").fetchall()
 bk_conn.close()
 
 bk_users_rows = [dict(r) for r in bk_rows]
@@ -116,17 +137,14 @@ bk_logins = {(u.get("sAMAccountName") or "").strip().lower(): u for u in bk_user
 matched_bk_users = []
 techfired_users = []
 
-logger.info("Сверка пользователей по username ↔ sAMAccountName...")
+logger.info("Сверка пользователей с BK (username ↔ sAMAccountName)...")
 
 for u in users:
-    zbx_login = (u.get("username") or "").strip().lower()
-    if zbx_login in bk_logins:
-        matched_bk_users.append(bk_logins[zbx_login])
+    login = (u.get("username") or "").strip().lower()
+    if login in bk_logins:
+        matched_bk_users.append(bk_logins[login])
     else:
         techfired_users.append(u)
-
-logger.info(f"Найдено в BK: {len(matched_bk_users)}")
-logger.info(f"Не найдено в BK (tech/fired): {len(techfired_users)}")
 
 logger.info("Получаю хосты...")
 hosts = api.host.get(
@@ -193,7 +211,7 @@ for h in hosts:
         {
             "ID": hostid,
             "Имя хоста": h.get("name", "—"),
-            "Хост": h.get("host", "—"),
+            "Системное имя": h.get("host", "—"),
             "IP": ip,
             "Группы": ", ".join(g["name"] for g in h.get("groups", [])) or "—",
             "Шаблоны": ", ".join(t["name"] for t in h.get("parentTemplates", []))
@@ -206,15 +224,17 @@ for h in hosts:
     )
 
 summary_data = [
-    ["Дата генерации", datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
-    ["Пользователей", len(user_data)],
-    ["Групп пользователей", len(bk_users_rows)],
-    ["Хостов", len(host_data)],
+    ["Дата формирования", datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
+    ["Всего пользователей", len(user_data)],
+    ["Групп пользователей", len(group_data)],
+    ["Пользователей BK", len(matched_bk_users)],
+    ["Не найдено в BK (Тех + Уволенные)", len(techfired_users)],
+    ["Хостов всего", len(host_data)],
     ["Хостов активных", sum(1 for h in host_data if h["Статус"] == "Активен")],
     ["Хостов отключённых", sum(1 for h in host_data if h["Статус"] == "Отключён")],
-    ["Триггеров", sum(trigger_count.values())],
-    ["Графиков", sum(graph_count.values())],
-    ["Дашбордов", sum(dashboard_count.values())],
+    ["Всего триггеров", sum(trigger_count.values())],
+    ["Всего графиков", sum(graph_count.values())],
+    ["Всего дашбордов", sum(dashboard_count.values())],
 ]
 
 summary_df = pd.DataFrame(summary_data, columns=["Показатель", "Значение"])
@@ -225,9 +245,14 @@ with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
     pd.DataFrame(user_data).sort_values(by="Логин").to_excel(
         writer, sheet_name="Пользователи", index=False
     )
-    pd.DataFrame(matched_bk_users).to_excel(writer, sheet_name="BK_Users", index=False)
+    pd.DataFrame(group_data).sort_values(by="Группа").to_excel(
+        writer, sheet_name="Группы пользователей", index=False
+    )
+    pd.DataFrame(matched_bk_users).to_excel(
+        writer, sheet_name="Пользователи BK", index=False
+    )
     pd.DataFrame(techfired_users).to_excel(
-        writer, sheet_name="TechFired_Users", index=False
+        writer, sheet_name="Не найдено в BK", index=False
     )
     pd.DataFrame(host_data).sort_values(by="Имя хоста").to_excel(
         writer, sheet_name="Хосты", index=False
