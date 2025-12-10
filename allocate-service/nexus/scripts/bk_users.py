@@ -50,15 +50,12 @@ def classify_tech_account(ad_user: dict) -> bool:
     display = (ad_user.get("displayName") or "").strip()
     login = (ad_user.get("ad_user") or "").strip()
 
-    # 1. ФИО → точно НЕ тех учётка
     if is_full_name(display):
         return False
 
-    # 2. Нет email + display НЕ кириллица → техучётка
     if not email and not is_cyrillic(display):
         return True
 
-    # 3. DisplayName технический (не кириллица, не имя, без пробелов)
     if is_machine_like_name(display):
         return True
 
