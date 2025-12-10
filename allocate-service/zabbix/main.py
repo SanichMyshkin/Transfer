@@ -85,13 +85,6 @@ for u in users:
     role_id = u.get("roleid")
     role_name = role_name_by_id.get(role_id, "—")
 
-    last_ts = u.get("sessions", [{}])[0].get("lastaccess")
-    last_login = (
-        datetime.utcfromtimestamp(int(last_ts)).strftime("%Y-%m-%d %H:%M:%S")
-        if last_ts
-        else "—"
-    )
-
     user_data.append(
         {
             "ID": u.get("userid", "—"),
@@ -101,8 +94,7 @@ for u in users:
             "Группы": groups,
             "Role ID": role_id,
             "Роль": role_name,
-            "IP последнего входа": u.get("attempt_ip", "—"),
-            "Последний вход": last_login,
+            "IP last unsuccessful login": u.get("attempt_ip", "—"),
             "Автовход": "Да" if u.get("autologin") == "1" else "Нет",
             "Язык интерфейса": u.get("lang", "—"),
             "Тема": u.get("theme", "—"),
@@ -220,11 +212,10 @@ for h in hosts:
 summary_data = [
     ["Дата генерации", datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
     ["Пользователей", len(user_data)],
-    ["С автологином", sum(1 for u in user_data if u["Автовход"] == "Да")],
     ["Групп пользователей", len(group_data)],
     ["Хостов", len(host_data)],
-    ["Активных", sum(1 for h in host_data if h["Статус"] == "Активен")],
-    ["Отключённых", sum(1 for h in host_data if h["Статус"] == "Отключён")],
+    ["Хостов активных", sum(1 for h in host_data if h["Статус"] == "Активен")],
+    ["Хостов отключённых", sum(1 for h in host_data if h["Статус"] == "Отключён")],
     ["Триггеров", sum(trigger_count.values())],
     ["Графиков", sum(graph_count.values())],
     ["Дашбордов", sum(dashboard_count.values())],
@@ -235,7 +226,6 @@ summary_df = pd.DataFrame(summary_data, columns=["Показатель", "Зна
 logger.info("Сохраняю Excel...")
 
 with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
-    summary_df.to_excel(writer, sheet_name="Сводка", index=False)
     pd.DataFrame(user_data).sort_values(by="Логин").to_excel(
         writer, sheet_name="Пользователи", index=False
     )
@@ -245,6 +235,7 @@ with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
     pd.DataFrame(host_data).sort_values(by="Имя хоста").to_excel(
         writer, sheet_name="Хосты", index=False
     )
+    summary_df.to_excel(writer, sheet_name="Сводка", index=False)
 
 logger.info(f"Отчёт сохранён: {OUTPUT_FILE}")
 
