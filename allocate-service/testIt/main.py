@@ -20,6 +20,7 @@ PG_PASSWORD = os.getenv("PG_PASSWORD")
 PG_DB = os.getenv("PG_DB")
 PG_DB2 = os.getenv("PG_DB2")
 
+BK_SQLITE_PATH = os.getenv("BK_SQLITE_PATH")
 
 def exec_query(conn, query):
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -175,27 +176,32 @@ def classify_tech_account(display: str) -> bool:
 
 
 def main():
+    logging.info("Connecting to AUTH DB...")
     with psycopg2.connect(
         host=PG_HOST, port=PG_PORT, dbname=PG_DB, user=PG_USER, password=PG_PASSWORD
     ) as conn_users:
         users = exec_query(conn_users, QUERY_USERS)
+    logging.info(f"Users loaded: {len(users)}")
 
+    logging.info("Connecting to PROJECT DB...")
     with psycopg2.connect(
         host=PG_HOST, port=PG_PORT, dbname=PG_DB2, user=PG_USER, password=PG_PASSWORD
     ) as conn_proj:
         projects = exec_query(conn_proj, QUERY_PROJECTS)
+    logging.info(f"Projects loaded: {len(projects)}")
 
-    conn_bk = sqlite3.connect("bk.sqlite")
+    logging.info("Opening BK SQLite database...")
+    conn_bk = sqlite3.connect(BK_SQLITE_PATH)
     conn_bk.row_factory = sqlite3.Row
     bk_rows = conn_bk.execute("SELECT * FROM Users").fetchall()
     conn_bk.close()
 
     bk_users = [dict(r) for r in bk_rows]
+    logging.info(f"BK users loaded: {len(bk_users)}")
+
     bk_emails = {u.get("Email", "").strip().lower(): u for u in bk_users}
 
-    matched_bk_users = []
-    fired_users = []
-    tech_accounts = []
+    logging.info("Matching users...")
 
     for u in users:
         email = (u["Email"] or "").strip().lower()
@@ -203,31 +209,29 @@ def main():
 
         if classify_tech_account(display):
             u["Status"] = "Tech"
-            tech_accounts.append(u)
+            logging.info(f"Tech: {u['UserName']}")
             continue
 
         if not email:
             u["Status"] = "Fired"
-            fired_users.append(u)
+            logging.info(f"No email, Fired: {u['UserName']}")
             continue
 
         if email in bk_emails:
             u["Status"] = "Active"
-            matched_bk_users.append(u)
+            logging.info(f"Active: {email}")
         else:
             u["Status"] = "Fired"
-            fired_users.append(u)
+            logging.info(f"Fired (not in BK): {email}")
 
     workbook = xlsxwriter.Workbook("testIt_report.xlsx")
 
     write_sheet(workbook, "Users", users)
     write_sheet(workbook, "Projects", projects)
-    write_sheet(workbook, "Active_Users", matched_bk_users)
-    write_sheet(workbook, "Fired_Users", fired_users)
-    write_sheet(workbook, "Tech_Accounts", tech_accounts)
     write_summary(workbook, users, projects)
 
     workbook.close()
+    logging.info("Excel report saved: testIt_report.xlsx")
 
 
 if __name__ == "__main__":
