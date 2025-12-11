@@ -240,13 +240,22 @@ def split_unmatched(unmatched):
     tech = []
     fired = []
 
+    def is_full_cyrillic_fio(name):
+        parts = name.strip().split()
+        if len(parts) < 2:
+            return False
+        for p in parts:
+            if not re.fullmatch(r"[А-Яа-яЁё]+", p):
+                return False
+        return True
+
     for u in unmatched:
         eu = (u.get("extern_uid") or "").strip()
         name = (u.get("name") or "").strip()
 
-        name_has_cyrillic = bool(re.search(r"[а-яА-ЯёЁ]", name))
+        name_is_fio = is_full_cyrillic_fio(name)
 
-        if name_has_cyrillic:
+        if name_is_fio:
             fired.append(u)
             continue
 
@@ -260,16 +269,15 @@ def split_unmatched(unmatched):
             continue
 
         cn = m.group(1).strip()
-        cn_has_cyrillic = bool(re.search(r"[а-яА-ЯёЁ]", cn))
+        cn_is_fio = is_full_cyrillic_fio(cn)
 
-        if cn_has_cyrillic:
+        if cn_is_fio:
             fired.append(u)
             continue
 
         tech.append(u)
 
     return tech, fired
-
 
 
 def write_to_excel(
