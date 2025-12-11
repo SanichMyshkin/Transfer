@@ -45,7 +45,9 @@ def get_users(gl):
         extern_uid = ""
         identities = getattr(u, "identities", [])
         if identities and isinstance(identities, list):
-            extern_uid = ", ".join(i.get("extern_uid", "") for i in identities if isinstance(i, dict))
+            extern_uid = ", ".join(
+                i.get("extern_uid", "") for i in identities if isinstance(i, dict)
+            )
 
         result.append(
             {
@@ -98,7 +100,7 @@ def get_projects_stats(gl):
     result = []
     total_commits = 0
 
-    for project in projects:
+    for idx, project in enumerate(projects, start=1):
         try:
             full = gl.projects.get(project.id, statistics=True)
             stats = getattr(full, "statistics", {}) or {}
@@ -112,15 +114,26 @@ def get_projects_stats(gl):
                     "id": full.id,
                     "name": full.name,
                     "path_with_namespace": full.path_with_namespace,
-                    "repository_size": humanize.naturalsize(stats.get("repository_size", 0), binary=True),
-                    "lfs_objects_size": humanize.naturalsize(stats.get("lfs_objects_size", 0), binary=True),
-                    "job_artifacts_size": humanize.naturalsize(stats.get("job_artifacts_size", 0), binary=True),
-                    "storage_size": humanize.naturalsize(stats.get("storage_size", 0), binary=True),
+                    "repository_size": humanize.naturalsize(
+                        stats.get("repository_size", 0), binary=True
+                    ),
+                    "lfs_objects_size": humanize.naturalsize(
+                        stats.get("lfs_objects_size", 0), binary=True
+                    ),
+                    "job_artifacts_size": humanize.naturalsize(
+                        stats.get("job_artifacts_size", 0), binary=True
+                    ),
+                    "storage_size": humanize.naturalsize(
+                        stats.get("storage_size", 0), binary=True
+                    ),
                     "commit_count": commits,
                     "last_activity_at": full.last_activity_at,
                     "visibility": full.visibility,
                 }
             )
+
+            if idx % 50 == 0:
+                logger.info(f"Обработано проектов: {idx}")
 
             time.sleep(0.05)
 
@@ -251,15 +264,28 @@ def split_unmatched(unmatched):
 
 
 def write_to_excel(
-    gitlab_users, stats, projects, runners,
-    bk_matched, tech_users, fired_users,
-    filename="gitlab_report.xlsx"
+    gitlab_users,
+    stats,
+    projects,
+    runners,
+    bk_matched,
+    tech_users,
+    fired_users,
+    filename="gitlab_report.xlsx",
 ):
     filename = str(Path(filename).resolve())
     wb = xlsxwriter.Workbook(filename)
 
     sh = wb.add_worksheet("Пользователи")
-    headers = ["id", "username", "email", "name", "last_sign_in_at", "last_activity_on", "extern_uid"]
+    headers = [
+        "id",
+        "username",
+        "email",
+        "name",
+        "last_sign_in_at",
+        "last_activity_on",
+        "extern_uid",
+    ]
     for c, h in enumerate(headers):
         sh.write(0, c, h)
     for r, u in enumerate(gitlab_users, start=1):
@@ -294,10 +320,16 @@ def write_to_excel(
 
     sh6 = wb.add_worksheet("Проекты")
     proj_headers = [
-        "id","name","path_with_namespace",
-        "repository_size","lfs_objects_size",
-        "job_artifacts_size","storage_size",
-        "commit_count","last_activity_at","visibility"
+        "id",
+        "name",
+        "path_with_namespace",
+        "repository_size",
+        "lfs_objects_size",
+        "job_artifacts_size",
+        "storage_size",
+        "commit_count",
+        "last_activity_at",
+        "visibility",
     ]
     for c, h in enumerate(proj_headers):
         sh6.write(0, c, h)
@@ -306,9 +338,16 @@ def write_to_excel(
 
     sh7 = wb.add_worksheet("Раннеры")
     runner_headers = [
-        "id","source_name","source_path","runner_type",
-        "description","status","online","ip_address",
-        "tag_list","contacted_at"
+        "id",
+        "source_name",
+        "source_path",
+        "runner_type",
+        "description",
+        "status",
+        "online",
+        "ip_address",
+        "tag_list",
+        "contacted_at",
     ]
     for c, h in enumerate(runner_headers):
         sh7.write(0, c, h)
@@ -337,10 +376,7 @@ def main():
     bk_matched, unmatched = match_users(gitlab_users, bk_users)
     tech, fired = split_unmatched(unmatched)
 
-    write_to_excel(
-        gitlab_users, stats, projects, runners,
-        bk_matched, tech, fired
-    )
+    write_to_excel(gitlab_users, stats, projects, runners, bk_matched, tech, fired)
 
     logger.info("Готово.")
 
