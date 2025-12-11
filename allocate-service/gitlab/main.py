@@ -27,14 +27,17 @@ logger = logging.getLogger(__name__)
 
 
 def get_gitlab_connection():
+    logger.info("Подключаемся к GitLab...")
     gl = gitlab.Gitlab(
         GITLAB_URL, private_token=GITLAB_TOKEN, ssl_verify=False, timeout=60
     )
     gl.auth()
+    logger.info("Успешное подключение к GitLab")
     return gl
 
 
 def get_users(gl):
+    logger.info("Получаем пользователей GitLab...")
     users = gl.users.list(all=True, iterator=True)
     result = []
 
@@ -55,11 +58,15 @@ def get_users(gl):
                 "extern_uid": extern_uid,
             }
         )
+
+    logger.info(f"Пользователей получено: {len(result)}")
     return result
 
 
 def get_stat(gl):
+    logger.info("Получаем статистику GitLab...")
     stats = gl.statistics.get()
+
     fields = {
         "forks": stats.forks,
         "issues": stats.issues,
@@ -73,16 +80,20 @@ def get_stat(gl):
         "groups": stats.groups,
         "active_users": stats.active_users,
     }
+
     norm = {}
     for k, v in fields.items():
         if isinstance(v, str):
             v = v.replace(",", "").strip()
             v = int(v) if v.isdigit() else 0
         norm[k] = v
+
+    logger.info("Статистика успешно получена")
     return norm
 
 
 def get_projects_stats(gl):
+    logger.info("Собираем статистику проектов...")
     projects = gl.projects.list(all=True, iterator=True)
     result = []
     total_commits = 0
@@ -91,6 +102,7 @@ def get_projects_stats(gl):
         try:
             full = gl.projects.get(project.id, statistics=True)
             stats = getattr(full, "statistics", {}) or {}
+
             commits = stats.get("commit_count", 0)
             if isinstance(commits, int):
                 total_commits += commits
@@ -109,15 +121,20 @@ def get_projects_stats(gl):
                     "visibility": full.visibility,
                 }
             )
+
             time.sleep(0.05)
-        except:
+
+        except Exception as e:
+            logger.warning(f"Ошибка проекта {project.id}: {e}")
             continue
 
     result.sort(key=lambda x: x.get("storage_size", ""), reverse=True)
+    logger.info(f"Проектов: {len(result)}, коммитов: {total_commits}")
     return result, total_commits
 
 
 def get_runners_info(gl):
+    logger.info("Получаем раннеры...")
     runners = gl.runners_all.list(all=True)
     data = []
 
@@ -157,23 +174,28 @@ def get_runners_info(gl):
                 }
             )
 
-        except:
-            pass
+        except Exception as e:
+            logger.warning(f"Ошибка раннера {r.id}: {e}")
 
         time.sleep(0.05)
 
+    logger.info(f"Всего раннеров: {len(data)}")
     return data, len(data)
 
 
 def load_bk_users():
+    logger.info("Загружаем BK SQLite...")
     conn = sqlite3.connect(BK_SQLITE_PATH)
     conn.row_factory = sqlite3.Row
     rows = conn.execute("SELECT * FROM bk").fetchall()
     conn.close()
+    logger.info(f"BK пользователей: {len(rows)}")
     return [dict(r) for r in rows]
 
 
 def match_users(gitlab_users, bk_users):
+    logger.info("Сопоставляем пользователей по логину и email...")
+
     bk_by_login = {(u.get("sAMAccountName") or "").strip().lower(): u for u in bk_users}
     bk_by_email = {(u.get("Email") or "").strip().lower(): u for u in bk_users}
 
@@ -197,6 +219,7 @@ def match_users(gitlab_users, bk_users):
         else:
             unmatched.append(u)
 
+    logger.info(f"Совпадений: {len(matched)}, не найдено: {len(unmatched)}")
     return matched, unmatched
 
 
@@ -293,10 +316,13 @@ def write_to_excel(
         sh7.write_row(r, 0, [p.get(h, "") for h in runner_headers])
 
     wb.close()
+    logger.info(f"Excel сохранён: {filename}")
     return filename
 
 
 def main():
+    logger.info("========== СТАРТ GitLab ОТЧЁТА ==========")
+
     gl = get_gitlab_connection()
     gitlab_users = get_users(gl)
     stats = get_stat(gl)
@@ -315,6 +341,8 @@ def main():
         gitlab_users, stats, projects, runners,
         bk_matched, tech, fired
     )
+
+    logger.info("Готово.")
 
 
 if __name__ == "__main__":
