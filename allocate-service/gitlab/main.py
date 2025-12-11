@@ -4,6 +4,8 @@ import gitlab
 import urllib3
 import xlsxwriter
 import sqlite3
+import humanize
+import re
 from dotenv import load_dotenv
 from pathlib import Path
 import time
@@ -14,7 +16,6 @@ load_dotenv()
 GITLAB_URL = os.getenv("GITLAB_URL")
 GITLAB_TOKEN = os.getenv("GITLAB_TOKEN")
 BK_SQLITE_PATH = os.getenv("BK_SQLITE_PATH")
-MAX_PROJECTS = 100
 
 logging.basicConfig(
     level=logging.INFO,
@@ -26,17 +27,14 @@ logger = logging.getLogger(__name__)
 
 
 def get_gitlab_connection():
-    logger.info("Подключаемся к GitLab...")
     gl = gitlab.Gitlab(
         GITLAB_URL, private_token=GITLAB_TOKEN, ssl_verify=False, timeout=60
     )
     gl.auth()
-    logger.info("Успешное подключение к GitLab")
     return gl
 
 
 def get_users(gl):
-    logger.info("Получаем пользователей GitLab...")
     users = gl.users.list(all=True, iterator=True)
     result = []
 
@@ -44,9 +42,7 @@ def get_users(gl):
         extern_uid = ""
         identities = getattr(u, "identities", [])
         if identities and isinstance(identities, list):
-            extern_uid = ", ".join(
-                i.get("extern_uid", "") for i in identities if isinstance(i, dict)
-            )
+            extern_uid = ", ".join(i.get("extern_uid", "") for i in identities if isinstance(i, dict))
 
         result.append(
             {
@@ -59,15 +55,11 @@ def get_users(gl):
                 "extern_uid": extern_uid,
             }
         )
-
-    logger.info(f"Пользователей получено: {len(result)}")
     return result
 
 
 def get_stat(gl):
-    logger.info("Получаем статистику GitLab...")
     stats = gl.statistics.get()
-
     fields = {
         "forks": stats.forks,
         "issues": stats.issues,
@@ -81,29 +73,24 @@ def get_stat(gl):
         "groups": stats.groups,
         "active_users": stats.active_users,
     }
-
     norm = {}
     for k, v in fields.items():
         if isinstance(v, str):
             v = v.replace(",", "").strip()
             v = int(v) if v.isdigit() else 0
         norm[k] = v
-
-    logger.info("Статистика успешно получена")
     return norm
 
 
 def get_projects_stats(gl):
-    logger.info("Начинаем сбор статистики по проектам...")
     projects = gl.projects.list(all=True, iterator=True)
     result = []
     total_commits = 0
 
-    for idx, project in enumerate(projects, start=1):
+    for project in projects:
         try:
             full = gl.projects.get(project.id, statistics=True)
             stats = getattr(full, "statistics", {}) or {}
-
             commits = stats.get("commit_count", 0)
             if isinstance(commits, int):
                 total_commits += commits
@@ -113,42 +100,24 @@ def get_projects_stats(gl):
                     "id": full.id,
                     "name": full.name,
                     "path_with_namespace": full.path_with_namespace,
-                    "repository_size_mb": round(
-                        stats.get("repository_size", 0) / 1024 / 1024, 2
-                    ),
-                    "lfs_objects_size_mb": round(
-                        stats.get("lfs_objects_size", 0) / 1024 / 1024, 2
-                    ),
-                    "job_artifacts_size_mb": round(
-                        stats.get("job_artifacts_size", 0) / 1024 / 1024, 2
-                    ),
-                    "storage_size_mb": round(
-                        stats.get("storage_size", 0) / 1024 / 1024, 2
-                    ),
+                    "repository_size": humanize.naturalsize(stats.get("repository_size", 0), binary=True),
+                    "lfs_objects_size": humanize.naturalsize(stats.get("lfs_objects_size", 0), binary=True),
+                    "job_artifacts_size": humanize.naturalsize(stats.get("job_artifacts_size", 0), binary=True),
+                    "storage_size": humanize.naturalsize(stats.get("storage_size", 0), binary=True),
                     "commit_count": commits,
                     "last_activity_at": full.last_activity_at,
                     "visibility": full.visibility,
                 }
             )
-
-            if idx % 50 == 0:
-                logger.info(f"Обработано проектов: {idx}")
-
-            if idx >= MAX_PROJECTS:
-                break
             time.sleep(0.05)
-
-        except Exception as e:
-            logger.warning(f"Ошибка при обработке проекта {project.id}: {e}")
+        except:
             continue
 
-    result.sort(key=lambda x: x.get("storage_size_mb", 0), reverse=True)
-    logger.info(f"Готово. Проектов: {len(result)}, коммитов: {total_commits}")
+    result.sort(key=lambda x: x.get("storage_size", ""), reverse=True)
     return result, total_commits
 
 
 def get_runners_info(gl):
-    logger.info("Получаем раннеры...")
     runners = gl.runners_all.list(all=True)
     data = []
 
@@ -188,30 +157,24 @@ def get_runners_info(gl):
                 }
             )
 
-        except Exception as e:
-            logger.warning(f"Ошибка раннера {r.id}: {e}")
+        except:
+            pass
 
         time.sleep(0.05)
 
-    logger.info(f"Всего раннеров: {len(data)}")
     return data, len(data)
 
 
 def load_bk_users():
-    logger.info("Загружаем BK SQLite...")
     conn = sqlite3.connect(BK_SQLITE_PATH)
     conn.row_factory = sqlite3.Row
     rows = conn.execute("SELECT * FROM bk").fetchall()
     conn.close()
-    logger.info(f"BK пользователей: {len(rows)}")
     return [dict(r) for r in rows]
 
 
 def match_users(gitlab_users, bk_users):
-    logger.info("Сопоставляем пользователей по логину и email")
-
     bk_by_login = {(u.get("sAMAccountName") or "").strip().lower(): u for u in bk_users}
-
     bk_by_email = {(u.get("Email") or "").strip().lower(): u for u in bk_users}
 
     matched = []
@@ -234,133 +197,124 @@ def match_users(gitlab_users, bk_users):
         else:
             unmatched.append(u)
 
-    logger.info(f"Найдено: {len(matched)}, не найдено: {len(unmatched)}")
     return matched, unmatched
 
 
+def split_unmatched(unmatched):
+    tech = []
+    fired = []
+
+    for u in unmatched:
+        eu = (u.get("extern_uid") or "").strip()
+
+        if eu == "":
+            tech.append(u)
+            continue
+
+        m = re.search(r"cn=([^,]+)", eu, re.IGNORECASE)
+        if not m:
+            tech.append(u)
+            continue
+
+        cn = m.group(1).strip()
+
+        if not re.search(r"[а-яА-ЯёЁ]", cn):
+            tech.append(u)
+            continue
+
+        fired.append(u)
+
+    return tech, fired
+
+
 def write_to_excel(
-    gitlab_users,
-    stats,
-    projects,
-    runners,
-    bk_matched,
-    bk_unmatched,
-    filename="gitlab_report.xlsx",
+    gitlab_users, stats, projects, runners,
+    bk_matched, tech_users, fired_users,
+    filename="gitlab_report.xlsx"
 ):
     filename = str(Path(filename).resolve())
-    logger.info(f"Создаём Excel: {filename}")
-
     wb = xlsxwriter.Workbook(filename)
 
     sh = wb.add_worksheet("Пользователи")
-    headers = [
-        "ID",
-        "Username",
-        "Email",
-        "Name",
-        "Last Sign In",
-        "Last Activity",
-        "Extern UID",
-    ]
+    headers = ["id", "username", "email", "name", "last_sign_in_at", "last_activity_on", "extern_uid"]
     for c, h in enumerate(headers):
         sh.write(0, c, h)
     for r, u in enumerate(gitlab_users, start=1):
-        sh.write_row(r, 0, list(u.values()))
+        sh.write_row(r, 0, [u.get(h, "") for h in headers])
 
-    sh2 = wb.add_worksheet("Статистика")
-    sh2.write(0, 0, "Показатель")
-    sh2.write(0, 1, "Значение")
+    sh2 = wb.add_worksheet("Совпавшие")
+    if bk_matched:
+        headers2 = list(bk_matched[0].keys())
+        for c, h in enumerate(headers2):
+            sh2.write(0, c, h)
+        for r, u in enumerate(bk_matched, start=1):
+            sh2.write_row(r, 0, [u.get(h, "") for h in headers2])
+
+    sh3 = wb.add_worksheet("Технические")
+    for c, h in enumerate(headers):
+        sh3.write(0, c, h)
+    for r, u in enumerate(tech_users, start=1):
+        sh3.write_row(r, 0, [u.get(h, "") for h in headers])
+
+    sh4 = wb.add_worksheet("Уволенные")
+    for c, h in enumerate(headers):
+        sh4.write(0, c, h)
+    for r, u in enumerate(fired_users, start=1):
+        sh4.write_row(r, 0, [u.get(h, "") for h in headers])
+
+    sh5 = wb.add_worksheet("Статистика")
+    sh5.write(0, 0, "Показатель")
+    sh5.write(0, 1, "Значение")
     for r, (k, v) in enumerate(stats.items(), start=1):
-        sh2.write(r, 0, k)
-        sh2.write(r, 1, v)
+        sh5.write(r, 0, k)
+        sh5.write(r, 1, v)
 
-    sh3 = wb.add_worksheet("Проекты")
+    sh6 = wb.add_worksheet("Проекты")
     proj_headers = [
-        "ID",
-        "Project Name",
-        "Namespace Path",
-        "Repo Size (MB)",
-        "LFS Size (MB)",
-        "Artifacts Size (MB)",
-        "Total Storage (MB)",
-        "Commits",
-        "Last Activity",
-        "Visibility",
+        "id","name","path_with_namespace",
+        "repository_size","lfs_objects_size",
+        "job_artifacts_size","storage_size",
+        "commit_count","last_activity_at","visibility"
     ]
     for c, h in enumerate(proj_headers):
-        sh3.write(0, c, h)
+        sh6.write(0, c, h)
     for r, p in enumerate(projects, start=1):
-        sh3.write_row(r, 0, list(p.values()))
+        sh6.write_row(r, 0, [p.get(h, "") for h in proj_headers])
 
-    sh4 = wb.add_worksheet("Раннеры")
+    sh7 = wb.add_worksheet("Раннеры")
     runner_headers = [
-        "ID",
-        "Source Name",
-        "Source Path",
-        "Runner Type",
-        "Description",
-        "Status",
-        "Online",
-        "IP Address",
-        "Tag List",
-        "Contacted At",
+        "id","source_name","source_path","runner_type",
+        "description","status","online","ip_address",
+        "tag_list","contacted_at"
     ]
     for c, h in enumerate(runner_headers):
-        sh4.write(0, c, h)
+        sh7.write(0, c, h)
     for r, p in enumerate(runners, start=1):
-        sh4.write_row(r, 0, list(p.values()))
-
-    sh5 = wb.add_worksheet("BK_Matched_Users")
-    if bk_matched:
-        headers = list(bk_matched[0].keys())
-        for c, h in enumerate(headers):
-            sh5.write(0, c, h)
-        for r, u in enumerate(bk_matched, start=1):
-            sh5.write_row(r, 0, [u.get(h, "") for h in headers])
-
-    sh6 = wb.add_worksheet("BK_Unmatched_Users")
-    headers = [
-        "id",
-        "username",
-        "email",
-        "name",
-        "last_sign_in_at",
-        "last_activity_on",
-        "extern_uid",
-    ]
-    for c, h in enumerate(headers):
-        sh6.write(0, c, h)
-    for r, u in enumerate(bk_unmatched, start=1):
-        sh6.write_row(r, 0, [u.get(h, "") for h in headers])
+        sh7.write_row(r, 0, [p.get(h, "") for h in runner_headers])
 
     wb.close()
-    logger.info(f"Excel сохранён: {filename}")
     return filename
 
 
 def main():
-    try:
-        logger.info("========== СТАРТ GitLab ОТЧЁТА ==========")
+    gl = get_gitlab_connection()
+    gitlab_users = get_users(gl)
+    stats = get_stat(gl)
+    projects, commits = get_projects_stats(gl)
+    runners, runners_count = get_runners_info(gl)
 
-        gl = get_gitlab_connection()
-        gitlab_users = get_users(gl)
-        stats = get_stat(gl)
-        projects, commits = get_projects_stats(gl)
-        runners, runners_count = get_runners_info(gl)
+    stats["total_commits"] = commits
+    stats["projects_processed"] = len(projects)
+    stats["runners_total"] = runners_count
 
-        stats["total_commits"] = commits
-        stats["projects_processed"] = len(projects)
-        stats["runners_total"] = runners_count
+    bk_users = load_bk_users()
+    bk_matched, unmatched = match_users(gitlab_users, bk_users)
+    tech, fired = split_unmatched(unmatched)
 
-        bk_users = load_bk_users()
-        bk_matched, bk_unmatched = match_users(gitlab_users, bk_users)
-
-        write_to_excel(gitlab_users, stats, projects, runners, bk_matched, bk_unmatched)
-
-        logger.info("Готово.")
-
-    except Exception as e:
-        logger.exception(f"Ошибка: {e}")
+    write_to_excel(
+        gitlab_users, stats, projects, runners,
+        bk_matched, tech, fired
+    )
 
 
 if __name__ == "__main__":
