@@ -242,6 +242,13 @@ def split_unmatched(unmatched):
 
     for u in unmatched:
         eu = (u.get("extern_uid") or "").strip()
+        name = (u.get("name") or "").strip()
+
+        name_has_cyrillic = bool(re.search(r"[а-яА-ЯёЁ]", name))
+
+        if name_has_cyrillic:
+            fired.append(u)
+            continue
 
         if eu == "":
             tech.append(u)
@@ -253,14 +260,16 @@ def split_unmatched(unmatched):
             continue
 
         cn = m.group(1).strip()
+        cn_has_cyrillic = bool(re.search(r"[а-яА-ЯёЁ]", cn))
 
-        if not re.search(r"[а-яА-ЯёЁ]", cn):
-            tech.append(u)
+        if cn_has_cyrillic:
+            fired.append(u)
             continue
 
-        fired.append(u)
+        tech.append(u)
 
     return tech, fired
+
 
 
 def write_to_excel(
