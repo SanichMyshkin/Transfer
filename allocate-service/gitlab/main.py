@@ -13,15 +13,12 @@ load_dotenv()
 
 GITLAB_URL = os.getenv("GITLAB_URL")
 GITLAB_TOKEN = os.getenv("GITLAB_TOKEN")
-LOG_FILE = "gitlab_report.log"
+BK_SQLITE_PATH = os.getenv("BK_SQLITE_PATH")
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_FILE, mode="a", encoding="utf-8"),
-        logging.StreamHandler(),
-    ],
+    handlers=[logging.StreamHandler()],
 )
 
 logger = logging.getLogger(__name__)
@@ -29,7 +26,9 @@ logger = logging.getLogger(__name__)
 
 def get_gitlab_connection():
     logger.info("Подключаемся к GitLab...")
-    gl = gitlab.Gitlab(GITLAB_URL, private_token=GITLAB_TOKEN, ssl_verify=False, timeout=60)
+    gl = gitlab.Gitlab(
+        GITLAB_URL, private_token=GITLAB_TOKEN, ssl_verify=False, timeout=60
+    )
     gl.auth()
     logger.info("Успешное подключение к GitLab")
     return gl
@@ -44,7 +43,9 @@ def get_users(gl):
         extern_uid = ""
         identities = getattr(u, "identities", [])
         if identities and isinstance(identities, list):
-            extern_uid = ", ".join(i.get("extern_uid", "") for i in identities if isinstance(i, dict))
+            extern_uid = ", ".join(
+                i.get("extern_uid", "") for i in identities if isinstance(i, dict)
+            )
 
         result.append(
             {
@@ -111,10 +112,18 @@ def get_projects_stats(gl):
                     "id": full.id,
                     "name": full.name,
                     "path_with_namespace": full.path_with_namespace,
-                    "repository_size_mb": round(stats.get("repository_size", 0) / 1024 / 1024, 2),
-                    "lfs_objects_size_mb": round(stats.get("lfs_objects_size", 0) / 1024 / 1024, 2),
-                    "job_artifacts_size_mb": round(stats.get("job_artifacts_size", 0) / 1024 / 1024, 2),
-                    "storage_size_mb": round(stats.get("storage_size", 0) / 1024 / 1024, 2),
+                    "repository_size_mb": round(
+                        stats.get("repository_size", 0) / 1024 / 1024, 2
+                    ),
+                    "lfs_objects_size_mb": round(
+                        stats.get("lfs_objects_size", 0) / 1024 / 1024, 2
+                    ),
+                    "job_artifacts_size_mb": round(
+                        stats.get("job_artifacts_size", 0) / 1024 / 1024, 2
+                    ),
+                    "storage_size_mb": round(
+                        stats.get("storage_size", 0) / 1024 / 1024, 2
+                    ),
                     "commit_count": commits,
                     "last_activity_at": full.last_activity_at,
                     "visibility": full.visibility,
@@ -187,44 +196,70 @@ def get_runners_info(gl):
 
 def load_bk_users():
     logger.info("Загружаем BK SQLite...")
-    conn = sqlite3.connect("bk.sqlite")
+    conn = sqlite3.connect(BK_SQLITE_PATH)
     conn.row_factory = sqlite3.Row
-    rows = conn.execute("SELECT * FROM Users").fetchall()
+    rows = conn.execute("SELECT * FROM bk").fetchall()
     conn.close()
     logger.info(f"BK пользователей: {len(rows)}")
     return [dict(r) for r in rows]
 
 
-def match_users_by_email(gitlab_users, bk_users):
-    logger.info("Сопоставляем пользователей по Email...")
-    bk_index = {u.get("Email", "").strip().lower(): u for u in bk_users}
+def normalize_domain_username(value):
+    if not value:
+        return ""
+    value = value.strip().lower()
+    if "@" in value:
+        value = value.split("@")[0]
+    return value
+
+
+def match_users_by_domain(gitlab_users, bk_users):
+    logger.info("Сопоставляем пользователей по доменному имени...")
+
+    bk_index = {
+        normalize_domain_username(u.get("sAMAccountName", "")): u
+        for u in bk_users
+    }
+
     matched = []
+    unmatched = []
 
     for u in gitlab_users:
-        email = (u["email"] or "").strip().lower()
+        gitlab_name = normalize_domain_username(u.get("username", ""))
 
-        if not email:
-            logger.info(f"⚠ Нет email → {u['username']}")
+        if not gitlab_name:
+            unmatched.append(u)
             continue
 
-        if email in bk_index:
-            logger.info(f"✔ Найден по email: {email}")
-            matched.append(bk_index[email])
+        if gitlab_name in bk_index:
+            matched.append(bk_index[gitlab_name])
         else:
-            logger.info(f"⚠ Не найден по Email (возможная тех. учётка): {email}")
+            unmatched.append(u)
 
-    logger.info(f"Совпадений найдено: {len(matched)}")
-    return matched
+    logger.info(f"Совпадений: {len(matched)}, НЕ найдено: {len(unmatched)}")
+    return matched, unmatched
 
 
-def write_to_excel(gitlab_users, stats, projects, runners, bk_matched, filename="gitlab_report.xlsx"):
+def write_to_excel(
+    gitlab_users, stats, projects, runners,
+    bk_matched, bk_unmatched,
+    filename="gitlab_report.xlsx"
+):
     filename = str(Path(filename).resolve())
     logger.info(f"Создаём Excel: {filename}")
 
     wb = xlsxwriter.Workbook(filename)
 
     sh = wb.add_worksheet("Пользователи")
-    headers = ["ID", "Username", "Email", "Name", "Last Sign In", "Last Activity", "Extern UID"]
+    headers = [
+        "ID",
+        "Username",
+        "Email",
+        "Name",
+        "Last Sign In",
+        "Last Activity",
+        "Extern UID",
+    ]
     for c, h in enumerate(headers):
         sh.write(0, c, h)
     for r, u in enumerate(gitlab_users, start=1):
@@ -239,9 +274,16 @@ def write_to_excel(gitlab_users, stats, projects, runners, bk_matched, filename=
 
     sh3 = wb.add_worksheet("Проекты")
     proj_headers = [
-        "ID", "Project Name", "Namespace Path",
-        "Repo Size (MB)", "LFS Size (MB)", "Artifacts Size (MB)",
-        "Total Storage (MB)", "Commits", "Last Activity", "Visibility"
+        "ID",
+        "Project Name",
+        "Namespace Path",
+        "Repo Size (MB)",
+        "LFS Size (MB)",
+        "Artifacts Size (MB)",
+        "Total Storage (MB)",
+        "Commits",
+        "Last Activity",
+        "Visibility",
     ]
     for c, h in enumerate(proj_headers):
         sh3.write(0, c, h)
@@ -250,8 +292,16 @@ def write_to_excel(gitlab_users, stats, projects, runners, bk_matched, filename=
 
     sh4 = wb.add_worksheet("Раннеры")
     runner_headers = [
-        "ID", "Source Name", "Source Path", "Runner Type", "Description",
-        "Status", "Online", "IP Address", "Tag List", "Contacted At"
+        "ID",
+        "Source Name",
+        "Source Path",
+        "Runner Type",
+        "Description",
+        "Status",
+        "Online",
+        "IP Address",
+        "Tag List",
+        "Contacted At",
     ]
     for c, h in enumerate(runner_headers):
         sh4.write(0, c, h)
@@ -265,6 +315,13 @@ def write_to_excel(gitlab_users, stats, projects, runners, bk_matched, filename=
             sh5.write(0, c, h)
         for r, u in enumerate(bk_matched, start=1):
             sh5.write_row(r, 0, [u.get(h, "") for h in headers])
+
+    sh6 = wb.add_worksheet("BK_Unmatched_Users")
+    headers = ["id", "username", "email", "name", "last_sign_in_at", "last_activity_on", "extern_uid"]
+    for c, h in enumerate(headers):
+        sh6.write(0, c, h)
+    for r, u in enumerate(bk_unmatched, start=1):
+        sh6.write_row(r, 0, [u.get(h, "") for h in headers])
 
     wb.close()
     logger.info(f"Excel сохранён: {filename}")
@@ -286,9 +343,13 @@ def main():
         stats["runners_total"] = runners_count
 
         bk_users = load_bk_users()
-        bk_matched = match_users_by_email(gitlab_users, bk_users)
+        bk_matched, bk_unmatched = match_users_by_domain(gitlab_users, bk_users)
 
-        write_to_excel(gitlab_users, stats, projects, runners, bk_matched)
+        write_to_excel(
+            gitlab_users, stats, projects, runners,
+            bk_matched, bk_unmatched
+        )
+
         logger.info("Готово.")
 
     except Exception as e:
