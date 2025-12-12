@@ -1,24 +1,35 @@
 import re
-from natasha import NamesExtractor
+import pymorphy2
 
-name_extractor = NamesExtractor()
+morph = pymorphy2.MorphAnalyzer()
 
 LATIN_RE = re.compile(r"[A-Za-z]")
-BANNED_WORDS_RE = re.compile(r"(служба|отдел|поддержк|администратор)", re.I)
+BANNED_WORDS_RE = re.compile(
+    r"(служба|отдел|поддержк|администратор)",
+    re.IGNORECASE,
+)
 CYRILLIC_RE = re.compile(r"^[А-Яа-яЁё\s-]+$")
 
 
 def is_valid_domain(email: str, allowed_domains: list[str]) -> bool:
-    if "@" not in email:
+    if not email or "@" not in email:
         return False
 
     domain = email.split("@", 1)[1].lower()
-    return any(domain == d or domain.endswith("." + d) for d in allowed_domains)
+
+    for allowed in allowed_domains:
+        allowed = allowed.lower()
+        if domain == allowed or domain.endswith("." + allowed):
+            return True
+
+    return False
 
 
 def is_human_name(name: str) -> bool:
     if not name:
         return False
+
+    name = name.strip()
 
     if LATIN_RE.search(name):
         return False
@@ -26,22 +37,30 @@ def is_human_name(name: str) -> bool:
     if BANNED_WORDS_RE.search(name):
         return False
 
-    if not CYRILLIC_RE.fullmatch(name.strip()):
+    if not CYRILLIC_RE.fullmatch(name):
         return False
 
-    matches = list(name_extractor(name))
-    if not matches:
+    parts = name.replace("-", " ").split()
+    if len(parts) not in (2, 3):
         return False
 
-    fact = matches[0].fact
-    filled = sum(1 for p in (fact.first, fact.last, fact.middle) if p)
+    valid_parts = 0
 
-    return filled >= 2
+    for p in parts:
+        parsed = morph.parse(p)[0]
+        if (
+            "Name" in parsed.tag
+            or "Surn" in parsed.tag
+            or "Patr" in parsed.tag
+        ):
+            valid_parts += 1
+
+    return valid_parts >= 2
 
 
 def classify_unmatched_users(unmatched: list[dict], allowed_domains: list[str]):
-    tech = []
-    terminated = []
+    tech_accounts = []
+    terminated_users = []
 
     for u in unmatched:
         email = (u.get("email") or "").strip().lower()
@@ -52,9 +71,9 @@ def classify_unmatched_users(unmatched: list[dict], allowed_domains: list[str]):
 
         if not domain_ok or not human_name:
             u["classification"] = "tech"
-            tech.append(u)
+            tech_accounts.append(u)
         else:
             u["classification"] = "terminated"
-            terminated.append(u)
+            terminated_users.append(u)
 
-    return tech, terminated
+    return tech_accounts, terminated_users
