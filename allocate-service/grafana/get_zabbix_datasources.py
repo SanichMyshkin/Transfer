@@ -3,6 +3,7 @@ import time
 import base64
 import requests
 import logging
+from urllib.parse import urlparse
 from tqdm import tqdm
 
 try:
@@ -11,8 +12,6 @@ except ImportError:
     import tomli as tomllib
 
 import gitlab
-
-# ================= ENV =================
 
 GRAFANA_URL = os.getenv("GRAFANA_URL")
 GRAFANA_USER = os.getenv("GRAFANA_USER")
@@ -26,21 +25,15 @@ GITLAB_REF = os.getenv("GITLAB_REF", "main")
 
 SLEEP = 0.2
 
-# ================= LOGGING =================
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
-logger = logging.getLogger("grafana_zabbix")
-
-# ================= HTTP =================
+logger = logging.getLogger("grafana_zabbix_full")
 
 requests.packages.urllib3.disable_warnings()
 session = requests.Session()
 session.verify = False
-
-# ================= GRAFANA =================
 
 
 def grafana_login():
@@ -86,9 +79,6 @@ def get_dashboard(uid: str):
     return r.json()
 
 
-# ================= ZABBIX DETECTION =================
-
-
 def dashboard_uses_zabbix(dashboard_json: dict) -> bool:
     panels = dashboard_json.get("dashboard", {}).get("panels", [])
 
@@ -98,16 +88,13 @@ def dashboard_uses_zabbix(dashboard_json: dict) -> bool:
 
         ds = panel.get("datasource")
 
-        if isinstance(ds, str):
-            if "zabbix" in ds.lower():
-                return True
+        if isinstance(ds, str) and "zabbix" in ds.lower():
+            return True
 
-        elif isinstance(ds, dict):
-            if "zabbix" in (ds.get("type") or "").lower():
-                return True
+        if isinstance(ds, dict) and "zabbix" in (ds.get("type") or "").lower():
+            return True
 
         targets = panel.get("targets")
-
         if not isinstance(targets, list):
             continue
 
@@ -117,18 +104,73 @@ def dashboard_uses_zabbix(dashboard_json: dict) -> bool:
 
             tds = target.get("datasource")
 
-            if isinstance(tds, str):
-                if "zabbix" in tds.lower():
-                    return True
+            if isinstance(tds, str) and "zabbix" in tds.lower():
+                return True
 
-            elif isinstance(tds, dict):
-                if "zabbix" in (tds.get("type") or "").lower():
-                    return True
+            if isinstance(tds, dict) and "zabbix" in (tds.get("type") or "").lower():
+                return True
 
     return False
 
 
-# ================= GITLAB =================
+def extract_zabbix_hosts(panel: dict):
+    hosts = set()
+    groups = set()
+
+    targets = panel.get("targets")
+    if not isinstance(targets, list):
+        return hosts, groups
+
+    for t in targets:
+        if not isinstance(t, dict):
+            continue
+
+        h = t.get("host")
+        g = t.get("group")
+
+        if isinstance(h, str):
+            hosts.add(h)
+        elif isinstance(h, list):
+            hosts.update(h)
+
+        if isinstance(g, str):
+            groups.add(g)
+        elif isinstance(g, list):
+            groups.update(g)
+
+    return hosts, groups
+
+
+def extract_zabbix_panels(dashboard_json: dict):
+    panels = dashboard_json.get("dashboard", {}).get("panels", [])
+    result = []
+
+    for panel in panels:
+        if not isinstance(panel, dict):
+            continue
+
+        ds = panel.get("datasource")
+        is_zabbix = False
+
+        if isinstance(ds, str) and "zabbix" in ds.lower():
+            is_zabbix = True
+        elif isinstance(ds, dict) and "zabbix" in (ds.get("type") or "").lower():
+            is_zabbix = True
+
+        if not is_zabbix:
+            continue
+
+        hosts, groups = extract_zabbix_hosts(panel)
+
+        result.append(
+            {
+                "panel_title": panel.get("title"),
+                "hosts": sorted(hosts),
+                "groups": sorted(groups),
+            }
+        )
+
+    return result
 
 
 def load_org_ids_from_gitlab():
@@ -153,23 +195,19 @@ def load_org_ids_from_gitlab():
     return sorted(org_ids)
 
 
-# ================= MAIN =================
-
-
 def main():
     grafana_login()
 
     org_ids = load_org_ids_from_gitlab()
     logger.info(f"Организаций из Git: {len(org_ids)}")
 
-    results = []
+    rows = []
 
     for org_id in tqdm(org_ids, desc="Scan orgs", ncols=100):
         if not switch_org(org_id):
             continue
 
         org_name = get_org_name(org_id)
-
         dashboards = get_all_dashboards()
 
         for d in dashboards:
@@ -180,22 +218,31 @@ def main():
             if not dash:
                 continue
 
-            if dashboard_uses_zabbix(dash):
-                results.append(
+            if not dashboard_uses_zabbix(dash):
+                continue
+
+            panels = extract_zabbix_panels(dash)
+
+            for p in panels:
+                rows.append(
                     {
-                        "org_id": org_id,
                         "organization": org_name,
+                        "org_id": org_id,
                         "dashboard_title": title,
                         "dashboard_url": f"{GRAFANA_URL}/d/{uid}",
+                        "panel_title": p["panel_title"],
+                        "zabbix_hosts": ", ".join(p["hosts"]) if p["hosts"] else "",
+                        "zabbix_groups": ", ".join(p["groups"]) if p["groups"] else "",
                     }
                 )
 
-    for r in results:
+    for r in rows:
         print(
-            f"[{r['org_id']}] {r['organization']} | {r['dashboard_title']} | {r['dashboard_url']}"
+            f"{r['organization']} | {r['dashboard_title']} | {r['panel_title']} | "
+            f"hosts=[{r['zabbix_hosts']}] groups=[{r['zabbix_groups']}] | {r['dashboard_url']}"
         )
 
-    logger.info(f"Найдено Zabbix-дашбордов: {len(results)}")
+    logger.info(f"Найдено Zabbix-панелей: {len(rows)}")
 
 
 if __name__ == "__main__":
