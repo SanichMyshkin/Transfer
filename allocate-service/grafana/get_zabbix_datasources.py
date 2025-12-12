@@ -1,9 +1,8 @@
 import os
 import time
 import base64
-import requests
 import logging
-from urllib.parse import urlparse
+import requests
 from tqdm import tqdm
 
 try:
@@ -12,6 +11,8 @@ except ImportError:
     import tomli as tomllib
 
 import gitlab
+
+# ================= ENV =================
 
 GRAFANA_URL = os.getenv("GRAFANA_URL")
 GRAFANA_USER = os.getenv("GRAFANA_USER")
@@ -25,15 +26,21 @@ GITLAB_REF = os.getenv("GITLAB_REF", "main")
 
 SLEEP = 0.2
 
+# ================= LOGGING =================
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 logger = logging.getLogger("grafana_zabbix_full")
 
+# ================= HTTP =================
+
 requests.packages.urllib3.disable_warnings()
 session = requests.Session()
 session.verify = False
+
+# ================= GRAFANA =================
 
 
 def grafana_login():
@@ -79,6 +86,9 @@ def get_dashboard(uid: str):
     return r.json()
 
 
+# ================= ZABBIX =================
+
+
 def dashboard_uses_zabbix(dashboard_json: dict) -> bool:
     panels = dashboard_json.get("dashboard", {}).get("panels", [])
 
@@ -116,10 +126,11 @@ def dashboard_uses_zabbix(dashboard_json: dict) -> bool:
 def extract_zabbix_hosts(panel: dict):
     hosts = set()
     groups = set()
+    items = set()
 
     targets = panel.get("targets")
     if not isinstance(targets, list):
-        return hosts, groups
+        return hosts, groups, items
 
     for t in targets:
         if not isinstance(t, dict):
@@ -127,18 +138,30 @@ def extract_zabbix_hosts(panel: dict):
 
         h = t.get("host")
         g = t.get("group")
+        i = t.get("item")
 
-        if isinstance(h, str):
+        if isinstance(h, str) and h:
             hosts.add(h)
         elif isinstance(h, list):
-            hosts.update(h)
+            for x in h:
+                if isinstance(x, str) and x:
+                    hosts.add(x)
 
-        if isinstance(g, str):
+        if isinstance(g, str) and g:
             groups.add(g)
         elif isinstance(g, list):
-            groups.update(g)
+            for x in g:
+                if isinstance(x, str) and x:
+                    groups.add(x)
 
-    return hosts, groups
+        if isinstance(i, str) and i:
+            items.add(i)
+        elif isinstance(i, list):
+            for x in i:
+                if isinstance(x, str) and x:
+                    items.add(x)
+
+    return hosts, groups, items
 
 
 def extract_zabbix_panels(dashboard_json: dict):
@@ -160,17 +183,21 @@ def extract_zabbix_panels(dashboard_json: dict):
         if not is_zabbix:
             continue
 
-        hosts, groups = extract_zabbix_hosts(panel)
+        hosts, groups, items = extract_zabbix_hosts(panel)
 
         result.append(
             {
                 "panel_title": panel.get("title"),
                 "hosts": sorted(hosts),
                 "groups": sorted(groups),
+                "items": sorted(items),
             }
         )
 
     return result
+
+
+# ================= GITLAB =================
 
 
 def load_org_ids_from_gitlab():
@@ -193,6 +220,9 @@ def load_org_ids_from_gitlab():
                 org_ids.add(m["org_id"])
 
     return sorted(org_ids)
+
+
+# ================= MAIN =================
 
 
 def main():
@@ -233,13 +263,15 @@ def main():
                         "panel_title": p["panel_title"],
                         "zabbix_hosts": ", ".join(p["hosts"]) if p["hosts"] else "",
                         "zabbix_groups": ", ".join(p["groups"]) if p["groups"] else "",
+                        "zabbix_items": ", ".join(p["items"]) if p["items"] else "",
                     }
                 )
 
     for r in rows:
         print(
             f"{r['organization']} | {r['dashboard_title']} | {r['panel_title']} | "
-            f"hosts=[{r['zabbix_hosts']}] groups=[{r['zabbix_groups']}] | {r['dashboard_url']}"
+            f"hosts=[{r['zabbix_hosts']}] groups=[{r['zabbix_groups']}] "
+            f"items=[{r['zabbix_items']}] | {r['dashboard_url']}"
         )
 
     logger.info(f"Найдено Zabbix-панелей: {len(rows)}")
