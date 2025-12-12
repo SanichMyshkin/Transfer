@@ -182,8 +182,6 @@ def main():
                 "isAdmin": u.get("isGrafanaAdmin"),
                 "lastSeenAt": u.get("lastSeenAt"),
                 "isDisabled": u.get("isDisabled"),
-                "created": u.get("createdAt"),
-                "updated": u.get("updatedAt"),
             }
         )
 
