@@ -93,6 +93,9 @@ def dashboard_uses_zabbix(dashboard_json: dict) -> bool:
     panels = dashboard_json.get("dashboard", {}).get("panels", [])
 
     for panel in panels:
+        if not isinstance(panel, dict):
+            continue
+
         ds = panel.get("datasource")
 
         if isinstance(ds, str):
@@ -103,7 +106,15 @@ def dashboard_uses_zabbix(dashboard_json: dict) -> bool:
             if "zabbix" in (ds.get("type") or "").lower():
                 return True
 
-        for target in panel.get("targets", []):
+        targets = panel.get("targets")
+
+        if not isinstance(targets, list):
+            continue
+
+        for target in targets:
+            if not isinstance(target, dict):
+                continue
+
             tds = target.get("datasource")
 
             if isinstance(tds, str):
