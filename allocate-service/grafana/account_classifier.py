@@ -1,14 +1,10 @@
 import re
-import pymorphy2
-
-morph = pymorphy2.MorphAnalyzer()
 
 LATIN_RE = re.compile(r"[A-Za-z]")
 BANNED_WORDS_RE = re.compile(
-    r"(служба|отдел|поддержк|администратор)",
+    r"(служба|отдел|поддержк|админ)",
     re.IGNORECASE,
 )
-CYRILLIC_RE = re.compile(r"^[А-Яа-яЁё\s-]+$")
 
 
 def is_valid_domain(email: str, allowed_domains: list[str]) -> bool:
@@ -16,13 +12,7 @@ def is_valid_domain(email: str, allowed_domains: list[str]) -> bool:
         return False
 
     domain = email.split("@", 1)[1].lower()
-
-    for allowed in allowed_domains:
-        allowed = allowed.lower()
-        if domain == allowed or domain.endswith("." + allowed):
-            return True
-
-    return False
+    return any(domain == d or domain.endswith("." + d) for d in allowed_domains)
 
 
 def is_human_name(name: str) -> bool:
@@ -37,25 +27,16 @@ def is_human_name(name: str) -> bool:
     if BANNED_WORDS_RE.search(name):
         return False
 
-    if not CYRILLIC_RE.fullmatch(name):
-        return False
+    parts = re.split(r"\s+", name)
 
-    parts = name.replace("-", " ").split()
     if len(parts) not in (2, 3):
         return False
 
-    valid_parts = 0
+    for part in parts:
+        if not re.fullmatch(r"[А-ЯЁ][а-яё\-]+", part):
+            return False
 
-    for p in parts:
-        parsed = morph.parse(p)[0]
-        if (
-            "Name" in parsed.tag
-            or "Surn" in parsed.tag
-            or "Patr" in parsed.tag
-        ):
-            valid_parts += 1
-
-    return valid_parts >= 2
+    return True
 
 
 def classify_unmatched_users(unmatched: list[dict], allowed_domains: list[str]):
