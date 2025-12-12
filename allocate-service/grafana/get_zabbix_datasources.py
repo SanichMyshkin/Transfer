@@ -42,6 +42,7 @@ session.verify = False
 
 # ================= GRAFANA =================
 
+
 def grafana_login():
     r = session.post(
         f"{GRAFANA_URL}/login",
@@ -84,7 +85,9 @@ def get_dashboard(uid: str):
     time.sleep(SLEEP)
     return r.json()
 
+
 # ================= ZABBIX DETECTION =================
+
 
 def dashboard_uses_zabbix(dashboard_json: dict) -> bool:
     panels = dashboard_json.get("dashboard", {}).get("panels", [])
@@ -92,22 +95,30 @@ def dashboard_uses_zabbix(dashboard_json: dict) -> bool:
     for panel in panels:
         ds = panel.get("datasource")
 
-        if isinstance(ds, str) and "zabbix" in ds.lower():
-            return True
+        if isinstance(ds, str):
+            if "zabbix" in ds.lower():
+                return True
 
-        if isinstance(ds, dict):
+        elif isinstance(ds, dict):
             if "zabbix" in (ds.get("type") or "").lower():
                 return True
 
         for target in panel.get("targets", []):
             tds = target.get("datasource")
-            if isinstance(tds, dict):
+
+            if isinstance(tds, str):
+                if "zabbix" in tds.lower():
+                    return True
+
+            elif isinstance(tds, dict):
                 if "zabbix" in (tds.get("type") or "").lower():
                     return True
 
     return False
 
+
 # ================= GITLAB =================
+
 
 def load_org_ids_from_gitlab():
     gl = gitlab.Gitlab(GITLAB_URL, private_token=GITLAB_TOKEN, ssl_verify=False)
@@ -130,7 +141,9 @@ def load_org_ids_from_gitlab():
 
     return sorted(org_ids)
 
+
 # ================= MAIN =================
+
 
 def main():
     grafana_login()
