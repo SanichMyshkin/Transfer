@@ -1,35 +1,38 @@
 import os
 import time
 import logging
-import pandas as pd
+import sqlite3
 import requests
+import pandas as pd
+
 from dotenv import load_dotenv
 from tqdm import tqdm
-
 from gitlab_config_loader import GitLabConfigLoader
+from account_classifier import classify_unmatched_users
 
 load_dotenv()
 
 GRAFANA_URL = os.getenv("GRAFANA_URL")
 GRAFANA_USER = os.getenv("GRAFANA_USER")
 GRAFANA_PASS = os.getenv("GRAFANA_PASS")
-
+BK_SQLITE_PATH = os.getenv("BK_SQLITE_PATH")
+ALLOWED_DOMAINS = [
+    d.strip() for d in os.getenv("ALLOWED_DOMAINS", "").split(",") if d.strip()
+]
 OUTPUT_FILE = "grafana_report.xlsx"
-LOG_FILE = "grafana_report.log"
-ORG_LIMIT = int(os.getenv("ORG_LIMIT", "5"))
+ORG_LIMIT = int(os.getenv("ORG_LIMIT", "100"))
+
 SLEEP_AFTER_SWITCH = 1
 SLEEP_BETWEEN_CALLS = 0.2
 
 logger = logging.getLogger("grafana_report")
 logger.setLevel(logging.INFO)
-
-fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S")
-fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
-fh.setFormatter(fmt)
-logger.addHandler(fh)
-ch = logging.StreamHandler()
-ch.setFormatter(fmt)
-logger.addHandler(ch)
+fmt = logging.Formatter(
+    "%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S"
+)
+handler = logging.StreamHandler()
+handler.setFormatter(fmt)
+logger.addHandler(handler)
 
 requests.packages.urllib3.disable_warnings()
 session = requests.Session()
@@ -87,74 +90,34 @@ def get_dashboards_in_folder(fid):
     return r.json()
 
 
-# -----------------------------------------------------
-# ПОЛНОЕ логирование результата /api/search
-# -----------------------------------------------------
-def get_all_dashboards_raw():
+def get_all_dashboards():
     r = session.get(
         f"{GRAFANA_URL}/api/search",
         params={"type": "dash-db", "limit": 5000},
     )
     r.raise_for_status()
-    data = r.json()
-
-    logger.info("==========================================================")
-    logger.info(f"RAW SEARCH RESULTS FOR CURRENT ORG: {len(data)} dashboards")
-    logger.info("Listing dashboards returned by /api/search:")
-    for d in data:
-        uid = d.get("uid")
-        title = d.get("title")
-        folder_id = d.get("folderId")
-        logger.info(
-            f"  - RAW: UID='{uid}', title='{title}', folderId={folder_id}"
-        )
-    logger.info("==========================================================")
-
     time.sleep(SLEEP_BETWEEN_CALLS)
-    return data
+    return r.json()
 
 
 def get_root_dashboards():
-    all_dash = get_all_dashboards_raw()
-    return [d for d in all_dash if d.get("folderId") in (0, None)]
+    return [d for d in get_all_dashboards() if d.get("folderId") in (0, None)]
 
 
-# -----------------------------------------------------
-# ДОБАВЛЕНО ПОЛНОЕ ЛОГИРОВАНИЕ + обработка 404 / 401
-# -----------------------------------------------------
-def get_dashboard_panels(uid, origininfo=""):
-    url = f"{GRAFANA_URL}/api/dashboards/uid/{uid}"
-    r = session.get(url)
-
-    if r.status_code == 404:
-        logger.warning(
-            f"Dashboard UID '{uid}' not found (404). "
-            f"Origin: {origininfo}. URL: {url}"
-        )
+def get_dashboard_panels(uid):
+    r = session.get(f"{GRAFANA_URL}/api/dashboards/uid/{uid}")
+    if r.status_code in (401, 404):
         return 0
-
-    if r.status_code == 401:
-        logger.warning(
-            f"Unauthorized (401) for dashboard UID '{uid}'. "
-            f"Origin: {origininfo}. URL: {url}"
-        )
-        return 0
-
     r.raise_for_status()
     time.sleep(SLEEP_BETWEEN_CALLS)
-
     dash = r.json().get("dashboard", {})
-    c = 0
-
+    count = 0
     if "panels" in dash:
-        c += len(dash["panels"])
-
+        count += len(dash["panels"])
     if "rows" in dash:
         for row in dash["rows"]:
-            if "panels" in row:
-                c += len(row["panels"])
-
-    return c
+            count += len(row.get("panels", []))
+    return count
 
 
 def get_all_grafana_users():
@@ -177,201 +140,158 @@ def get_all_grafana_users():
     return users
 
 
-# -----------------------------------------------------
-# ОСНОВНОЙ КОД
-# -----------------------------------------------------
+def get_bk_users():
+    conn = sqlite3.connect(BK_SQLITE_PATH)
+    with conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("select * from bk").fetchall()
+    return [dict(r) for r in rows]
 
-login_cookie()
 
-loader = GitLabConfigLoader()
-owners_clean = loader.get_owners_clean()
+def match_users(grafana_users, bk_users):
+    bk_by_login = {(u.get("sAMAccountName") or "").lower(): u for u in bk_users}
+    bk_by_email = {(u.get("Email") or "").lower(): u for u in bk_users}
+    matched = []
+    unmatched = []
+    for u in grafana_users:
+        login = (u.get("login") or "").lower()
+        email = (u.get("email") or "").lower()
+        found = bk_by_login.get(login) or bk_by_email.get(email)
+        if found:
+            matched.append(found)
+        else:
+            unmatched.append(u)
+    return matched, unmatched
 
-org_ids = sorted(owners_clean.keys())
-org_ids = org_ids[:ORG_LIMIT]
 
-rows_all_users = []
-for u in get_all_grafana_users():
-    rows_all_users.append(
-        {
-            "id": u.get("id"),
-            "name": u.get("name"),
-            "login": u.get("login"),
-            "email": u.get("email"),
-            "isAdmin": u.get("isGrafanaAdmin"),
-            "isDisabled": u.get("isDisabled"),
-            "created": u.get("createdAt"),
-            "updated": u.get("updatedAt"),
-        }
+def main():
+    login_cookie()
+
+    loader = GitLabConfigLoader()
+    owners_clean = loader.get_owners_clean()
+    org_ids = sorted(owners_clean.keys())[:ORG_LIMIT]
+
+    rows_all_users = []
+    for u in get_all_grafana_users():
+        rows_all_users.append(
+            {
+                "id": u.get("id"),
+                "name": u.get("name"),
+                "login": u.get("login"),
+                "email": u.get("email"),
+                "isAdmin": u.get("isGrafanaAdmin"),
+                "lastSeenAt": u.get("lastSeenAt"),
+                "isDisabled": u.get("isDisabled"),
+                "created": u.get("createdAt"),
+                "updated": u.get("updatedAt"),
+            }
+        )
+
+    bk_users = get_bk_users()
+    matched, unmatched = match_users(rows_all_users, bk_users)
+
+    tech_accounts, terminated_users = classify_unmatched_users(
+        unmatched, ALLOWED_DOMAINS
     )
 
-rows_users = []
-rows_folders = []
-rows_dashboards = []
-rows_orgs = []
+    rows_orgs = []
+    rows_users = []
+    rows_folders = []
+    rows_dashboards = []
 
+    for org_id in tqdm(org_ids, desc="Организации"):
+        org_name = get_org_name(org_id)
 
-for org_id in tqdm(org_ids, desc="Организации", ncols=100):
-    owner_entries = owners_clean.get(org_id, [])
-    if isinstance(owner_entries, list):
-        owner_group = ", ".join([e[0] for e in owner_entries]) if owner_entries else ""
-    elif isinstance(owner_entries, tuple):
-        owner_group = owner_entries[0]
-    else:
-        owner_group = ""
+        if not switch_org(org_id):
+            rows_orgs.append(
+                {
+                    "organization": org_name,
+                    "users_total": "NO ACCESS",
+                    "folders_total": "NO ACCESS",
+                    "dashboards_total": "NO ACCESS",
+                    "panels_total": "NO ACCESS",
+                }
+            )
+            continue
 
-    org_name = get_org_name(org_id)
-    ok = switch_org(org_id)
+        users = get_users_in_org(org_id)
+        if users is None:
+            continue
 
-    if not ok:
-        rows_orgs.append(
-            {
-                "organization": org_name,
-                "owner_group": owner_group,
-                "users_total": "NO ACCESS",
-                "folders_total": "NO ACCESS",
-                "dashboards_total": "NO ACCESS",
-                "panels_total": "NO ACCESS",
-            }
-        )
-        continue
-
-    users = get_users_in_org(org_id)
-    if users is None:
-        rows_orgs.append(
-            {
-                "organization": org_name,
-                "owner_group": owner_group,
-                "users_total": "NO ACCESS",
-                "folders_total": "NO ACCESS",
-                "dashboards_total": "NO ACCESS",
-                "panels_total": "NO ACCESS",
-            }
-        )
-        continue
-
-    users_total = len(users)
-    for u in users:
-        rows_users.append(
-            {
-                "organization": org_name,
-                "user_id": u.get("userId"),
-                "email": u.get("email"),
-                "login": u.get("login"),
-                "role": u.get("role"),
-            }
-        )
-
-    folders = get_folders()
-    folders_total = len(folders)
-
-    dashboards_total = 0
-    panels_total = 0
-
-    # -------- Folders dashboards --------
-    for f in folders:
-        fid = f["id"]
-        fname = f["title"]
-        dashboards = get_dashboards_in_folder(fid)
-        dashboards_total += len(dashboards)
-
-        rows_folders.append(
-            {
-                "organization": org_name,
-                "folder_id": fid,
-                "folder_title": fname,
-                "dashboards_count": len(dashboards),
-            }
-        )
-
-        for d in dashboards:
-            uid = d.get("uid")
-            title = d.get("title")
-
-            logger.info(
-                f"Checking dashboard from folder '{fname}' (ID={fid}): "
-                f"UID='{uid}', title='{title}'"
+        for u in users:
+            rows_users.append(
+                {
+                    "organization": org_name,
+                    "login": u.get("login"),
+                    "email": u.get("email"),
+                    "role": u.get("role"),
+                }
             )
 
-            panels = get_dashboard_panels(
-                uid,
-                origininfo=f"folder '{fname}' (ID={fid}), dashboard '{title}'"
+        folders = get_folders()
+        dashboards_total = 0
+        panels_total = 0
+
+        for f in folders:
+            dashboards = get_dashboards_in_folder(f["id"])
+            dashboards_total += len(dashboards)
+
+            rows_folders.append(
+                {
+                    "organization": org_name,
+                    "folder_id": f["id"],
+                    "folder_title": f["title"],
+                    "dashboards_count": len(dashboards),
+                }
             )
+
+            for d in dashboards:
+                panels = get_dashboard_panels(d["uid"])
+                panels_total += panels
+                rows_dashboards.append(
+                    {
+                        "organization": org_name,
+                        "dashboard_uid": d["uid"],
+                        "dashboard_title": d["title"],
+                        "panels": panels,
+                    }
+                )
+
+        for d in get_root_dashboards():
+            panels = get_dashboard_panels(d["uid"])
             panels_total += panels
-
+            dashboards_total += 1
             rows_dashboards.append(
                 {
                     "organization": org_name,
-                    "folder_id": fid,
-                    "folder_title": fname,
-                    "dashboard_uid": uid,
-                    "dashboard_title": title,
+                    "dashboard_uid": d["uid"],
+                    "dashboard_title": d["title"],
                     "panels": panels,
                 }
             )
 
-    # -------- ROOT dashboards --------
-    root_dash = get_root_dashboards()
-    dashboards_total += len(root_dash)
-
-    for d in root_dash:
-        uid = d.get("uid")
-        title = d.get("title")
-
-        logger.info(
-            f"Checking ROOT dashboard: UID='{uid}', title='{title}'"
-        )
-
-        panels = get_dashboard_panels(
-            uid,
-            origininfo=f"ROOT dashboard '{title}'"
-        )
-        panels_total += panels
-
-        rows_dashboards.append(
+        rows_orgs.append(
             {
                 "organization": org_name,
-                "folder_id": 0,
-                "folder_title": "ROOT",
-                "dashboard_uid": uid,
-                "dashboard_title": title,
-                "panels": panels,
+                "users_total": len(users),
+                "folders_total": len(folders),
+                "dashboards_total": dashboards_total,
+                "panels_total": panels_total,
             }
         )
 
-    rows_orgs.append(
-        {
-            "organization": org_name,
-            "owner_group": owner_group,
-            "users_total": users_total,
-            "folders_total": folders_total,
-            "dashboards_total": dashboards_total,
-            "panels_total": panels_total,
-        }
-    )
+    with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
+        pd.DataFrame(rows_all_users).to_excel(writer, "GrafanaUsers", index=False)
+        pd.DataFrame(matched).to_excel(writer, "BK_Users", index=False)
+        pd.DataFrame(tech_accounts).to_excel(writer, "Tech_Accounts", index=False)
+        pd.DataFrame(terminated_users).to_excel(writer, "Terminated_Users", index=False)
+        pd.DataFrame(rows_users).to_excel(writer, "OrganizationUsers", index=False)
+        pd.DataFrame(rows_orgs).to_excel(writer, "Organizations", index=False)
+        pd.DataFrame(rows_folders).to_excel(writer, "Folders", index=False)
+        pd.DataFrame(rows_dashboards).to_excel(writer, "Dashboards", index=False)
+
+    logger.info(f"Готово. Файл сохранён: {OUTPUT_FILE}")
 
 
-df_all_users = pd.DataFrame(rows_all_users)
-df_users = pd.DataFrame(rows_users)
-df_orgs = pd.DataFrame(rows_orgs)
-df_folders = pd.DataFrame(rows_folders)
-df_dashboards = pd.DataFrame(rows_dashboards)
-
-global_summary = {
-    "organizations_total": len(df_orgs),
-    "users_total": len(df_all_users),
-    "folders_total": len(df_folders),
-    "dashboards_total": len(df_dashboards),
-    "panels_total": df_dashboards["panels"].sum() if not df_dashboards.empty else 0,
-}
-
-df_global_summary = pd.DataFrame(list(global_summary.items()), columns=["metric", "value"])
-
-with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
-    df_all_users.to_excel(writer, sheet_name="GrafanaUsers", index=False)
-    df_users.to_excel(writer, sheet_name="OrganizationUsers", index=False)
-    df_orgs.to_excel(writer, sheet_name="Organizations", index=False)
-    df_folders.to_excel(writer, sheet_name="Folders", index=False)
-    df_dashboards.to_excel(writer, sheet_name="Dashboards", index=False)
-    df_global_summary.to_excel(writer, sheet_name="Summary", index=False)
-
-logger.info(f"Готово! Данные сохранены в файл: {OUTPUT_FILE}")
+if __name__ == "__main__":
+    main()
