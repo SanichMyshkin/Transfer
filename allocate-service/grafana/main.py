@@ -281,14 +281,26 @@ def main():
         )
 
     with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
-        pd.DataFrame(rows_all_users).to_excel(writer, "GrafanaUsers", index=False)
-        pd.DataFrame(matched).to_excel(writer, "BK_Users", index=False)
-        pd.DataFrame(tech_accounts).to_excel(writer, "Tech_Accounts", index=False)
-        pd.DataFrame(terminated_users).to_excel(writer, "Terminated_Users", index=False)
-        pd.DataFrame(rows_users).to_excel(writer, "OrganizationUsers", index=False)
-        pd.DataFrame(rows_orgs).to_excel(writer, "Organizations", index=False)
-        pd.DataFrame(rows_folders).to_excel(writer, "Folders", index=False)
-        pd.DataFrame(rows_dashboards).to_excel(writer, "Dashboards", index=False)
+        pd.DataFrame(rows_all_users).to_excel(
+            writer, sheet_name="GrafanaUsers", index=False
+        )
+        pd.DataFrame(matched).to_excel(writer, sheet_name="BK_Users", index=False)
+        pd.DataFrame(tech_accounts).to_excel(
+            writer, sheet_name="Tech_Accounts", index=False
+        )
+        pd.DataFrame(terminated_users).to_excel(
+            writer, sheet_name="Terminated_Users", index=False
+        )
+        pd.DataFrame(rows_users).to_excel(
+            writer, sheet_name="OrganizationUsers", index=False
+        )
+        pd.DataFrame(rows_orgs).to_excel(
+            writer, sheet_name="Organizations", index=False
+        )
+        pd.DataFrame(rows_folders).to_excel(writer, sheet_name="Folders", index=False)
+        pd.DataFrame(rows_dashboards).to_excel(
+            writer, sheet_name="Dashboards", index=False
+        )
 
     logger.info(f"Готово. Файл сохранён: {OUTPUT_FILE}")
 
