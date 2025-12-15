@@ -1,55 +1,40 @@
 import os
-import sys
-import json
 import logging
-from dotenv import load_dotenv
 import pandas as pd
+from dotenv import load_dotenv
 from zabbix_utils import ZabbixAPI
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 log = logging.getLogger("zbx_match")
 
-STRICT = True  # если True — при конфликтах завершаем скрипт с кодом 1
 
-
-def load_excel_assets(path: str):
+def load_excel_assets(path):
     df = pd.read_excel(path, engine="openpyxl", dtype=str)
-
-    assets = []
+    rows = []
     for service, host, ip in zip(df.iloc[:, 0], df.iloc[:, 13], df.iloc[:, 21]):
         if not service or str(service).lower() == "nan":
             continue
-
-        assets.append({
+        rows.append({
             "service": service.strip(),
             "excel_host": None if not host or str(host).lower() == "nan" else host.strip(),
             "excel_ip": None if not ip or str(ip).lower() == "nan" else ip.strip(),
         })
-
-    log.info("Excel assets loaded: %d", len(assets))
-    return assets
+    log.info("Загружено строк из Excel: %d", len(rows))
+    return rows
 
 
 def build_zabbix_maps(zabbix_hosts):
-    """
-    Возвращает:
-      host_by_id: hostid -> {"hostid","host","name","ips":set,"dns":set}
-      ip_to_ids: ip -> set(hostid)
-      dns_to_ids: dns_lower -> set(hostid)
-    """
     host_by_id = {}
     ip_to_ids = {}
     dns_to_ids = {}
 
     for zh in zabbix_hosts:
-        hid = str(zh.get("hostid"))
+        hid = str(zh["hostid"])
         host = (zh.get("host") or "").strip()
         name = (zh.get("name") or "").strip()
-
         ips = set()
         dns = set()
 
-        # host/name тоже считаем как dns-ключи
         if host:
             dns.add(host.lower())
         if name:
@@ -63,211 +48,190 @@ def build_zabbix_maps(zabbix_hosts):
                 ip_to_ids.setdefault(ip, set()).add(hid)
             if d:
                 dns.add(d.lower())
-                dns_to_ids.setdefault(d.lower(), set()).add(hid)
 
-        # добавить накопленные dns в индекс
         for d in dns:
             dns_to_ids.setdefault(d, set()).add(hid)
 
         host_by_id[hid] = {
             "hostid": hid,
             "host": host,
-            "name": name,
             "ips": ips,
             "dns": dns,
         }
 
-    log.info("Zabbix maps built: hosts=%d ip_keys=%d dns_keys=%d",
-             len(host_by_id), len(ip_to_ids), len(dns_to_ids))
+    log.info(
+        "Построены индексы Zabbix: хостов=%d ip=%d dns=%d",
+        len(host_by_id), len(ip_to_ids), len(dns_to_ids)
+    )
     return host_by_id, ip_to_ids, dns_to_ids
 
 
-def get_candidates(row, ip_to_ids, dns_to_ids):
-    """
-    Возвращает (match_field, set(hostid), dns_variants_used)
-    match_field: "ip" / "dns" / None
-    """
-    excel_ip = row.get("excel_ip")
-    excel_host = row.get("excel_host")
-
-    if excel_ip and excel_ip in ip_to_ids:
-        return "ip", set(ip_to_ids[excel_ip]), []
-
-    if excel_host:
-        variants = [excel_host.lower()]
-        if "." in excel_host:
-            variants.append(excel_host.split(".", 1)[0].lower())
-
-        # объединяем кандидатов по вариантам
-        ids = set()
-        used = []
-        for v in variants:
-            if v in dns_to_ids:
-                ids |= dns_to_ids[v]
-                used.append(v)
-
-        if ids:
-            return "dns", ids, used
-
-    return None, set(), []
+def resolve_ip_by_hostname(ids, excel_host, host_by_id):
+    eh = excel_host.lower()
+    eh_short = eh.split(".", 1)[0] if "." in eh else None
+    matched = []
+    for hid in ids:
+        zh = host_by_id[hid]
+        if eh in zh["dns"] or (eh_short and eh_short in zh["dns"]):
+            matched.append(hid)
+    if len(matched) == 1:
+        return matched[0], "уточнено по hostname"
+    if len(matched) == 0:
+        return None, "hostname не совпал ни с одним кандидатом"
+    return None, "hostname совпал с несколькими кандидатами"
 
 
 def match_all(zabbix_hosts, excel_rows):
     host_by_id, ip_to_ids, dns_to_ids = build_zabbix_maps(zabbix_hosts)
 
     matched = []
-    conflicts = []  # сюда всё неоднозначное/противоречивое
-    unmatched_excel = []
-
-    # чтобы детектить “один zabbix host у разных сервисов”
-    service_by_hostid = {}
+    matched_hostids = set()
+    conflicts = []
 
     for row in excel_rows:
         service = row["service"]
-        excel_host = row.get("excel_host")
-        excel_ip = row.get("excel_ip")
+        excel_host = row["excel_host"]
+        excel_ip = row["excel_ip"]
 
-        match_field, ids, used_variants = get_candidates(row, ip_to_ids, dns_to_ids)
+        if excel_ip and excel_ip in ip_to_ids:
+            ids = ip_to_ids[excel_ip]
 
-        if not ids:
-            unmatched_excel.append(row)
-            continue
+            if len(ids) == 1:
+                hid = next(iter(ids))
+                zh = host_by_id[hid]
+                matched.append({
+                    "service": service,
+                    "match_field": "ip",
+                    "excel_host": excel_host,
+                    "excel_ip": excel_ip,
+                    "zabbix_host_name": zh["host"],
+                    "zabbix_ip": excel_ip,
+                })
+                matched_hostids.add(hid)
+                continue
 
-        if len(ids) > 1:
-            conflicts.append({
-                "type": "ambiguous_match",
-                "service": service,
-                "match_field": match_field,
-                "excel_host": excel_host,
-                "excel_ip": excel_ip,
-                "dns_variants": used_variants,
-                "candidates": [host_by_id[i]["host"] for i in sorted(ids)],
-                "candidate_hostids": sorted(ids),
-            })
-            continue
+            if excel_host:
+                hid, reason = resolve_ip_by_hostname(ids, excel_host, host_by_id)
+                if hid:
+                    zh = host_by_id[hid]
+                    log.warning(
+                        "IP %s используется несколькими хостами, но сопоставлен по hostname %s → %s",
+                        excel_ip, excel_host, zh["host"]
+                    )
+                    matched.append({
+                        "service": service,
+                        "match_field": "ip+hostname",
+                        "excel_host": excel_host,
+                        "excel_ip": excel_ip,
+                        "zabbix_host_name": zh["host"],
+                        "zabbix_ip": excel_ip,
+                    })
+                    matched_hostids.add(hid)
+                    continue
 
-        # ровно один кандидат
-        hid = next(iter(ids))
-        zh = host_by_id[hid]
-
-        # cross-check: если совпали по IP, но excel_host есть и НЕ встречается среди dns-алиасов zabbix
-        if match_field == "ip" and excel_host:
-            eh = excel_host.lower()
-            eh_short = excel_host.split(".", 1)[0].lower() if "." in excel_host else None
-            if (eh not in zh["dns"]) and (eh_short and eh_short not in zh["dns"]):
                 conflicts.append({
-                    "type": "ip_host_mismatch",
+                    "type": "ambiguous_ip",
                     "service": service,
                     "excel_host": excel_host,
                     "excel_ip": excel_ip,
-                    "zabbix_host": zh["host"],
-                    "zabbix_hostid": hid,
-                    "zabbix_dns_sample": sorted(list(zh["dns"]))[:5],
+                    "candidates": [host_by_id[i]["host"] for i in ids],
+                    "reason": reason,
                 })
-                # не продолжаем — это “подозрительное”, но связь по IP всё равно записать можно
-                # если хочешь “жёстко” — перенеси в continue
-                # continue
+                continue
 
-        # service conflict: один hid у разных service
-        prev_service = service_by_hostid.get(hid)
-        if prev_service and prev_service != service:
-            conflicts.append({
-                "type": "service_conflict",
-                "zabbix_host": zh["host"],
-                "zabbix_hostid": hid,
-                "service_prev": prev_service,
-                "service_new": service,
-                "excel_host": excel_host,
-                "excel_ip": excel_ip,
-                "match_field": match_field,
-            })
-            continue
+        if excel_host:
+            key = excel_host.lower()
+            key_short = key.split(".", 1)[0] if "." in key else None
+            ids = set()
+            if key in dns_to_ids:
+                ids |= dns_to_ids[key]
+            if key_short and key_short in dns_to_ids:
+                ids |= dns_to_ids[key_short]
 
-        service_by_hostid[hid] = service
+            if len(ids) == 1:
+                hid = next(iter(ids))
+                zh = host_by_id[hid]
+                ip_any = next(iter(zh["ips"]), None)
+                matched.append({
+                    "service": service,
+                    "match_field": "hostname",
+                    "excel_host": excel_host,
+                    "excel_ip": excel_ip,
+                    "zabbix_host_name": zh["host"],
+                    "zabbix_ip": ip_any,
+                })
+                matched_hostids.add(hid)
+                continue
 
-        # zabbix ip для вывода: если матч по IP — это он, иначе возьмём любой ip (если есть)
-        zabbix_ip = None
-        if match_field == "ip":
-            zabbix_ip = excel_ip
-        else:
-            zabbix_ip = next(iter(zh["ips"]), None)
+            if len(ids) > 1:
+                conflicts.append({
+                    "type": "ambiguous_hostname",
+                    "service": service,
+                    "excel_host": excel_host,
+                    "excel_ip": excel_ip,
+                    "candidates": [host_by_id[i]["host"] for i in ids],
+                })
+                continue
 
-        matched.append({
-            "service": service,
-            "match_field": match_field,
-            "excel_host": excel_host,
-            "excel_ip": excel_ip,
-            "zabbix_host_name": zh["host"],
-            "zabbix_ip": zabbix_ip,
-        })
-
-    # unmatched zabbix = те hostid, которые ни разу не попали в matched (и не лежат в конфликтных назначениях)
-    matched_ids = set([m["zabbix_host_name"] for m in matched])
     unmatched_zabbix = []
     for hid, zh in host_by_id.items():
-        if zh["host"] in matched_ids:
+        if hid in matched_hostids:
             continue
-        ip = next(iter(zh["ips"]), None)
-        # dns для отчёта можно брать любое (не обязательно)
+        ip_any = next(iter(zh["ips"]), None)
         dns_any = next(iter(zh["dns"]), None)
         unmatched_zabbix.append({
             "zabbix_host_name": zh["host"],
-            "zabbix_ip": ip,
+            "zabbix_ip": ip_any,
             "zabbix_dns": dns_any,
         })
 
-    return matched, unmatched_zabbix, conflicts, unmatched_excel
+    return matched, unmatched_zabbix, conflicts
 
 
-def export_to_excel(matched, unmatched_zabbix, out_xlsx="match_results.xlsx"):
-    with pd.ExcelWriter(out_xlsx, engine="openpyxl") as writer:
+def export_excel(matched, unmatched):
+    with pd.ExcelWriter("match_results.xlsx", engine="openpyxl") as writer:
         pd.DataFrame(matched).to_excel(writer, sheet_name="Matched", index=False)
-        pd.DataFrame(unmatched_zabbix).to_excel(writer, sheet_name="Unmatched_Zabbix", index=False)
-    log.info("Exported: %s", out_xlsx)
+        pd.DataFrame(unmatched).to_excel(writer, sheet_name="Unmatched_Zabbix", index=False)
+    log.info("Результаты сохранены в match_results.xlsx")
 
 
 def main():
     load_dotenv()
-    ZABBIX_URL = os.getenv("ZABBIX_URL")
-    ZABBIX_TOKEN = os.getenv("ZABBIX_TOKEN")
-    if not ZABBIX_URL or not ZABBIX_TOKEN:
-        log.error("ZABBIX_URL / ZABBIX_TOKEN not set")
-        return 1
+    url = os.getenv("ZABBIX_URL")
+    token = os.getenv("ZABBIX_TOKEN")
+
+    if not url or not token:
+        log.error("Не заданы ZABBIX_URL / ZABBIX_TOKEN")
+        return
 
     excel_rows = load_excel_assets(r"tags\service_db.xlsx")
 
     try:
-        api = ZabbixAPI(url=ZABBIX_URL)
-        api.login(token=ZABBIX_TOKEN)
+        api = ZabbixAPI(url=url)
+        api.login(token=token)
         zabbix_hosts = api.host.get(
             output=["hostid", "host", "name"],
             selectInterfaces=["ip", "dns"],
         )
-        log.info("Zabbix hosts loaded: %d", len(zabbix_hosts))
+        log.info("Получено хостов из Zabbix: %d", len(zabbix_hosts))
     except Exception:
-        log.exception("Zabbix API error")
-        return 1
+        log.exception("Ошибка работы с Zabbix API")
+        return
 
-    matched, unmatched_zabbix, conflicts, unmatched_excel = match_all(zabbix_hosts, excel_rows)
+    matched, unmatched, conflicts = match_all(zabbix_hosts, excel_rows)
 
-    log.info("RESULT: matched=%d  unmatched_zabbix=%d  conflicts=%d  unmatched_excel=%d",
-             len(matched), len(unmatched_zabbix), len(conflicts), len(unmatched_excel))
+    log.info(
+        "ИТОГО: сопоставлено=%d нераспределённых_в_zabbix=%d конфликтов=%d",
+        len(matched), len(unmatched), len(conflicts)
+    )
 
-    # покажем примеры конфликтов (первые 10)
     if conflicts:
-        log.error("CONFLICTS detected (showing up to 10):")
+        log.error("КОНФЛИКТЫ (первые 10):")
         for c in conflicts[:10]:
-            log.error(json.dumps(c, ensure_ascii=False))
+            log.error(c)
 
-    export_to_excel(matched, unmatched_zabbix, "match_results.xlsx")
-
-    # строгий режим: если есть конфликты или excel строки вообще не сопоставились — падаем
-    if STRICT and (conflicts or unmatched_excel):
-        log.error("STRICT mode: failing due to conflicts/unmatched_excel.")
-        return 1
-
-    return 0
+    export_excel(matched, unmatched)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
