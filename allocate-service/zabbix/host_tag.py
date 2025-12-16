@@ -44,12 +44,13 @@ def load_excel(path):
     return rows
 
 
-def zabbix_enabled_hosts(api):
+def load_enabled_zabbix_hosts(api):
     hosts = api.host.get(
-        output=["hostid", "host", "name", "status"],
+        output=["hostid", "name", "status"],
         selectInterfaces=["ip", "dns"],
     )
     enabled = [h for h in hosts if str(h.get("status")) == "0"]
+
     log.info(
         "Zabbix: всего=%d активных=%d отключённых=%d",
         len(hosts), len(enabled), len(hosts) - len(enabled),
@@ -57,22 +58,33 @@ def zabbix_enabled_hosts(api):
     return enabled
 
 
-def build_enabled_hostname_index(enabled_hosts):
-    idx = {}
-    for h in enabled_hosts:
-        keys = []
-        for iface in h.get("interfaces", []) or []:
-            dns = iface.get("dns")
-            if dns:
-                keys.extend(host_variants(dns))
+def zabbix_identity_keys(z):
+    keys = []
 
-        keys.extend(host_variants(h.get("host")))
-        keys.extend(host_variants(h.get("name")))
+    for iface in z.get("interfaces", []) or []:
+        if iface.get("dns"):
+            keys.extend(host_variants(iface["dns"]))
 
-        for k in keys:
-            idx.setdefault(k, []).append(h)
+    if z.get("name"):
+        keys.extend(host_variants(z["name"]))
 
-    return idx
+    return list(dict.fromkeys(keys))
+
+
+def zabbix_ips(z):
+    ips = []
+    for iface in z.get("interfaces", []) or []:
+        if iface.get("ip"):
+            ips.append(iface["ip"])
+    return list(dict.fromkeys(ips))
+
+
+
+def build_enabled_hostname_set(enabled_hosts):
+    s = set()
+    for z in enabled_hosts:
+        s.update(zabbix_identity_keys(z))
+    return s
 
 
 def build_excel_index(excel_rows, enabled_hostname_keys):
@@ -97,30 +109,27 @@ def build_excel_index(excel_rows, enabled_hostname_keys):
     return idx
 
 
+# ---------- Матч ----------
+
 def assign(enabled_hosts, excel_index):
     matched = []
     unmatched = []
     conflicts = []
 
     for z in enabled_hosts:
-        z_host = z.get("host")
-        z_ips = [iface.get("ip") for iface in z.get("interfaces", []) if iface.get("ip")]
-
-        keys = []
-        for iface in z.get("interfaces", []) or []:
-            if iface.get("dns"):
-                keys.extend(host_variants(iface["dns"]))
-        keys.extend(host_variants(z.get("host")))
-        keys.extend(host_variants(z.get("name")))
+        z_name = z.get("name")
+        z_keys = zabbix_identity_keys(z)
+        z_ip_list = zabbix_ips(z)
 
         candidates = []
-        for k in keys:
+        for k in z_keys:
             candidates.extend(excel_index.get(k, []))
 
         if not candidates:
             unmatched.append({
-                "zabbix_host_name": z_host,
-                "zabbix_ip": z_ips[0] if z_ips else None,
+                "zabbix_name": z_name,
+                "zabbix_dns": z_keys[0] if z_keys else None,
+                "zabbix_ip": z_ip_list[0] if z_ip_list else None,
                 "Статус": "Активен",
             })
             continue
@@ -129,7 +138,7 @@ def assign(enabled_hosts, excel_index):
         if len(services) > 1:
             conflicts.append({
                 "type": "hostname_conflict",
-                "zabbix_host": z_host,
+                "zabbix_name": z_name,
                 "services": services,
             })
             continue
@@ -137,7 +146,7 @@ def assign(enabled_hosts, excel_index):
         chosen = candidates[0]
 
         match_field = "hostname"
-        if chosen["excel_ip"] and chosen["excel_ip"] in z_ips:
+        if chosen["excel_ip"] and chosen["excel_ip"] in z_ip_list:
             match_field = "hostname+ip"
 
         if chosen["is_old"]:
@@ -148,20 +157,26 @@ def assign(enabled_hosts, excel_index):
             "match_field": match_field,
             "excel_host": chosen["excel_host"],
             "excel_ip": chosen["excel_ip"],
-            "zabbix_host_name": z_host,
-            "zabbix_ip": z_ips[0] if z_ips else None,
+            "zabbix_name": z_name,
+            "zabbix_dns": z_keys[0] if z_keys else None,
+            "zabbix_ip": z_ip_list[0] if z_ip_list else None,
             "Статус": "Активен",
         })
 
     return matched, unmatched, conflicts
 
 
+# ---------- Export ----------
+
 def export_excel(matched, unmatched):
     with pd.ExcelWriter("match_results.xlsx", engine="openpyxl") as writer:
         pd.DataFrame(matched).to_excel(writer, sheet_name="Matched", index=False)
         pd.DataFrame(unmatched).to_excel(writer, sheet_name="Unmatched_Zabbix", index=False)
+
     log.info("Результаты сохранены в match_results.xlsx")
 
+
+# ---------- Main ----------
 
 def main():
     load_dotenv()
@@ -177,9 +192,10 @@ def main():
     api = ZabbixAPI(url=url)
     api.login(token=token)
 
-    enabled_hosts = zabbix_enabled_hosts(api)
-    enabled_hostname_index = build_enabled_hostname_index(enabled_hosts)
-    excel_index = build_excel_index(excel_rows, set(enabled_hostname_index.keys()))
+    enabled_hosts = load_enabled_zabbix_hosts(api)
+    enabled_hostname_keys = build_enabled_hostname_set(enabled_hosts)
+
+    excel_index = build_excel_index(excel_rows, enabled_hostname_keys)
 
     matched, unmatched, conflicts = assign(enabled_hosts, excel_index)
 
