@@ -10,16 +10,52 @@ log = logging.getLogger("zbx_match")
 
 def load_excel_assets(path):
     df = pd.read_excel(path, engine="openpyxl", dtype=str)
-    rows = []
+
+    raw = []
     for service, host, ip in zip(df.iloc[:, 0], df.iloc[:, 13], df.iloc[:, 21]):
         if not service or str(service).lower() == "nan":
             continue
-        rows.append({
-            "service": service.strip(),
-            "excel_host": None if not host or str(host).lower() == "nan" else host.strip(),
-            "excel_ip": None if not ip or str(ip).lower() == "nan" else ip.strip(),
+
+        service = service.strip()
+        excel_host = None if not host or str(host).lower() == "nan" else host.strip()
+        excel_ip_raw = None if not ip or str(ip).lower() == "nan" else ip.strip()
+
+        is_old = False
+        excel_ip = excel_ip_raw
+        if excel_ip_raw and "old" in excel_ip_raw.lower():
+            is_old = True
+            excel_ip = excel_ip_raw.split("-", 1)[0].strip()
+
+        raw.append({
+            "service": service,
+            "excel_host": excel_host,
+            "excel_ip_raw": excel_ip_raw,
+            "excel_ip": excel_ip,
+            "is_old": is_old,
         })
-    log.info("Загружено строк из Excel: %d", len(rows))
+
+    non_old_ips = set()
+    for r in raw:
+        if r["excel_ip"] and not r["is_old"]:
+            non_old_ips.add(r["excel_ip"])
+
+    rows = []
+    old_skipped = 0
+    old_kept = 0
+    for r in raw:
+        if r["is_old"] and r["excel_ip"] and r["excel_ip"] in non_old_ips:
+            old_skipped += 1
+            continue
+        if r["is_old"]:
+            old_kept += 1
+        rows.append(r)
+
+    log.info("Загружено строк из Excel: %d", len(raw))
+    if old_skipped:
+        log.info("Пропущено строк с old из-за дублей: %d", old_skipped)
+    if old_kept:
+        log.info("Оставлено строк с old (единственные): %d", old_kept)
+
     return rows
 
 
@@ -92,6 +128,11 @@ def match_all(zabbix_hosts, excel_rows):
         service = row["service"]
         excel_host = row["excel_host"]
         excel_ip = row["excel_ip"]
+        excel_ip_raw = row["excel_ip_raw"]
+        is_old = row["is_old"]
+
+        if is_old:
+            log.warning("Запись имеет old: service=%s host=%s ip=%s", service, excel_host, excel_ip_raw)
 
         if excel_ip and excel_ip in ip_to_ids:
             ids = ip_to_ids[excel_ip]
@@ -101,9 +142,9 @@ def match_all(zabbix_hosts, excel_rows):
                 zh = host_by_id[hid]
                 matched.append({
                     "service": service,
-                    "match_field": "ip",
+                    "match_field": "ip_old" if is_old else "ip",
                     "excel_host": excel_host,
-                    "excel_ip": excel_ip,
+                    "excel_ip": excel_ip_raw,
                     "zabbix_host_name": zh["host"],
                     "zabbix_ip": excel_ip,
                 })
@@ -120,9 +161,9 @@ def match_all(zabbix_hosts, excel_rows):
                     )
                     matched.append({
                         "service": service,
-                        "match_field": "ip+hostname",
+                        "match_field": "ip+hostname_old" if is_old else "ip+hostname",
                         "excel_host": excel_host,
-                        "excel_ip": excel_ip,
+                        "excel_ip": excel_ip_raw,
                         "zabbix_host_name": zh["host"],
                         "zabbix_ip": excel_ip,
                     })
@@ -133,11 +174,21 @@ def match_all(zabbix_hosts, excel_rows):
                     "type": "ambiguous_ip",
                     "service": service,
                     "excel_host": excel_host,
-                    "excel_ip": excel_ip,
+                    "excel_ip": excel_ip_raw,
                     "candidates": [host_by_id[i]["host"] for i in ids],
                     "reason": reason,
                 })
                 continue
+
+            conflicts.append({
+                "type": "ambiguous_ip",
+                "service": service,
+                "excel_host": excel_host,
+                "excel_ip": excel_ip_raw,
+                "candidates": [host_by_id[i]["host"] for i in ids],
+                "reason": "ip неоднозначный, а excel_host пустой",
+            })
+            continue
 
         if excel_host:
             key = excel_host.lower()
@@ -154,9 +205,9 @@ def match_all(zabbix_hosts, excel_rows):
                 ip_any = next(iter(zh["ips"]), None)
                 matched.append({
                     "service": service,
-                    "match_field": "hostname",
+                    "match_field": "hostname_old" if is_old else "hostname",
                     "excel_host": excel_host,
-                    "excel_ip": excel_ip,
+                    "excel_ip": excel_ip_raw,
                     "zabbix_host_name": zh["host"],
                     "zabbix_ip": ip_any,
                 })
@@ -168,10 +219,17 @@ def match_all(zabbix_hosts, excel_rows):
                     "type": "ambiguous_hostname",
                     "service": service,
                     "excel_host": excel_host,
-                    "excel_ip": excel_ip,
+                    "excel_ip": excel_ip_raw,
                     "candidates": [host_by_id[i]["host"] for i in ids],
                 })
                 continue
+
+        conflicts.append({
+            "type": "not_found",
+            "service": service,
+            "excel_host": excel_host,
+            "excel_ip": excel_ip_raw,
+        })
 
     unmatched_zabbix = []
     for hid, zh in host_by_id.items():
@@ -209,11 +267,13 @@ def main():
     try:
         api = ZabbixAPI(url=url)
         api.login(token=token)
-        zabbix_hosts = api.host.get(
-            output=["hostid", "host", "name"],
+        zabbix_hosts_all = api.host.get(
+            output=["hostid", "host", "name", "status"],
             selectInterfaces=["ip", "dns"],
         )
-        log.info("Получено хостов из Zabbix: %d", len(zabbix_hosts))
+        zabbix_hosts = [h for h in zabbix_hosts_all if str(h.get("status")) == "0"]
+        log.info("Получено хостов из Zabbix: %d (активных=%d, отключённых=%d)",
+                 len(zabbix_hosts_all), len(zabbix_hosts), len(zabbix_hosts_all) - len(zabbix_hosts))
     except Exception:
         log.exception("Ошибка работы с Zabbix API")
         return
