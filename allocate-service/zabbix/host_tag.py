@@ -154,6 +154,8 @@ def assign_services(zabbix_hosts, excel_rows):
     for z in zabbix_hosts:
         z_host = z.get("host")
         z_hostid = str(z.get("hostid"))
+        z_status = str(z.get("status", "0"))
+        z_status_ru = "Активен" if z_status == "0" else "Отключён"
 
         z_ips, z_dns = get_zabbix_keys(z)
 
@@ -169,6 +171,7 @@ def assign_services(zabbix_hosts, excel_rows):
                 "zabbix_host_name": z_host,
                 "zabbix_ip": ip_any,
                 "zabbix_dns": dns_any,
+                "Статус": z_status_ru,
             })
             continue
 
@@ -187,13 +190,19 @@ def assign_services(zabbix_hosts, excel_rows):
                     "type": "ambiguous_ip",
                     "zabbix_host_name": z_host,
                     "zabbix_hostid": z_hostid,
+                    "Статус": z_status_ru,
                     "zabbix_ips": z_ips,
                     "services": services,
                     "reason": reason,
                 })
                 continue
 
-        if chosen["is_old"] and chosen["excel_ip"] and chosen["excel_ip"] not in warned_old_ips:
+        if (
+            z_status == "0"
+            and chosen["is_old"]
+            and chosen["excel_ip"]
+            and chosen["excel_ip"] not in warned_old_ips
+        ):
             log.warning("IP имеет old и является единственным: %s", chosen["excel_ip_raw"])
             warned_old_ips.add(chosen["excel_ip"])
 
@@ -206,6 +215,7 @@ def assign_services(zabbix_hosts, excel_rows):
             "excel_ip": chosen["excel_ip_raw"],
             "zabbix_host_name": z_host,
             "zabbix_ip": z_ip_out,
+            "Статус": z_status_ru,
         })
 
     return matched, unmatched, conflicts
@@ -237,11 +247,8 @@ def main():
             output=["hostid", "host", "name", "status"],
             selectInterfaces=["ip", "dns"],
         )
-        zabbix_hosts = [h for h in all_hosts if str(h.get("status")) == "0"]
-        log.info(
-            "Получено хостов из Zabbix: %d (активных=%d, отключённых=%d)",
-            len(all_hosts), len(zabbix_hosts), len(all_hosts) - len(zabbix_hosts)
-        )
+        log.info("Получено хостов из Zabbix: %d", len(all_hosts))
+        zabbix_hosts = all_hosts
     except Exception:
         log.exception("Ошибка работы с Zabbix API")
         return
