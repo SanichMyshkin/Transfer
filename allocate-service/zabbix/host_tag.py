@@ -6,7 +6,7 @@
    - Для идентификации хоста используем ТОЛЬКО:
        * interfaces[].dns
        * name
-     Поле host не используем (часто UUID/техническое).
+     Поле host не используем (может быть UUID/техническое).
 
    - Для каждого Zabbix-хоста строим набор ключей (hostname keys):
        * full (как есть) в lower
@@ -14,17 +14,18 @@
 
 2) Excel:
    - Читаем:
-       * service  (A)
-       * excel_host (N)
-       * excel_ip   (V)
+       * service     (A)
+       * excel_host  (N)
+       * excel_ip    (V)
    - is_old = True, если в excel_ip встречается подстрока "old" (любой регистр).
 
-3) Предварительная фильтрация Excel:
-   - Excel-строки индексируем ТОЛЬКО если их excel_host (full/short) встречается среди ENABLED Zabbix keys.
-     Это автоматически выкидывает строки, относящиеся только к disabled/удалённым хостам.
+3) Предварительная фильтрация Excel (защита от “переноса” старых строк):
+   - Excel-строки индексируются ТОЛЬКО если их excel_host (full/short) встречается среди ENABLED Zabbix keys.
+     Это выкидывает строки, относящиеся только к disabled/удалённым хостам и запрещает использовать их
+     для сопоставления с другими активными хостами.
 
 4) Сопоставление (Zabbix -> Excel), ТОЛЬКО по hostname:
-   - Для каждого enabled Zabbix-хоста собираем всех кандидатов Excel по совпадению ключей hostname.
+   - Для каждого enabled Zabbix-хоста собираем всех кандидатов Excel по совпадению hostname keys.
    - IP НЕ используется для выбора/подтягивания кандидатов. IP только для поля match_field.
 
 5) Обработка old и конфликтов:
@@ -33,16 +34,15 @@
        * old-кандидаты отбрасываются.
        * если среди non-old сервис один -> назначаем non-old.
            - если old-кандидаты были -> conflict_resolution="resolved_by_old_filter",
-             conflict_note="были old-кандидаты, выбрали non-old"
+             conflict_note="old кандидаты отброшены"
            - если old-кандидатов не было -> conflict_resolution/conflict_note пустые
-       * если среди non-old несколько сервисов -> конфликт (Conflicts),
-         conflict_type="conflict_non_old_services"
+       * если среди non-old несколько сервисов -> конфликт:
+           - если old-кандидатов не было -> conflict_type="hostname_multiple_services"
+           - если old-кандидаты были и мы их отбросили -> conflict_type="hostname_multiple_services_after_old_drop"
    - Если non-old нет (только old):
        * если сервис один -> назначаем old, conflict_resolution="only_old",
-         conflict_note="только old-кандидаты"
-         + WARNING в лог
-       * если сервисов несколько -> конфликт (Conflicts),
-         conflict_type="conflict_only_old_services"
+         conflict_note="только old кандидаты" + WARNING в лог
+       * если сервисов несколько -> конфликт: conflict_type="hostname_multiple_services_only_old"
 
 6) match_field:
    - "hostname+ip" если excel_ip совпал с одним из zabbix interface ip
@@ -51,7 +51,7 @@
 Результат:
 - Matched: назначенные строки + при необходимости пометки conflict_resolution/conflict_note
 - Unmatched_Zabbix: enabled хосты без найденных excel-кандидатов
-- Conflicts: хосты, где нельзя однозначно выбрать сервис
+- Conflicts: хосты, где нельзя однозначно выбрать сервис (подробно: name/dns/ip/hostid + services)
 """
 
 import os
@@ -90,12 +90,16 @@ def load_excel(path):
 
         excel_ip = None if not ip or str(ip).lower() == "nan" else str(ip).strip()
 
-        rows.append({
-            "service": str(service).strip(),
-            "excel_host": None if not host or str(host).lower() == "nan" else str(host).strip(),
-            "excel_ip": excel_ip,
-            "is_old": bool(excel_ip and "old" in excel_ip.lower()),
-        })
+        rows.append(
+            {
+                "service": str(service).strip(),
+                "excel_host": None
+                if not host or str(host).lower() == "nan"
+                else str(host).strip(),
+                "excel_ip": excel_ip,
+                "is_old": bool(excel_ip and "old" in excel_ip.lower()),
+            }
+        )
 
     log.info("Excel строк загружено: %d", len(rows))
     return rows
@@ -109,9 +113,11 @@ def load_enabled_zabbix(api):
     enabled = [h for h in hosts if str(h.get("status")) == "0"]
     log.info(
         "Zabbix: всего=%d активных=%d отключённых=%d",
-        len(hosts), len(enabled), len(hosts) - len(enabled),
+        len(hosts),
+        len(enabled),
+        len(hosts) - len(enabled),
     )
-    return enabled
+    return enabled, hosts
 
 
 def zabbix_keys(z):
@@ -124,11 +130,20 @@ def zabbix_keys(z):
     return list(dict.fromkeys(keys))
 
 
+def zabbix_primary_dns(z):
+    for iface in z.get("interfaces", []) or []:
+        dns = (iface.get("dns") or "").strip()
+        if dns:
+            return dns
+    return None
+
+
 def zabbix_ips(z):
     ips = []
     for iface in z.get("interfaces", []) or []:
-        if iface.get("ip"):
-            ips.append(iface["ip"])
+        ip = (iface.get("ip") or "").strip()
+        if ip:
+            ips.append(ip)
     return list(dict.fromkeys(ips))
 
 
@@ -155,9 +170,7 @@ def build_excel_index(excel_rows, enabled_keys):
         for v in vars_:
             idx.setdefault(v, []).append(r)
 
-    if dropped:
-        log.info("Excel строк отброшено (host не найден среди ENABLED Zabbix): %d", dropped)
-
+    log.info("Excel строк отброшено (host не найден среди ENABLED Zabbix): %d", dropped)
     return idx
 
 
@@ -168,22 +181,43 @@ def decide_from_candidates(candidates):
     if non_old:
         services = sorted(set(c["service"] for c in non_old))
         if len(services) == 1:
-            chosen = non_old[0]
             if old:
-                return chosen, "resolved_by_old_filter", "были old-кандидаты, выбрали non-old", False, None
-            return chosen, "", "", False, None
-        return None, "", "", True, {
-            "conflict_type": "conflict_non_old_services",
-            "services": services,
-        }
+                return (
+                    non_old[0],
+                    "resolved_by_old_filter",
+                    "old кандидаты отброшены",
+                    None,
+                )
+            return non_old[0], "", "", None
+
+        conflict_type = (
+            "hostname_multiple_services_after_old_drop"
+            if old
+            else "hostname_multiple_services"
+        )
+        return (
+            None,
+            "",
+            "",
+            {
+                "conflict_type": conflict_type,
+                "services": services,
+            },
+        )
 
     services = sorted(set(c["service"] for c in old))
     if len(services) == 1:
-        return old[0], "only_old", "только old-кандидаты", False, None
-    return None, "", "", True, {
-        "conflict_type": "conflict_only_old_services",
-        "services": services,
-    }
+        return old[0], "only_old", "только old кандидаты", None
+
+    return (
+        None,
+        "",
+        "",
+        {
+            "conflict_type": "hostname_multiple_services_only_old",
+            "services": services,
+        },
+    )
 
 
 def assign(enabled_hosts, excel_index):
@@ -191,7 +225,9 @@ def assign(enabled_hosts, excel_index):
 
     for z in enabled_hosts:
         z_name = z.get("name")
+        z_hostid = str(z.get("hostid"))
         z_keys = zabbix_keys(z)
+        z_dns = zabbix_primary_dns(z)
         z_ip_list = zabbix_ips(z)
 
         candidates = []
@@ -199,22 +235,29 @@ def assign(enabled_hosts, excel_index):
             candidates.extend(excel_index.get(k, []))
 
         if not candidates:
-            unmatched.append({
-                "zabbix_name": z_name,
-                "zabbix_dns": z_keys[0] if z_keys else None,
-                "zabbix_ip": z_ip_list[0] if z_ip_list else None,
-                "status": "Активен",
-            })
+            unmatched.append(
+                {
+                    "zabbix_hostid": z_hostid,
+                    "zabbix_name": z_name,
+                    "zabbix_dns": z_dns,
+                    "zabbix_ip": z_ip_list[0] if z_ip_list else None,
+                    "status": "Активен",
+                }
+            )
             continue
 
-        chosen, resolution, note, is_conflict, conflict_info = decide_from_candidates(candidates)
-        if is_conflict:
-            conflicts.append({
-                "zabbix_name": z_name,
-                "zabbix_dns": z_keys[0] if z_keys else None,
-                "conflict_type": conflict_info["conflict_type"],
-                "services": conflict_info["services"],
-            })
+        chosen, resolution, note, conflict_info = decide_from_candidates(candidates)
+        if conflict_info:
+            conflicts.append(
+                {
+                    "zabbix_hostid": z_hostid,
+                    "zabbix_name": z_name,
+                    "zabbix_dns": z_dns,
+                    "zabbix_ip": z_ip_list[0] if z_ip_list else None,
+                    "conflict_type": conflict_info["conflict_type"],
+                    "services": "; ".join(conflict_info["services"]),
+                }
+            )
             continue
 
         match_field = "hostname"
@@ -224,18 +267,21 @@ def assign(enabled_hosts, excel_index):
         if chosen.get("is_old"):
             log.warning("Используется old-запись: %s", chosen.get("excel_ip"))
 
-        matched.append({
-            "service": chosen["service"],
-            "match_field": match_field,
-            "excel_host": chosen["excel_host"],
-            "excel_ip": chosen["excel_ip"],
-            "zabbix_name": z_name,
-            "zabbix_dns": z_keys[0] if z_keys else None,
-            "zabbix_ip": z_ip_list[0] if z_ip_list else None,
-            "conflict_resolution": resolution,
-            "conflict_note": note,
-            "status": "Активен",
-        })
+        matched.append(
+            {
+                "service": chosen["service"],
+                "match_field": match_field,
+                "excel_host": chosen["excel_host"],
+                "excel_ip": chosen["excel_ip"],
+                "zabbix_hostid": z_hostid,
+                "zabbix_name": z_name,
+                "zabbix_dns": z_dns,
+                "zabbix_ip": z_ip_list[0] if z_ip_list else None,
+                "conflict_resolution": resolution,
+                "conflict_note": note,
+                "status": "Активен",
+            }
+        )
 
     return matched, unmatched, conflicts
 
@@ -243,8 +289,11 @@ def assign(enabled_hosts, excel_index):
 def export_excel(matched, unmatched, conflicts):
     with pd.ExcelWriter("match_results.xlsx", engine="openpyxl") as writer:
         pd.DataFrame(matched).to_excel(writer, sheet_name="Matched", index=False)
-        pd.DataFrame(unmatched).to_excel(writer, sheet_name="Unmatched_Zabbix", index=False)
+        pd.DataFrame(unmatched).to_excel(
+            writer, sheet_name="Unmatched_Zabbix", index=False
+        )
         pd.DataFrame(conflicts).to_excel(writer, sheet_name="Conflicts", index=False)
+
     log.info("Результаты сохранены в match_results.xlsx")
 
 
@@ -262,7 +311,8 @@ def main():
     api = ZabbixAPI(url=url)
     api.login(token=token)
 
-    enabled_hosts = load_enabled_zabbix(api)
+    enabled_hosts, _all_hosts = load_enabled_zabbix(api)
+
     enabled_keys = build_enabled_hostname_set(enabled_hosts)
     excel_index = build_excel_index(excel_rows, enabled_keys)
 
@@ -270,8 +320,15 @@ def main():
 
     log.info(
         "ИТОГО: сопоставлено=%d нераспределённых=%d конфликтов=%d",
-        len(matched), len(unmatched), len(conflicts),
+        len(matched),
+        len(unmatched),
+        len(conflicts),
     )
+
+    if conflicts:
+        log.error("КОНФЛИКТЫ (первые 10):")
+        for c in conflicts[:10]:
+            log.error(c)
 
     export_excel(matched, unmatched, conflicts)
 
