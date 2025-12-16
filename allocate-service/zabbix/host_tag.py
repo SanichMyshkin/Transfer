@@ -25,14 +25,15 @@ def load_excel_rows(path):
 
         if ip_raw and "old" in ip_raw.lower():
             is_old = True
-            ip_clean = (
+            cleaned = (
                 ip_raw.lower()
                 .replace("old", "")
                 .replace("-", " ")
                 .replace("_", " ")
                 .strip()
-                .split()[0]
             )
+            parts = cleaned.split()
+            ip_clean = parts[0] if parts else None
 
         rows.append({
             "service": service,
