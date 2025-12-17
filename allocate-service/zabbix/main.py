@@ -43,24 +43,20 @@ users = api.user.get(
         "name",
         "surname",
         "roleid",
-        "attempt_clock",
-        "attempt_failed",
         "attempt_ip",
         "autologin",
-        "autologout",
         "lang",
-        "provisioned",
-        "refresh",
-        "rows_per_page",
         "theme",
+        "refresh",
+        "timezone",
+        "rows_per_page",
+        "provisioned",
         "ts_provisioned",
         "url",
         "userdirectoryid",
-        "timezone",
     ],
     selectUsrgrps=["name"],
     selectMedias=["sendto"],
-    selectSessions=["lastaccess"],
 )
 
 user_data = []
@@ -78,29 +74,20 @@ for u in users:
 
     groups = ", ".join(g["name"] for g in u.get("usrgrps", [])) or "—"
 
-    role_id = u.get("roleid")
-    role_name = role_name_by_id.get(role_id, "—")
+    role_name = role_name_by_id.get(u.get("roleid"), "—")
 
     user_data.append(
         {
-            "ID": u.get("userid", "—"),
+            "ID": u.get("userid"),
             "Логин": login,
             "Имя": f"{u.get('name', '')} {u.get('surname', '')}".strip() or "—",
             "Email": email,
             "Группы": groups,
-            "ID роли": role_id,
             "Роль": role_name,
-            "IP последней неуспешной попытки": u.get("attempt_ip", "—"),
             "Автовход": "Да" if u.get("autologin") == "1" else "Нет",
-            "Язык интерфейса": u.get("lang", "—"),
-            "Тема": u.get("theme", "—"),
-            "Интервал обновления": u.get("refresh", "—"),
-            "Часовой пояс": u.get("timezone", "—"),
-            "Rows per page": u.get("rows_per_page", "—"),
-            "Provisioned": u.get("provisioned", "—"),
-            "TS Provisioned": u.get("ts_provisioned", "—"),
-            "URL": u.get("url", "—"),
-            "UserDirectory ID": u.get("userdirectoryid", "—"),
+            "Язык": u.get("lang"),
+            "Тема": u.get("theme"),
+            "Часовой пояс": u.get("timezone"),
         }
     )
 
@@ -118,9 +105,8 @@ for g in groups:
     group_data.append(
         {
             "ID": g.get("usrgrpid"),
-            "Группа": g.get("name", "—"),
-            "GUI доступ": g.get("gui_access", "—"),
-            "Статус": g.get("users_status", "—"),
+            "Группа": g.get("name"),
+            "Статус": g.get("users_status"),
             "Пользователи": members or "—",
         }
     )
@@ -131,16 +117,14 @@ bk_conn.row_factory = sqlite3.Row
 bk_rows = bk_conn.execute("SELECT * FROM bk").fetchall()
 bk_conn.close()
 
-bk_users_rows = [dict(r) for r in bk_rows]
-bk_logins = {(u.get("sAMAccountName") or "").strip().lower(): u for u in bk_users_rows}
+bk_users = [dict(r) for r in bk_rows]
+bk_logins = {(u.get("sAMAccountName") or "").lower(): u for u in bk_users}
 
 matched_bk_users = []
 techfired_users = []
 
-logger.info("Сверка пользователей с BK (username ↔ sAMAccountName)...")
-
 for u in users:
-    login = (u.get("username") or "").strip().lower()
+    login = (u.get("username") or "").lower()
     if login in bk_logins:
         matched_bk_users.append(bk_logins[login])
     else:
@@ -149,36 +133,32 @@ for u in users:
 logger.info("Получаю хосты...")
 hosts = api.host.get(
     output=["hostid", "host", "name", "status"],
-    selectInterfaces=["ip", "type", "port", "dns"],
+    selectInterfaces=["ip", "dns"],
     selectGroups=["name"],
     selectParentTemplates=["name"],
+    selectTags="extend",
 )
 
 batch_size = 500
-
-logger.info("Получаю триггеры...")
 triggers_all = []
-for i in range(0, len(hosts), batch_size):
-    batch = [h["hostid"] for h in hosts[i : i + batch_size]]
-    try:
-        part = api.trigger.get(
-            output=["triggerid"], hostids=batch, selectHosts=["hostid"]
-        )
-        triggers_all.extend(part)
-    except Exception:
-        pass
-
-logger.info("Получаю графики...")
 graphs_all = []
+
 for i in range(0, len(hosts), batch_size):
     batch = [h["hostid"] for h in hosts[i : i + batch_size]]
     try:
-        part = api.graph.get(output=["graphid"], hostids=batch, selectHosts=["hostid"])
-        graphs_all.extend(part)
+        triggers_all.extend(
+            api.trigger.get(output=["triggerid"], hostids=batch, selectHosts=["hostid"])
+        )
     except Exception:
         pass
 
-logger.info("Получаю дашборды...")
+    try:
+        graphs_all.extend(
+            api.graph.get(output=["graphid"], hostids=batch, selectHosts=["hostid"])
+        )
+    except Exception:
+        pass
+
 try:
     dashboards_all = api.dashboard.get(output=["dashboardid", "name"])
 except Exception:
@@ -196,45 +176,69 @@ for g in graphs_all:
 
 dashboard_count = Counter()
 for d in dashboards_all:
-    name = d.get("name", "")
     for h in hosts:
-        if h.get("name") in name:
+        if h.get("name") in d.get("name", ""):
             dashboard_count[h["hostid"]] += 1
 
-host_data = []
+
+def get_tag_value(tags, tag_name):
+    for t in tags or []:
+        if t.get("tag") == tag_name:
+            return t.get("value")
+    return None
+
+
+hosts_with_owner = []
+hosts_without_owner = []
+
 for h in hosts:
     hostid = h.get("hostid")
+
     ip_list = [i.get("ip") for i in h.get("interfaces", []) if i.get("ip")]
     ip = ", ".join(ip_list) if ip_list else "—"
 
-    host_data.append(
-        {
-            "ID": hostid,
-            "Имя хоста": h.get("name", "—"),
-            "Системное имя": h.get("host", "—"),
-            "IP": ip,
-            "Группы": ", ".join(g["name"] for g in h.get("groups", [])) or "—",
-            "Шаблоны": ", ".join(t["name"] for t in h.get("parentTemplates", []))
-            or "—",
-            "Триггеров": trigger_count.get(hostid, 0),
-            "Графиков": graph_count.get(hostid, 0),
-            "Дашбордов": dashboard_count.get(hostid, 0),
-            "Статус": "Активен" if str(h.get("status")) == "0" else "Отключён",
-        }
-    )
+    owner = get_tag_value(h.get("tags"), "host_owner")
+
+    row = {
+        "ID": hostid,
+        "Имя хоста": h.get("name", "—"),
+        "Системное имя": h.get("host", "—"),
+        "IP": ip,
+        "Группы": ", ".join(g["name"] for g in h.get("groups", [])) or "—",
+        "Шаблоны": ", ".join(t["name"] for t in h.get("parentTemplates", [])) or "—",
+        "Триггеров": trigger_count.get(hostid, 0),
+        "Графиков": graph_count.get(hostid, 0),
+        "Дашбордов": dashboard_count.get(hostid, 0),
+        "Статус": "Активен" if str(h.get("status")) == "0" else "Отключён",
+    }
+
+    if owner:
+        row["Владелец"] = owner
+        hosts_with_owner.append(row)
+    else:
+        hosts_without_owner.append(row)
 
 summary_data = [
     ["Дата формирования", datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
-    ["Всего пользователей", len(user_data)],
-    ["Групп пользователей", len(group_data)],
-    ["Пользователей BK", len(matched_bk_users)],
-    ["Не найдено в BK (Тех + Уволенные)", len(techfired_users)],
-    ["Хостов всего", len(host_data)],
-    ["Хостов активных", sum(1 for h in host_data if h["Статус"] == "Активен")],
-    ["Хостов отключённых", sum(1 for h in host_data if h["Статус"] == "Отключён")],
-    ["Всего триггеров", sum(trigger_count.values())],
-    ["Всего графиков", sum(graph_count.values())],
-    ["Всего дашбордов", sum(dashboard_count.values())],
+    ["Хостов всего", len(hosts_with_owner) + len(hosts_without_owner)],
+    ["Хостов с владельцем", len(hosts_with_owner)],
+    ["Хостов без владельца", len(hosts_without_owner)],
+    [
+        "Хостов активных",
+        sum(
+            1
+            for h in hosts_with_owner + hosts_without_owner
+            if h["Статус"] == "Активен"
+        ),
+    ],
+    [
+        "Хостов отключённых",
+        sum(
+            1
+            for h in hosts_with_owner + hosts_without_owner
+            if h["Статус"] == "Отключён"
+        ),
+    ],
 ]
 
 summary_df = pd.DataFrame(summary_data, columns=["Показатель", "Значение"])
@@ -254,8 +258,11 @@ with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
     pd.DataFrame(techfired_users).to_excel(
         writer, sheet_name="Не найдено в BK", index=False
     )
-    pd.DataFrame(host_data).sort_values(by="Имя хоста").to_excel(
-        writer, sheet_name="Хосты", index=False
+    pd.DataFrame(hosts_with_owner).sort_values(by="Имя хоста").to_excel(
+        writer, sheet_name="Хосты с владельцем", index=False
+    )
+    pd.DataFrame(hosts_without_owner).sort_values(by="Имя хоста").to_excel(
+        writer, sheet_name="Хосты без владельца", index=False
     )
     summary_df.to_excel(writer, sheet_name="Сводка", index=False)
 
