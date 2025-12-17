@@ -60,8 +60,15 @@ import pandas as pd
 from dotenv import load_dotenv
 from zabbix_utils import ZabbixAPI
 
+# ================== НАСТРОЙКИ ==================
+
+DRY_RUN = True
+OWNER_TAG_NAME = "host_owner"
+
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 log = logging.getLogger("zbx_match")
+
+# ================== ВСПОМОГАТЕЛЬНЫЕ ==================
 
 
 def norm(s):
@@ -78,6 +85,22 @@ def host_variants(host):
     if "." in h:
         res.append(h.split(".", 1)[0])
     return list(dict.fromkeys(res))
+
+
+def has_tag(tags, tag):
+    for t in tags:
+        if t.get("tag") == tag:
+            return True
+    return False
+
+
+def add_tag(tags, tag, value):
+    tags = [t.copy() for t in tags]
+    tags.append({"tag": tag, "value": value})
+    return tags
+
+
+# ================== EXCEL ==================
 
 
 def load_excel(path):
@@ -105,6 +128,9 @@ def load_excel(path):
     return rows
 
 
+# ================== ZABBIX ==================
+
+
 def load_enabled_zabbix(api):
     hosts = api.host.get(
         output=["hostid", "name", "status"],
@@ -117,7 +143,7 @@ def load_enabled_zabbix(api):
         len(enabled),
         len(hosts) - len(enabled),
     )
-    return enabled, hosts
+    return enabled
 
 
 def zabbix_keys(z):
@@ -147,6 +173,9 @@ def zabbix_ips(z):
     return list(dict.fromkeys(ips))
 
 
+# ================== ИНДЕКСЫ ==================
+
+
 def build_enabled_hostname_set(enabled_hosts):
     s = set()
     for z in enabled_hosts:
@@ -172,6 +201,9 @@ def build_excel_index(excel_rows, enabled_keys):
 
     log.info("Excel строк отброшено (host не найден среди ENABLED Zabbix): %d", dropped)
     return idx
+
+
+# ================== ВЫБОР КАНДИДАТА ==================
 
 
 def decide_from_candidates(candidates):
@@ -220,15 +252,18 @@ def decide_from_candidates(candidates):
     )
 
 
+# ================== СОПОСТАВЛЕНИЕ ==================
+
+
 def assign(enabled_hosts, excel_index):
     matched, unmatched, conflicts = [], [], []
 
     for z in enabled_hosts:
-        z_name = z.get("name")
         z_hostid = str(z.get("hostid"))
-        z_keys = zabbix_keys(z)
+        z_name = z.get("name")
         z_dns = zabbix_primary_dns(z)
         z_ip_list = zabbix_ips(z)
+        z_keys = zabbix_keys(z)
 
         candidates = []
         for k in z_keys:
@@ -271,30 +306,17 @@ def assign(enabled_hosts, excel_index):
             {
                 "service": chosen["service"],
                 "match_field": match_field,
-                "excel_host": chosen["excel_host"],
-                "excel_ip": chosen["excel_ip"],
                 "zabbix_hostid": z_hostid,
                 "zabbix_name": z_name,
                 "zabbix_dns": z_dns,
                 "zabbix_ip": z_ip_list[0] if z_ip_list else None,
-                "conflict_resolution": resolution,
-                "conflict_note": note,
-                "status": "Активен",
             }
         )
 
     return matched, unmatched, conflicts
 
 
-def export_excel(matched, unmatched, conflicts):
-    with pd.ExcelWriter("match_results.xlsx", engine="openpyxl") as writer:
-        pd.DataFrame(matched).to_excel(writer, sheet_name="Matched", index=False)
-        pd.DataFrame(unmatched).to_excel(
-            writer, sheet_name="Unmatched_Zabbix", index=False
-        )
-        pd.DataFrame(conflicts).to_excel(writer, sheet_name="Conflicts", index=False)
-
-    log.info("Результаты сохранены в match_results.xlsx")
+# ================== MAIN ==================
 
 
 def main():
@@ -311,8 +333,7 @@ def main():
     api = ZabbixAPI(url=url)
     api.login(token=token)
 
-    enabled_hosts, _all_hosts = load_enabled_zabbix(api)
-
+    enabled_hosts = load_enabled_zabbix(api)
     enabled_keys = build_enabled_hostname_set(enabled_hosts)
     excel_index = build_excel_index(excel_rows, enabled_keys)
 
@@ -330,7 +351,58 @@ def main():
         for c in conflicts[:10]:
             log.error(c)
 
-    export_excel(matched, unmatched, conflicts)
+    # ======== ПРОСТАНОВКА host_owner ========
+
+    zabbix_hosts_with_tags = api.host.get(
+        output=["hostid", "name"],
+        selectInterfaces=["ip", "dns"],
+        selectTags="extend",
+    )
+
+    hosts_by_id = {h["hostid"]: h for h in zabbix_hosts_with_tags}
+
+    applied = 0
+    skipped = 0
+
+    log.info("=== ПРОСТАНОВКА host_owner (DRY_RUN=%s) ===", DRY_RUN)
+
+    for row in matched:
+        hostid = row["zabbix_hostid"]
+        owner_value = row["service"]
+
+        host = hosts_by_id.get(hostid)
+        if not host:
+            continue
+
+        tags = host.get("tags", [])
+
+        if has_tag(tags, OWNER_TAG_NAME):
+            skipped += 1
+            continue
+
+        new_tags = add_tag(tags, OWNER_TAG_NAME, owner_value)
+
+        iface = host.get("interfaces", [{}])[0]
+        log.info(
+            "DRY_RUN=%s | HOST=%s | DNS=%s | IP=%s | ADD TAG: %s=%s",
+            DRY_RUN,
+            host.get("name"),
+            iface.get("dns"),
+            iface.get("ip"),
+            OWNER_TAG_NAME,
+            owner_value,
+        )
+
+        applied += 1
+
+        if DRY_RUN:
+            continue
+
+        api.host.update(hostid=hostid, tags=new_tags)
+
+    log.info(
+        "host_owner: добавлено=%d пропущено_из-за_существующего=%d", applied, skipped
+    )
 
 
 if __name__ == "__main__":
