@@ -55,20 +55,23 @@
 """
 
 import os
+import time
 import logging
 import pandas as pd
 from dotenv import load_dotenv
 from zabbix_utils import ZabbixAPI
 
-# ================== НАСТРОЙКИ ==================
 
-DRY_RUN = True
-OWNER_TAG_NAME = "host_owner"
+DRY_RUN = True  # True = только логи, False = реальные изменения
+OWNER_TAG_NAME = "host_owner"  # Что запишем в графе заббикса
+
+UPDATE_DELAY_SEC = 1.0  # задержка между запросами на простановку тегов в секундах
+MAX_HOSTS_TO_UPDATE = (
+    10  # Кол-во которое будет обработано, если не указывать (None), то пойдут в бой все
+)
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 log = logging.getLogger("zbx_match")
-
-# ================== ВСПОМОГАТЕЛЬНЫЕ ==================
 
 
 def norm(s):
@@ -100,9 +103,6 @@ def add_tag(tags, tag, value):
     return tags
 
 
-# ================== EXCEL ==================
-
-
 def load_excel(path):
     df = pd.read_excel(path, engine="openpyxl", dtype=str)
     rows = []
@@ -126,9 +126,6 @@ def load_excel(path):
 
     log.info("Excel строк загружено: %d", len(rows))
     return rows
-
-
-# ================== ZABBIX ==================
 
 
 def load_enabled_zabbix(api):
@@ -173,9 +170,6 @@ def zabbix_ips(z):
     return list(dict.fromkeys(ips))
 
 
-# ================== ИНДЕКСЫ ==================
-
-
 def build_enabled_hostname_set(enabled_hosts):
     s = set()
     for z in enabled_hosts:
@@ -201,9 +195,6 @@ def build_excel_index(excel_rows, enabled_keys):
 
     log.info("Excel строк отброшено (host не найден среди ENABLED Zabbix): %d", dropped)
     return idx
-
-
-# ================== ВЫБОР КАНДИДАТА ==================
 
 
 def decide_from_candidates(candidates):
@@ -250,9 +241,6 @@ def decide_from_candidates(candidates):
             "services": services,
         },
     )
-
-
-# ================== СОПОСТАВЛЕНИЕ ==================
 
 
 def assign(enabled_hosts, excel_index):
@@ -316,9 +304,6 @@ def assign(enabled_hosts, excel_index):
     return matched, unmatched, conflicts
 
 
-# ================== MAIN ==================
-
-
 def main():
     load_dotenv()
     url = os.getenv("ZABBIX_URL")
@@ -351,8 +336,6 @@ def main():
         for c in conflicts[:10]:
             log.error(c)
 
-    # ======== ПРОСТАНОВКА host_owner ========
-
     zabbix_hosts_with_tags = api.host.get(
         output=["hostid", "name"],
         selectInterfaces=["ip", "dns"],
@@ -367,6 +350,10 @@ def main():
     log.info("=== ПРОСТАНОВКА host_owner (DRY_RUN=%s) ===", DRY_RUN)
 
     for row in matched:
+        if MAX_HOSTS_TO_UPDATE is not None and applied >= MAX_HOSTS_TO_UPDATE:
+            log.info("Достигнут лимит обработки: %d", MAX_HOSTS_TO_UPDATE)
+            break
+
         hostid = row["zabbix_hostid"]
         owner_value = row["service"]
 
@@ -383,6 +370,7 @@ def main():
         new_tags = add_tag(tags, OWNER_TAG_NAME, owner_value)
 
         iface = host.get("interfaces", [{}])[0]
+
         log.info(
             "DRY_RUN=%s | HOST=%s | DNS=%s | IP=%s | ADD TAG: %s=%s",
             DRY_RUN,
@@ -399,6 +387,9 @@ def main():
             continue
 
         api.host.update(hostid=hostid, tags=new_tags)
+
+        if UPDATE_DELAY_SEC:
+            time.sleep(UPDATE_DELAY_SEC)
 
     log.info(
         "host_owner: добавлено=%d пропущено_из-за_существующего=%d", applied, skipped
