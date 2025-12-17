@@ -8,7 +8,7 @@ load_dotenv()
 AUTH_DB = {
     "host": os.getenv("PG_HOST"),
     "port": os.getenv("PG_PORT"),
-    "dbname": os.getenv("PG_DB"),  # authdb
+    "dbname": os.getenv("PG_DB"),
     "user": os.getenv("PG_USER"),
     "password": os.getenv("PG_PASSWORD"),
 }
@@ -16,91 +16,74 @@ AUTH_DB = {
 TESTIT_DB = {
     "host": os.getenv("PG_HOST"),
     "port": os.getenv("PG_PORT"),
-    "dbname": os.getenv("PG_DB2"),  # testitdb
+    "dbname": os.getenv("PG_DB2"),
     "user": os.getenv("PG_USER"),
     "password": os.getenv("PG_PASSWORD"),
 }
 
 
-def fetch(conn_cfg, query):
-    with psycopg2.connect(**conn_cfg) as conn:
+def fetch(cfg, query):
+    with psycopg2.connect(**cfg) as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(query)
             return cur.fetchall()
 
 
-USERS_QUERY = """
+# ------------------ QUERIES ------------------
+
+PROJECTS_QUERY = """
+SELECT "Id", "Name"
+FROM "Projects";
+"""
+
+PROJECT_GROUPS_QUERY = """
+SELECT "ProjectId", "GroupId"
+FROM "GroupProjects";
+"""
+
+GROUP_USERS_QUERY = """
 SELECT
-    u."Id",
+    ug."GroupId",
+    u."Id" AS user_id,
     u."UserName",
     u."Email"
-FROM "AspNetUsers" u;
-"""
-
-ROLES_QUERY = """
-SELECT
-    ur."UserId",
-    r."Name" AS role_name
-FROM "UserRoles" ur
-JOIN "AspNetRoles" r
-    ON r."Id" = ur."RoleId";
-"""
-
-# TESTIT DB
-PROJECTS_QUERY = """
-SELECT
-    "Id",
-    "Name",
-    "CreatedById"
-FROM "Projects";
+FROM "UserGroups" ug
+JOIN "AspNetUsers" u ON u."Id" = ug."UserId";
 """
 
 
 def main():
-    print("Loading users from AUTH DB...")
-    users = fetch(AUTH_DB, USERS_QUERY)
-    print(f"Users loaded: {len(users)}")
-
-    print("Loading roles from AUTH DB...")
-    roles = fetch(AUTH_DB, ROLES_QUERY)
-    print(f"Roles loaded: {len(roles)}")
-
-    print("Loading projects from TESTIT DB...")
     projects = fetch(TESTIT_DB, PROJECTS_QUERY)
-    print(f"Projects loaded: {len(projects)}")
+    project_groups = fetch(TESTIT_DB, PROJECT_GROUPS_QUERY)
+    group_users = fetch(AUTH_DB, GROUP_USERS_QUERY)
 
-    users_by_id = {u["Id"]: u for u in users}
+    # --- индексы ---
+    groups_by_project = {}
+    for pg in project_groups:
+        groups_by_project.setdefault(pg["ProjectId"], set()).add(pg["GroupId"])
 
-    roles_by_user = {}
-    for r in roles:
-        roles_by_user.setdefault(r["UserId"], []).append(r["role_name"])
+    users_by_group = {}
+    for gu in group_users:
+        users_by_group.setdefault(gu["GroupId"], []).append(gu)
 
-    result = []
+    # --- результат ---
+    print("\nPROJECT ACCESS MAP\n" + "-" * 70)
 
     for p in projects:
-        owner_id = p["CreatedById"]
+        project_id = p["Id"]
+        project_name = p["Name"]
 
-        owner = users_by_id.get(owner_id)
-        owner_roles = roles_by_user.get(owner_id, [])
+        users = []
+        for gid in groups_by_project.get(project_id, []):
+            users.extend(users_by_group.get(gid, []))
 
-        result.append(
-            {
-                "project_id": p["Id"],
-                "project_name": p["Name"],
-                "owner_id": owner_id,
-                "owner_username": owner["UserName"] if owner else None,
-                "owner_email": owner["Email"] if owner else None,
-                "owner_roles": owner_roles,
-            }
-        )
+        unique_users = {
+            u["user_id"]: u for u in users
+        }.values()
 
-    print("\nPROJECT OWNERSHIP\n" + "-" * 60)
-    for r in result:
-        print(
-            f"{r['project_name']:<30} | "
-            f"{r['owner_username'] or 'UNKNOWN':<20} | "
-            f"roles={','.join(r['owner_roles']) or '-'}"
-        )
+        print(f"\n{project_name}")
+        for u in unique_users:
+            print(f"  - {u['UserName']} ({u['Email']})")
 
 
 if __name__ == "__main__":
