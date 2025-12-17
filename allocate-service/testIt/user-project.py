@@ -1,6 +1,9 @@
+import os
 import psycopg2
 from psycopg2.extras import RealDictCursor
-import os
+from dotenv import load_dotenv
+
+load_dotenv()
 
 AUTH_DB = {
     "host": os.getenv("PG_HOST"),
@@ -39,53 +42,64 @@ SELECT
     ur."UserId",
     r."Name" AS role_name
 FROM "UserRoles" ur
-JOIN "AspNetRoles" r ON r."Id" = ur."RoleId";
+JOIN "AspNetRoles" r
+    ON r."Id" = ur."RoleId";
 """
 
-
+# TESTIT DB
 PROJECTS_QUERY = """
 SELECT
     "Id",
     "Name",
-    "CreatedBy"
+    "CreatedById"
 FROM "Projects";
 """
 
 
 def main():
+    print("Loading users from AUTH DB...")
     users = fetch(AUTH_DB, USERS_QUERY)
-    roles = fetch(AUTH_DB, ROLES_QUERY)
-    projects = fetch(TESTIT_DB, PROJECTS_QUERY)
+    print(f"Users loaded: {len(users)}")
 
-    # --- индексы ---
+    print("Loading roles from AUTH DB...")
+    roles = fetch(AUTH_DB, ROLES_QUERY)
+    print(f"Roles loaded: {len(roles)}")
+
+    print("Loading projects from TESTIT DB...")
+    projects = fetch(TESTIT_DB, PROJECTS_QUERY)
+    print(f"Projects loaded: {len(projects)}")
+
     users_by_id = {u["Id"]: u for u in users}
 
     roles_by_user = {}
     for r in roles:
         roles_by_user.setdefault(r["UserId"], []).append(r["role_name"])
 
-    # --- результат ---
     result = []
 
     for p in projects:
-        owner = users_by_id.get(p["CreatedBy"])
-        owner_roles = roles_by_user.get(p["CreatedBy"], [])
+        owner_id = p["CreatedById"]
+
+        owner = users_by_id.get(owner_id)
+        owner_roles = roles_by_user.get(owner_id, [])
 
         result.append(
             {
                 "project_id": p["Id"],
                 "project_name": p["Name"],
+                "owner_id": owner_id,
                 "owner_username": owner["UserName"] if owner else None,
                 "owner_email": owner["Email"] if owner else None,
                 "owner_roles": owner_roles,
             }
         )
 
+    print("\nPROJECT OWNERSHIP\n" + "-" * 60)
     for r in result:
         print(
-            f"{r['project_name']} | "
-            f"{r['owner_username']} | "
-            f"roles={','.join(r['owner_roles'])}"
+            f"{r['project_name']:<30} | "
+            f"{r['owner_username'] or 'UNKNOWN':<20} | "
+            f"roles={','.join(r['owner_roles']) or '-'}"
         )
 
 
