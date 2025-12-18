@@ -16,7 +16,6 @@ ZABBIX_TOKEN = os.getenv("ZABBIX_TOKEN")
 BK_SQLITE_PATH = os.getenv("BK_SQLITE_PATH")
 OUTPUT_FILE = "zabbix_report.xlsx"
 
-# Zabbix DB (PostgreSQL) connection from .env
 ZBX_DB_HOST = os.getenv("ZBX_DB_HOST")
 ZBX_DB_PORT = int(os.getenv("ZBX_DB_PORT", "5432"))
 ZBX_DB_NAME = os.getenv("ZBX_DB_NAME")
@@ -25,7 +24,9 @@ ZBX_DB_PASSWORD = os.getenv("ZBX_DB_PASSWORD")
 
 logger = logging.getLogger("zabbix_report")
 logger.setLevel(logging.INFO)
-fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S")
+fmt = logging.Formatter(
+    "%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S"
+)
 ch = logging.StreamHandler()
 ch.setFormatter(fmt)
 logger.addHandler(ch)
@@ -73,7 +74,16 @@ def fetch_last_online_by_username():
     finally:
         conn.close()
 
-    return {str(username).lower(): last_online for username, last_online in rows if username}
+    return {
+        str(username).lower(): last_online for username, last_online in rows if username
+    }
+
+
+def get_tag_value(tags, tag_name):
+    for t in tags or []:
+        if t.get("tag") == tag_name:
+            return t.get("value")
+    return None
 
 
 logger.info("Подключаюсь к Zabbix...")
@@ -109,7 +119,7 @@ users = api.user.get(
     selectMedias=["sendto"],
 )
 
-# ✅ Last online from DB
+# last online from DB
 last_online_by_username = fetch_last_online_by_username()
 
 user_data = []
@@ -193,7 +203,10 @@ hosts = api.host.get(
     output=["hostid", "host", "name", "status"],
     selectInterfaces=["ip", "dns"],
     selectGroups=["name"],
-    selectParentTemplates=["name"],
+    selectParentTemplates=[
+        "templateid",
+        "name",
+    ],  # важно: templateid нужен для host dashboards
     selectTags="extend",
 )
 
@@ -204,7 +217,6 @@ graphs_all = []
 for i in range(0, len(hosts), batch_size):
     batch = [h["hostid"] for h in hosts[i : i + batch_size]]
 
-    # triggers (как было)
     try:
         triggers_all.extend(
             api.trigger.get(output=["triggerid"], hostids=batch, selectHosts=["hostid"])
@@ -212,7 +224,6 @@ for i in range(0, len(hosts), batch_size):
     except Exception:
         pass
 
-    # ✅ graphs: ВАЖНО selectHosts="extend", иначе hosts часто пустые => графики = 0
     try:
         graphs_all.extend(
             api.graph.get(
@@ -224,17 +235,10 @@ for i in range(0, len(hosts), batch_size):
     except Exception:
         pass
 
-# (опционально) быстрая диагностика, можно убрать потом
 logger.info(f"Graphs returned: {len(graphs_all)}")
 if graphs_all:
     logger.info(f"First graph keys: {list(graphs_all[0].keys())}")
     logger.info(f"First graph hosts: {graphs_all[0].get('hosts')}")
-
-# dashboards оставляю как в оригинале (ЭВРИСТИКА по имени). Может быть 0 — это нормально.
-try:
-    dashboards_all = api.dashboard.get(output=["dashboardid", "name"])
-except Exception:
-    dashboards_all = []
 
 trigger_count = Counter()
 for t in triggers_all:
@@ -246,19 +250,64 @@ for g in graphs_all:
     for h in g.get("hosts", []):
         graph_count[str(h["hostid"])] += 1
 
-dashboard_count = Counter()
-for d in dashboards_all:
-    for h in hosts:
-        if h.get("name") in d.get("name", ""):
-            dashboard_count[str(h["hostid"])] += 1
+logger.info("Считаю host dashboards (template dashboards)...")
 
+hostids_by_templateid = {}
+for h in hosts:
+    hostid = str(h.get("hostid"))
+    for t in h.get("parentTemplates", []) or []:
+        tid = t.get("templateid")
+        if tid:
+            hostids_by_templateid.setdefault(str(tid), set()).add(hostid)
 
-def get_tag_value(tags, tag_name):
-    for t in tags or []:
-        if t.get("tag") == tag_name:
-            return t.get("value")
-    return None
+all_templateids = list(hostids_by_templateid.keys())
 
+host_dashboards_count = (
+    Counter()
+)  # сколько дашбордов у хоста (вкладка Host -> Dashboards)
+host_dashboards_graphs = Counter()  # сколько “графов” (graph fields) внутри
+
+if not all_templateids:
+    logger.warning(
+        "У хостов не найдено parentTemplates.templateid — host dashboards посчитать нельзя."
+    )
+else:
+    tds = []
+    try:
+        tds = api.templatedashboard.get(
+            output=["templatedashboardid", "templateid", "name"],
+            templateids=all_templateids,
+            selectPages="extend",
+        )
+    except Exception as e:
+        logger.warning(f"templatedashboard.get не сработал (права/версия/обёртка): {e}")
+        tds = []
+
+    dashboards_by_templateid = {}
+    for d in tds:
+        tid = str(d.get("templateid"))
+        dashboards_by_templateid.setdefault(tid, []).append(d)
+    GRAPH_FIELD_TYPES = {"6", "7"}
+
+    for tid, hostid_set in hostids_by_templateid.items():
+        dashboards = dashboards_by_templateid.get(tid, [])
+
+        dashboards_len = len(dashboards)
+        for hostid in hostid_set:
+            host_dashboards_count[hostid] += dashboards_len
+        graphs_in_template_dashboards = 0
+
+        for d in dashboards:
+            for p in d.get("pages", []) or []:
+                for w in p.get("widgets", []) or []:
+                    for f in w.get("fields", []) or []:
+                        if str(f.get("type")) in GRAPH_FIELD_TYPES:
+                            graphs_in_template_dashboards += 1
+
+        for hostid in hostid_set:
+            host_dashboards_graphs[hostid] += graphs_in_template_dashboards
+
+logger.info("Host dashboards подсчитаны.")
 
 hosts_with_owner = []
 hosts_without_owner = []
@@ -279,8 +328,11 @@ for h in hosts:
         "Группы": ", ".join(g["name"] for g in h.get("groups", [])) or "—",
         "Шаблоны": ", ".join(t["name"] for t in h.get("parentTemplates", [])) or "—",
         "Триггеров": trigger_count.get(str(hostid), 0),
-        "Графиков": graph_count.get(str(hostid), 0),      # ✅ вкладка Graphs
-        "Дашбордов": dashboard_count.get(str(hostid), 0),  # эвристика по имени
+        "Графиков": graph_count.get(str(hostid), 0),  # вкладка Host -> Graphs
+        "Хост-дашбордов": host_dashboards_count.get(
+            str(hostid), 0
+        ),  # вкладка Host -> Dashboards
+        "Графов на хост-дашбордах": host_dashboards_graphs.get(str(hostid), 0),
         "Статус": "Активен" if str(h.get("status")) == "0" else "Отключён",
     }
 
@@ -297,14 +349,21 @@ summary_data = [
     ["Хостов без владельца", len(hosts_without_owner)],
     [
         "Хостов активных",
-        sum(1 for hh in hosts_with_owner + hosts_without_owner if hh["Статус"] == "Активен"),
+        sum(
+            1
+            for hh in hosts_with_owner + hosts_without_owner
+            if hh["Статус"] == "Активен"
+        ),
     ],
     [
         "Хостов отключённых",
-        sum(1 for hh in hosts_with_owner + hosts_without_owner if hh["Статус"] == "Отключён"),
+        sum(
+            1
+            for hh in hosts_with_owner + hosts_without_owner
+            if hh["Статус"] == "Отключён"
+        ),
     ],
 ]
-
 summary_df = pd.DataFrame(summary_data, columns=["Показатель", "Значение"])
 
 logger.info("Сохраняю Excel...")
