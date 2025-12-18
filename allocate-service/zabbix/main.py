@@ -16,7 +16,6 @@ ZABBIX_TOKEN = os.getenv("ZABBIX_TOKEN")
 BK_SQLITE_PATH = os.getenv("BK_SQLITE_PATH")
 OUTPUT_FILE = "zabbix_report.xlsx"
 
-# Zabbix DB (PostgreSQL) connection from .env
 ZBX_DB_HOST = os.getenv("ZBX_DB_HOST")
 ZBX_DB_PORT = int(os.getenv("ZBX_DB_PORT", "5432"))
 ZBX_DB_NAME = os.getenv("ZBX_DB_NAME")
@@ -25,7 +24,9 @@ ZBX_DB_PASSWORD = os.getenv("ZBX_DB_PASSWORD")
 
 logger = logging.getLogger("zabbix_report")
 logger.setLevel(logging.INFO)
-fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S")
+fmt = logging.Formatter(
+    "%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S"
+)
 ch = logging.StreamHandler()
 ch.setFormatter(fmt)
 logger.addHandler(ch)
@@ -33,6 +34,18 @@ logger.addHandler(ch)
 if not ZABBIX_URL or not ZABBIX_TOKEN:
     logger.error("Не найден URL или TOKEN. Проверь .env")
     raise SystemExit(1)
+
+
+def _zbx_db_conn():
+    if not all([ZBX_DB_HOST, ZBX_DB_NAME, ZBX_DB_USER, ZBX_DB_PASSWORD]):
+        raise RuntimeError("Не заданы параметры Zabbix DB (ZBX_DB_*) в .env")
+    return psycopg2.connect(
+        host=ZBX_DB_HOST,
+        port=ZBX_DB_PORT,
+        dbname=ZBX_DB_NAME,
+        user=ZBX_DB_USER,
+        password=ZBX_DB_PASSWORD,
+    )
 
 
 def fetch_last_online_by_username():
@@ -59,13 +72,7 @@ def fetch_last_online_by_username():
     """
 
     logger.info("Получаю последний онлайн пользователей из Zabbix DB...")
-    conn = psycopg2.connect(
-        host=ZBX_DB_HOST,
-        port=ZBX_DB_PORT,
-        dbname=ZBX_DB_NAME,
-        user=ZBX_DB_USER,
-        password=ZBX_DB_PASSWORD,
-    )
+    conn = _zbx_db_conn()
     try:
         with conn.cursor() as cur:
             cur.execute(sql)
@@ -73,7 +80,39 @@ def fetch_last_online_by_username():
     finally:
         conn.close()
 
-    return {str(username).lower(): last_online for username, last_online in rows if username}
+    return {
+        str(username).lower(): last_online for username, last_online in rows if username
+    }
+
+
+def fetch_internal_usernames(group_name: str = "ZabbixInternalUsers"):
+    """
+    Returns set of usernames (lowercase) that are in internal group (НЕ LDAP по вашему правилу).
+    """
+    if not all([ZBX_DB_HOST, ZBX_DB_NAME, ZBX_DB_USER, ZBX_DB_PASSWORD]):
+        logger.warning(
+            "Не заданы параметры Zabbix DB (ZBX_DB_*) в .env — классификация fired/tech будет без LDAP-логики."
+        )
+        return set()
+
+    sql = """
+    select u.username
+    from users u
+    join users_groups ug on u.userid = ug.userid
+    join usrgrp g on g.usrgrpid = ug.usrgrpid
+    where g.name = %s
+    """
+
+    logger.info(f"Получаю НЕ-LDAP пользователей из группы '{group_name}' (для tech)...")
+    conn = _zbx_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, (group_name,))
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    return {str(r[0]).lower() for r in rows if r and r[0]}
 
 
 def get_tag_value(tags, tag_name):
@@ -88,12 +127,10 @@ api = ZabbixAPI(url=ZABBIX_URL)
 api.login(token=ZABBIX_TOKEN)
 logger.info("Успешно!")
 
-# ------------------ ROLES ------------------
 logger.info("Получаю роли...")
 roles = api.role.get(output=["roleid", "name", "type", "readonly"])
 role_name_by_id = {r["roleid"]: r["name"] for r in roles}
 
-# ------------------ USERS ------------------
 logger.info("Получаю пользователей...")
 users = api.user.get(
     output=[
@@ -118,7 +155,6 @@ users = api.user.get(
     selectMedias=["sendto"],
 )
 
-# last online from DB
 last_online_by_username = fetch_last_online_by_username()
 
 user_data = []
@@ -158,7 +194,8 @@ for u in users:
         }
     )
 
-# ------------------ USER GROUPS ------------------
+user_row_by_login = {str(r["Логин"]).lower(): r for r in user_data if r.get("Логин")}
+
 logger.info("Получаю группы пользователей...")
 groups = api.usergroup.get(
     output=["usrgrpid", "name", "gui_access", "users_status"],
@@ -179,7 +216,6 @@ for g in groups:
         }
     )
 
-# ------------------ BK SQLITE ------------------
 logger.info("Подключаюсь к BK SQLite...")
 bk_conn = sqlite3.connect(BK_SQLITE_PATH)
 bk_conn.row_factory = sqlite3.Row
@@ -190,26 +226,36 @@ bk_users = [dict(r) for r in bk_rows]
 bk_logins = {(u.get("sAMAccountName") or "").lower(): u for u in bk_users}
 
 matched_bk_users = []
-techfired_users = []
+not_found_in_bk_users = []
+internal_usernames = fetch_internal_usernames("ZabbixInternalUsers")
 
 for u in users:
-    login = (u.get("username") or "").lower()
-    if login in bk_logins:
-        matched_bk_users.append(bk_logins[login])
-    else:
-        techfired_users.append(u)
+    login_lower = (u.get("username") or "").lower()
+    if not login_lower:
+        continue
 
-# ------------------ HOSTS ------------------
+    if login_lower in bk_logins:
+        matched_bk_users.append(bk_logins[login_lower])
+    else:
+        utype = "tech" if login_lower in internal_usernames else "fired"
+
+        base_row = user_row_by_login.get(
+            login_lower, {"Логин": u.get("username") or "—"}
+        )
+        row = {"Тип": utype}
+        row.update(base_row)
+        not_found_in_bk_users.append(row)
+
+
 logger.info("Получаю хосты...")
 hosts = api.host.get(
     output=["hostid", "host", "name", "status"],
     selectInterfaces=["ip", "dns"],
     selectGroups=["name"],
-    selectParentTemplates=["templateid", "name"],  # важно: templateid нужен для host dashboards
+    selectParentTemplates=["templateid", "name"],
     selectTags="extend",
 )
 
-# ---- Triggers & Graphs count ----
 batch_size = 500
 triggers_all = []
 graphs_all = []
@@ -229,7 +275,7 @@ for i in range(0, len(hosts), batch_size):
             api.graph.get(
                 output=["graphid"],
                 hostids=batch,
-                selectHosts="extend",  # важно
+                selectHosts="extend",
             )
         )
     except Exception:
@@ -250,11 +296,9 @@ for g in graphs_all:
     for h in g.get("hosts", []):
         graph_count[str(h["hostid"])] += 1
 
-# ---- Host dashboards count (Host -> Dashboards) ----
-# Считаем через template dashboards, т.к. это именно то, что показывается на хосте.
+
 logger.info("Считаю host dashboards (template dashboards)...")
 
-# templateid -> set(hostid)
 hostids_by_templateid = {}
 for h in hosts:
     hostid = str(h.get("hostid"))
@@ -264,13 +308,13 @@ for h in hosts:
             hostids_by_templateid.setdefault(str(tid), set()).add(hostid)
 
 all_templateids = list(hostids_by_templateid.keys())
-host_dashboards_count = Counter()  # hostid -> dashboards count
-
+host_dashboards_count = Counter()
 if not all_templateids:
-    logger.warning("У хостов не найдено parentTemplates.templateid — дашборды посчитать нельзя.")
+    logger.warning(
+        "У хостов не найдено parentTemplates.templateid — дашборды посчитать нельзя."
+    )
 else:
     try:
-        # ВАЖНО: правильные поля output (как требует API)
         tds = api.templatedashboard.get(
             output=["dashboardid", "name", "templateid"],
             templateids=all_templateids,
@@ -293,7 +337,6 @@ else:
 
 logger.info("Host dashboards подсчитаны.")
 
-# ------------------ HOSTS TABLES ------------------
 hosts_with_owner = []
 hosts_without_owner = []
 
@@ -314,7 +357,7 @@ for h in hosts:
         "Шаблоны": ", ".join(t["name"] for t in h.get("parentTemplates", [])) or "—",
         "Триггеров": trigger_count.get(str(hostid), 0),
         "Графиков": graph_count.get(str(hostid), 0),
-        "Дашбордов": host_dashboards_count.get(str(hostid), 0),  # ✅ теперь это Host->Dashboards
+        "Дашбордов": host_dashboards_count.get(str(hostid), 0),
         "Статус": "Активен" if str(h.get("status")) == "0" else "Отключён",
     }
 
@@ -324,7 +367,6 @@ for h in hosts:
     else:
         hosts_without_owner.append(row)
 
-# ------------------ SUMMARY ------------------
 summary_data = [
     ["Дата формирования", datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
     ["Хостов всего", len(hosts_with_owner) + len(hosts_without_owner)],
@@ -332,16 +374,23 @@ summary_data = [
     ["Хостов без владельца", len(hosts_without_owner)],
     [
         "Хостов активных",
-        sum(1 for hh in hosts_with_owner + hosts_without_owner if hh["Статус"] == "Активен"),
+        sum(
+            1
+            for hh in hosts_with_owner + hosts_without_owner
+            if hh["Статус"] == "Активен"
+        ),
     ],
     [
         "Хостов отключённых",
-        sum(1 for hh in hosts_with_owner + hosts_without_owner if hh["Статус"] == "Отключён"),
+        sum(
+            1
+            for hh in hosts_with_owner + hosts_without_owner
+            if hh["Статус"] == "Отключён"
+        ),
     ],
 ]
 summary_df = pd.DataFrame(summary_data, columns=["Показатель", "Значение"])
 
-# ------------------ SAVE EXCEL ------------------
 logger.info("Сохраняю Excel...")
 
 with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
@@ -354,9 +403,13 @@ with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
     pd.DataFrame(matched_bk_users).to_excel(
         writer, sheet_name="Пользователи BK", index=False
     )
-    pd.DataFrame(techfired_users).to_excel(
-        writer, sheet_name="Не найдено в BK", index=False
-    )
+
+    df_nf = pd.DataFrame(not_found_in_bk_users)
+    if not df_nf.empty:
+        cols = ["Тип"] + [c for c in df_nf.columns if c != "Тип"]
+        df_nf = df_nf[cols].sort_values(by=["Тип", "Логин"], kind="stable")
+    df_nf.to_excel(writer, sheet_name="Уволенные и тех учетки", index=False)
+
     pd.DataFrame(hosts_with_owner).sort_values(by="Имя хоста").to_excel(
         writer, sheet_name="Хосты с владельцем", index=False
     )
