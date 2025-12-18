@@ -2,16 +2,26 @@ import os
 import logging
 import sqlite3
 from datetime import datetime
+from collections import Counter
+
 import pandas as pd
 from dotenv import load_dotenv
-from collections import Counter
 from zabbix_utils import ZabbixAPI
+import psycopg2
 
 load_dotenv()
+
 ZABBIX_URL = os.getenv("ZABBIX_URL")
 ZABBIX_TOKEN = os.getenv("ZABBIX_TOKEN")
 BK_SQLITE_PATH = os.getenv("BK_SQLITE_PATH")
 OUTPUT_FILE = "zabbix_report.xlsx"
+
+# Zabbix DB (PostgreSQL) connection from .env
+ZBX_DB_HOST = os.getenv("ZBX_DB_HOST")
+ZBX_DB_PORT = int(os.getenv("ZBX_DB_PORT", "5432"))
+ZBX_DB_NAME = os.getenv("ZBX_DB_NAME")
+ZBX_DB_USER = os.getenv("ZBX_DB_USER")
+ZBX_DB_PASSWORD = os.getenv("ZBX_DB_PASSWORD")
 
 logger = logging.getLogger("zabbix_report")
 logger.setLevel(logging.INFO)
@@ -25,6 +35,50 @@ logger.addHandler(ch)
 if not ZABBIX_URL or not ZABBIX_TOKEN:
     logger.error("Не найден URL или TOKEN. Проверь .env")
     raise SystemExit(1)
+
+
+def fetch_last_online_by_username():
+    """
+    Returns dict: {username_lower: datetime_of_last_access}
+    If DB env vars are not set, returns empty dict and report will have '—'.
+    """
+    if not all([ZBX_DB_HOST, ZBX_DB_NAME, ZBX_DB_USER, ZBX_DB_PASSWORD]):
+        logger.warning(
+            "Не заданы параметры Zabbix DB (ZBX_DB_*) в .env — 'Последний онлайн' будет пустым."
+        )
+        return {}
+
+    sql = """
+    select u.username, to_timestamp(ss.lastaccess) as last_online
+    from users u
+    join lateral (
+        select s.lastaccess
+        from sessions s
+        where u.userid = s.userid
+        order by s.lastaccess desc
+        limit 1
+    ) ss on true
+    """
+
+    logger.info("Получаю последний онлайн пользователей из Zabbix DB...")
+    conn = psycopg2.connect(
+        host=ZBX_DB_HOST,
+        port=ZBX_DB_PORT,
+        dbname=ZBX_DB_NAME,
+        user=ZBX_DB_USER,
+        password=ZBX_DB_PASSWORD,
+    )
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql)
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    return {
+        str(username).lower(): last_online for username, last_online in rows if username
+    }
+
 
 logger.info("Подключаюсь к Zabbix...")
 api = ZabbixAPI(url=ZABBIX_URL)
@@ -59,9 +113,18 @@ users = api.user.get(
     selectMedias=["sendto"],
 )
 
+# Fetch last online from DB and map by username
+last_online_by_username = fetch_last_online_by_username()
+
 user_data = []
 for u in users:
     login = u.get("username") or "—"
+
+    # last online (string for Excel)
+    last_online_dt = last_online_by_username.get(str(login).lower())
+    last_online_str = (
+        last_online_dt.strftime("%Y-%m-%d %H:%M:%S") if last_online_dt else "—"
+    )
 
     medias = []
     for m in u.get("medias", []):
@@ -73,7 +136,6 @@ for u in users:
     email = ", ".join(medias) if medias else "—"
 
     groups = ", ".join(g["name"] for g in u.get("usrgrps", [])) or "—"
-
     role_name = role_name_by_id.get(u.get("roleid"), "—")
 
     user_data.append(
@@ -84,6 +146,7 @@ for u in users:
             "Email": email,
             "Группы": groups,
             "Роль": role_name,
+            "Последний онлайн": last_online_str,
             "Автовход": "Да" if u.get("autologin") == "1" else "Нет",
             "Язык": u.get("lang"),
             "Тема": u.get("theme"),
