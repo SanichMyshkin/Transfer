@@ -25,9 +25,7 @@ ZBX_DB_PASSWORD = os.getenv("ZBX_DB_PASSWORD")
 
 logger = logging.getLogger("zabbix_report")
 logger.setLevel(logging.INFO)
-fmt = logging.Formatter(
-    "%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S"
-)
+fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S")
 ch = logging.StreamHandler()
 ch.setFormatter(fmt)
 logger.addHandler(ch)
@@ -75,9 +73,7 @@ def fetch_last_online_by_username():
     finally:
         conn.close()
 
-    return {
-        str(username).lower(): last_online for username, last_online in rows if username
-    }
+    return {str(username).lower(): last_online for username, last_online in rows if username}
 
 
 logger.info("Подключаюсь к Zabbix...")
@@ -113,14 +109,13 @@ users = api.user.get(
     selectMedias=["sendto"],
 )
 
-# Fetch last online from DB and map by username
+# ✅ Last online from DB
 last_online_by_username = fetch_last_online_by_username()
 
 user_data = []
 for u in users:
     login = u.get("username") or "—"
 
-    # last online (string for Excel)
     last_online_dt = last_online_by_username.get(str(login).lower())
     last_online_str = (
         last_online_dt.strftime("%Y-%m-%d %H:%M:%S") if last_online_dt else "—"
@@ -208,6 +203,8 @@ graphs_all = []
 
 for i in range(0, len(hosts), batch_size):
     batch = [h["hostid"] for h in hosts[i : i + batch_size]]
+
+    # triggers (как было)
     try:
         triggers_all.extend(
             api.trigger.get(output=["triggerid"], hostids=batch, selectHosts=["hostid"])
@@ -215,13 +212,25 @@ for i in range(0, len(hosts), batch_size):
     except Exception:
         pass
 
+    # ✅ graphs: ВАЖНО selectHosts="extend", иначе hosts часто пустые => графики = 0
     try:
         graphs_all.extend(
-            api.graph.get(output=["graphid"], hostids=batch, selectHosts=["hostid"])
+            api.graph.get(
+                output=["graphid"],
+                hostids=batch,
+                selectHosts="extend",
+            )
         )
     except Exception:
         pass
 
+# (опционально) быстрая диагностика, можно убрать потом
+logger.info(f"Graphs returned: {len(graphs_all)}")
+if graphs_all:
+    logger.info(f"First graph keys: {list(graphs_all[0].keys())}")
+    logger.info(f"First graph hosts: {graphs_all[0].get('hosts')}")
+
+# dashboards оставляю как в оригинале (ЭВРИСТИКА по имени). Может быть 0 — это нормально.
 try:
     dashboards_all = api.dashboard.get(output=["dashboardid", "name"])
 except Exception:
@@ -230,18 +239,18 @@ except Exception:
 trigger_count = Counter()
 for t in triggers_all:
     for h in t.get("hosts", []):
-        trigger_count[h["hostid"]] += 1
+        trigger_count[str(h["hostid"])] += 1
 
 graph_count = Counter()
 for g in graphs_all:
     for h in g.get("hosts", []):
-        graph_count[h["hostid"]] += 1
+        graph_count[str(h["hostid"])] += 1
 
 dashboard_count = Counter()
 for d in dashboards_all:
     for h in hosts:
         if h.get("name") in d.get("name", ""):
-            dashboard_count[h["hostid"]] += 1
+            dashboard_count[str(h["hostid"])] += 1
 
 
 def get_tag_value(tags, tag_name):
@@ -269,9 +278,9 @@ for h in hosts:
         "IP": ip,
         "Группы": ", ".join(g["name"] for g in h.get("groups", [])) or "—",
         "Шаблоны": ", ".join(t["name"] for t in h.get("parentTemplates", [])) or "—",
-        "Триггеров": trigger_count.get(hostid, 0),
-        "Графиков": graph_count.get(hostid, 0),
-        "Дашбордов": dashboard_count.get(hostid, 0),
+        "Триггеров": trigger_count.get(str(hostid), 0),
+        "Графиков": graph_count.get(str(hostid), 0),      # ✅ вкладка Graphs
+        "Дашбордов": dashboard_count.get(str(hostid), 0),  # эвристика по имени
         "Статус": "Активен" if str(h.get("status")) == "0" else "Отключён",
     }
 
@@ -288,19 +297,11 @@ summary_data = [
     ["Хостов без владельца", len(hosts_without_owner)],
     [
         "Хостов активных",
-        sum(
-            1
-            for h in hosts_with_owner + hosts_without_owner
-            if h["Статус"] == "Активен"
-        ),
+        sum(1 for hh in hosts_with_owner + hosts_without_owner if hh["Статус"] == "Активен"),
     ],
     [
         "Хостов отключённых",
-        sum(
-            1
-            for h in hosts_with_owner + hosts_without_owner
-            if h["Статус"] == "Отключён"
-        ),
+        sum(1 for hh in hosts_with_owner + hosts_without_owner if hh["Статус"] == "Отключён"),
     ],
 ]
 
