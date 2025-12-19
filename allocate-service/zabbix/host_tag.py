@@ -63,7 +63,9 @@ from zabbix_utils import ZabbixAPI
 
 
 DRY_RUN = True  # True = только логи, False = реальные изменения
-OWNER_TAG_NAME = "host_owner"  # Что запишем в графе заббикса
+
+OWNER_NAME_TAG = "host_owner_name"  # вместо host_owner
+OWNER_ID_TAG = "host_owner_id"  # новый тег с цифрами из Excel (B)
 
 UPDATE_DELAY_SEC = 1.0  # задержка между запросами на простановку тегов в секундах
 MAX_HOSTS_TO_UPDATE = (
@@ -97,17 +99,34 @@ def has_tag(tags, tag):
     return False
 
 
-def add_tag(tags, tag, value):
-    tags = [t.copy() for t in tags]
-    tags.append({"tag": tag, "value": value})
+def add_or_replace_tag(tags, tag, value):
+    """Добавляет или заменяет тег (чтобы не плодить дубли)."""
+    tags = [t.copy() for t in (tags or [])]
+    replaced = False
+    for t in tags:
+        if t.get("tag") == tag:
+            t["value"] = value
+            replaced = True
+            break
+    if not replaced:
+        tags.append({"tag": tag, "value": value})
     return tags
 
 
 def load_excel(path):
+    """
+    Excel:
+      A (0)  -> service
+      B (1)  -> host_owner_id (цифры)
+      N (13) -> excel_host
+      V (21) -> excel_ip
+    """
     df = pd.read_excel(path, engine="openpyxl", dtype=str)
     rows = []
 
-    for service, host, ip in zip(df.iloc[:, 0], df.iloc[:, 13], df.iloc[:, 21]):
+    for service, owner_id, host, ip in zip(
+        df.iloc[:, 0], df.iloc[:, 1], df.iloc[:, 13], df.iloc[:, 21]
+    ):
         if not service or str(service).lower() == "nan":
             continue
 
@@ -116,6 +135,9 @@ def load_excel(path):
         rows.append(
             {
                 "service": str(service).strip(),
+                "owner_id": None
+                if not owner_id or str(owner_id).lower() == "nan"
+                else str(owner_id).strip(),
                 "excel_host": None
                 if not host or str(host).lower() == "nan"
                 else str(host).strip(),
@@ -292,7 +314,8 @@ def assign(enabled_hosts, excel_index):
 
         matched.append(
             {
-                "service": chosen["service"],
+                "service": chosen["service"],  # пойдёт в host_owner_name
+                "owner_id": chosen.get("owner_id"),  # пойдёт в host_owner_id
                 "match_field": match_field,
                 "zabbix_hostid": z_hostid,
                 "zabbix_name": z_name,
@@ -345,9 +368,16 @@ def main():
     hosts_by_id = {h["hostid"]: h for h in zabbix_hosts_with_tags}
 
     applied = 0
-    skipped = 0
+    skipped_existing = 0
+    skipped_no_owner_id = 0
+    skipped_missing_host = 0
 
-    log.info("=== ПРОСТАНОВКА host_owner (DRY_RUN=%s) ===", DRY_RUN)
+    log.info(
+        "=== ПРОСТАНОВКА %s + %s (DRY_RUN=%s) ===",
+        OWNER_NAME_TAG,
+        OWNER_ID_TAG,
+        DRY_RUN,
+    )
 
     for row in matched:
         if MAX_HOSTS_TO_UPDATE is not None and applied >= MAX_HOSTS_TO_UPDATE:
@@ -355,30 +385,51 @@ def main():
             break
 
         hostid = row["zabbix_hostid"]
-        owner_value = row["service"]
+        owner_name_value = row["service"]
+        owner_id_value = row.get("owner_id")
 
         host = hosts_by_id.get(hostid)
         if not host:
+            skipped_missing_host += 1
             continue
 
-        tags = host.get("tags", [])
-
-        if has_tag(tags, OWNER_TAG_NAME):
-            skipped += 1
+        # ВАЖНО: если нет owner_id — скипаем, но лог БОЛЬШИМИ БУКВАМИ
+        if not owner_id_value:
+            iface0 = (host.get("interfaces") or [{}])[0]
+            log.error(
+                "SKIPPED: NO OWNER ID FOR MATCHED HOST | HOST=%s | DNS=%s | IP=%s | WOULD_SET %s=%s",
+                host.get("name"),
+                iface0.get("dns"),
+                iface0.get("ip"),
+                OWNER_NAME_TAG,
+                owner_name_value,
+            )
+            skipped_no_owner_id += 1
             continue
 
-        new_tags = add_tag(tags, OWNER_TAG_NAME, owner_value)
+        tags = host.get("tags", []) or []
 
-        iface = host.get("interfaces", [{}])[0]
+        # Если уже есть хотя бы один из тегов — пропускаем
+        if has_tag(tags, OWNER_NAME_TAG) or has_tag(tags, OWNER_ID_TAG):
+            skipped_existing += 1
+            continue
+
+        new_tags = tags
+        new_tags = add_or_replace_tag(new_tags, OWNER_NAME_TAG, owner_name_value)
+        new_tags = add_or_replace_tag(new_tags, OWNER_ID_TAG, owner_id_value)
+
+        iface = (host.get("interfaces") or [{}])[0]
 
         log.info(
-            "DRY_RUN=%s | HOST=%s | DNS=%s | IP=%s | ADD TAG: %s=%s",
+            "DRY_RUN=%s | HOST=%s | DNS=%s | IP=%s | ADD TAGS: %s=%s, %s=%s",
             DRY_RUN,
             host.get("name"),
             iface.get("dns"),
             iface.get("ip"),
-            OWNER_TAG_NAME,
-            owner_value,
+            OWNER_NAME_TAG,
+            owner_name_value,
+            OWNER_ID_TAG,
+            owner_id_value,
         )
 
         applied += 1
@@ -392,7 +443,13 @@ def main():
             time.sleep(UPDATE_DELAY_SEC)
 
     log.info(
-        "host_owner: добавлено=%d пропущено_из-за_существующего=%d", applied, skipped
+        "%s/%s: добавлено=%d пропущено_существует=%d пропущено_нет_owner_id=%d пропущено_нет_хоста=%d",
+        OWNER_NAME_TAG,
+        OWNER_ID_TAG,
+        applied,
+        skipped_existing,
+        skipped_no_owner_id,
+        skipped_missing_host,
     )
 
 
