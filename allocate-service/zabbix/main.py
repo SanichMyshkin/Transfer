@@ -121,6 +121,14 @@ def get_tag_value(tags, tag_name):
             return t.get("value")
     return None
 
+def get_first_tag_value(tags, tag_names):
+    """Возвращает первое найденное значение по списку имён тегов (в порядке приоритета)."""
+    for name in tag_names:
+        v = get_tag_value(tags, name)
+        if v:
+            return v
+    return None
+
 
 logger.info("Подключаюсь к Zabbix...")
 api = ZabbixAPI(url=ZABBIX_URL)
@@ -346,7 +354,9 @@ for h in hosts:
     ip_list = [i.get("ip") for i in h.get("interfaces", []) if i.get("ip")]
     ip = ", ".join(ip_list) if ip_list else "—"
 
-    owner = get_tag_value(h.get("tags"), "host_owner")
+    # Новый формат тегов:
+    owner_name = get_first_tag_value(h.get("tags"), ["host_owner_name", "host_owner"])
+    owner_id = get_tag_value(h.get("tags"), "host_owner_id")
 
     row = {
         "ID": hostid,
@@ -361,8 +371,9 @@ for h in hosts:
         "Статус": "Активен" if str(h.get("status")) == "0" else "Отключён",
     }
 
-    if owner:
-        row["Владелец"] = owner
+    if owner_name:
+        row["Владелец"] = owner_name
+        row["ID владельца"] = owner_id or "—"
         hosts_with_owner.append(row)
     else:
         hosts_without_owner.append(row)
