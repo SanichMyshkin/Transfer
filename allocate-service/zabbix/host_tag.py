@@ -62,15 +62,17 @@ from dotenv import load_dotenv
 from zabbix_utils import ZabbixAPI
 
 
-DRY_RUN = True  # True = только логи, False = реальные изменения
+# ================== НАСТРОЙКИ ==================
 
-OWNER_NAME_TAG = "host_owner_name"  # вместо host_owner
-OWNER_ID_TAG = "host_owner_id"  # новый тег с цифрами из Excel (B)
+DRY_RUN = False
+OWNER_NAME_TAG = "host_owner_name"
+OWNER_ID_TAG = "host_owner_id"
 
-UPDATE_DELAY_SEC = 1.0  # задержка между запросами на простановку тегов в секундах
-MAX_HOSTS_TO_UPDATE = (
-    10  # Кол-во которое будет обработано, если не указывать (None), то пойдут в бой все
-)
+UPDATE_DELAY_SEC = 1.0
+MAX_HOSTS_TO_UPDATE = 10  # None = без лимита
+
+EXCEL_PATH = r"tags\db.xlsx"
+
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 log = logging.getLogger("zbx_match")
@@ -92,40 +94,59 @@ def host_variants(host):
     return list(dict.fromkeys(res))
 
 
+def sanitize_tags(tags):
+    """Оставляем ТОЛЬКО tag/value — Zabbix не принимает automatic."""
+    clean = []
+    for t in tags or []:
+        if not isinstance(t, dict):
+            continue
+        tag = t.get("tag")
+        if not tag:
+            continue
+        clean.append(
+            {
+                "tag": str(tag),
+                "value": "" if t.get("value") is None else str(t.get("value")),
+            }
+        )
+    return clean
+
+
 def has_tag(tags, tag):
-    for t in tags:
+    for t in tags or []:
         if t.get("tag") == tag:
             return True
     return False
 
 
 def add_or_replace_tag(tags, tag, value):
-    """Добавляет или заменяет тег (чтобы не плодить дубли)."""
-    tags = [t.copy() for t in (tags or [])]
-    replaced = False
+    tags = sanitize_tags(tags)
+    value = "" if value is None else str(value)
+
     for t in tags:
-        if t.get("tag") == tag:
+        if t["tag"] == tag:
             t["value"] = value
-            replaced = True
-            break
-    if not replaced:
-        tags.append({"tag": tag, "value": value})
+            return tags
+
+    tags.append({"tag": tag, "value": value})
     return tags
 
 
 def load_excel(path):
     """
-    Excel:
-      A (0)  -> service
-      B (1)  -> host_owner_id (цифры)
-      N (13) -> excel_host
-      V (21) -> excel_ip
+    A (0)  -> service
+    B (1)  -> host_owner_id
+    N (13) -> excel_host
+    V (21) -> excel_ip
     """
     df = pd.read_excel(path, engine="openpyxl", dtype=str)
     rows = []
 
     for service, owner_id, host, ip in zip(
-        df.iloc[:, 0], df.iloc[:, 1], df.iloc[:, 13], df.iloc[:, 21]
+        df.iloc[:, 0],
+        df.iloc[:, 1],
+        df.iloc[:, 13],
+        df.iloc[:, 21],
     ):
         if not service or str(service).lower() == "nan":
             continue
@@ -207,12 +228,12 @@ def build_excel_index(excel_rows, enabled_keys):
         if not r["excel_host"]:
             continue
 
-        vars_ = host_variants(r["excel_host"])
-        if not any(v in enabled_keys for v in vars_):
+        variants = host_variants(r["excel_host"])
+        if not any(v in enabled_keys for v in variants):
             dropped += 1
             continue
 
-        for v in vars_:
+        for v in variants:
             idx.setdefault(v, []).append(r)
 
     log.info("Excel строк отброшено (host не найден среди ENABLED Zabbix): %d", dropped)
@@ -220,11 +241,11 @@ def build_excel_index(excel_rows, enabled_keys):
 
 
 def decide_from_candidates(candidates):
-    old = [c for c in candidates if c.get("is_old")]
-    non_old = [c for c in candidates if not c.get("is_old")]
+    old = [c for c in candidates if c["is_old"]]
+    non_old = [c for c in candidates if not c["is_old"]]
 
     if non_old:
-        services = sorted(set(c["service"] for c in non_old))
+        services = sorted({c["service"] for c in non_old})
         if len(services) == 1:
             if old:
                 return (
@@ -235,22 +256,21 @@ def decide_from_candidates(candidates):
                 )
             return non_old[0], "", "", None
 
-        conflict_type = (
-            "hostname_multiple_services_after_old_drop"
-            if old
-            else "hostname_multiple_services"
-        )
         return (
             None,
             "",
             "",
             {
-                "conflict_type": conflict_type,
+                "conflict_type": (
+                    "hostname_multiple_services_after_old_drop"
+                    if old
+                    else "hostname_multiple_services"
+                ),
                 "services": services,
             },
         )
 
-    services = sorted(set(c["service"] for c in old))
+    services = sorted({c["service"] for c in old})
     if len(services) == 1:
         return old[0], "only_old", "только old кандидаты", None
 
@@ -269,10 +289,10 @@ def assign(enabled_hosts, excel_index):
     matched, unmatched, conflicts = [], [], []
 
     for z in enabled_hosts:
-        z_hostid = str(z.get("hostid"))
+        z_hostid = z["hostid"]
         z_name = z.get("name")
         z_dns = zabbix_primary_dns(z)
-        z_ip_list = zabbix_ips(z)
+        z_ips = zabbix_ips(z)
         z_keys = zabbix_keys(z)
 
         candidates = []
@@ -280,47 +300,28 @@ def assign(enabled_hosts, excel_index):
             candidates.extend(excel_index.get(k, []))
 
         if not candidates:
-            unmatched.append(
-                {
-                    "zabbix_hostid": z_hostid,
-                    "zabbix_name": z_name,
-                    "zabbix_dns": z_dns,
-                    "zabbix_ip": z_ip_list[0] if z_ip_list else None,
-                    "status": "Активен",
-                }
-            )
+            unmatched.append(z_hostid)
             continue
 
-        chosen, resolution, note, conflict_info = decide_from_candidates(candidates)
-        if conflict_info:
+        chosen, _, _, conflict = decide_from_candidates(candidates)
+        if conflict:
             conflicts.append(
                 {
-                    "zabbix_hostid": z_hostid,
-                    "zabbix_name": z_name,
-                    "zabbix_dns": z_dns,
-                    "zabbix_ip": z_ip_list[0] if z_ip_list else None,
-                    "conflict_type": conflict_info["conflict_type"],
-                    "services": "; ".join(conflict_info["services"]),
+                    "hostid": z_hostid,
+                    "name": z_name,
+                    "conflict": conflict,
                 }
             )
             continue
-
-        match_field = "hostname"
-        if chosen["excel_ip"] and chosen["excel_ip"] in z_ip_list:
-            match_field = "hostname+ip"
-
-        if chosen.get("is_old"):
-            log.warning("Используется old-запись: %s", chosen.get("excel_ip"))
 
         matched.append(
             {
-                "service": chosen["service"],  # пойдёт в host_owner_name
-                "owner_id": chosen.get("owner_id"),  # пойдёт в host_owner_id
-                "match_field": match_field,
                 "zabbix_hostid": z_hostid,
                 "zabbix_name": z_name,
                 "zabbix_dns": z_dns,
-                "zabbix_ip": z_ip_list[0] if z_ip_list else None,
+                "zabbix_ip": z_ips[0] if z_ips else None,
+                "service": chosen["service"],
+                "owner_id": chosen["owner_id"],
             }
         )
 
@@ -329,6 +330,7 @@ def assign(enabled_hosts, excel_index):
 
 def main():
     load_dotenv()
+
     url = os.getenv("ZABBIX_URL")
     token = os.getenv("ZABBIX_TOKEN")
 
@@ -336,7 +338,7 @@ def main():
         log.error("Не заданы ZABBIX_URL / ZABBIX_TOKEN")
         return
 
-    excel_rows = load_excel(r"tags\service_db.xlsx")
+    excel_rows = load_excel(EXCEL_PATH)
 
     api = ZabbixAPI(url=url)
     api.login(token=token)
@@ -354,23 +356,15 @@ def main():
         len(conflicts),
     )
 
-    if conflicts:
-        log.error("КОНФЛИКТЫ (первые 10):")
-        for c in conflicts[:10]:
-            log.error(c)
-
-    zabbix_hosts_with_tags = api.host.get(
+    zabbix_hosts = api.host.get(
         output=["hostid", "name"],
         selectInterfaces=["ip", "dns"],
         selectTags="extend",
     )
 
-    hosts_by_id = {h["hostid"]: h for h in zabbix_hosts_with_tags}
+    hosts_by_id = {h["hostid"]: h for h in zabbix_hosts}
 
-    applied = 0
-    skipped_existing = 0
-    skipped_no_owner_id = 0
-    skipped_missing_host = 0
+    applied = skipped_existing = skipped_no_id = 0
 
     log.info(
         "=== ПРОСТАНОВКА %s + %s (DRY_RUN=%s) ===",
@@ -380,56 +374,39 @@ def main():
     )
 
     for row in matched:
-        if MAX_HOSTS_TO_UPDATE is not None and applied >= MAX_HOSTS_TO_UPDATE:
-            log.info("Достигнут лимит обработки: %d", MAX_HOSTS_TO_UPDATE)
+        if MAX_HOSTS_TO_UPDATE and applied >= MAX_HOSTS_TO_UPDATE:
             break
 
-        hostid = row["zabbix_hostid"]
-        owner_name_value = row["service"]
-        owner_id_value = row.get("owner_id")
-
-        host = hosts_by_id.get(hostid)
+        host = hosts_by_id.get(row["zabbix_hostid"])
         if not host:
-            skipped_missing_host += 1
             continue
 
-        # ВАЖНО: если нет owner_id — скипаем, но лог БОЛЬШИМИ БУКВАМИ
-        if not owner_id_value:
-            iface0 = (host.get("interfaces") or [{}])[0]
+        if not row["owner_id"]:
             log.error(
-                "SKIPPED: NO OWNER ID FOR MATCHED HOST | HOST=%s | DNS=%s | IP=%s | WOULD_SET %s=%s",
+                "SKIPPED: NO OWNER ID | HOST=%s | SERVICE=%s",
                 host.get("name"),
-                iface0.get("dns"),
-                iface0.get("ip"),
-                OWNER_NAME_TAG,
-                owner_name_value,
+                row["service"],
             )
-            skipped_no_owner_id += 1
+            skipped_no_id += 1
             continue
 
-        tags = host.get("tags", []) or []
+        tags = sanitize_tags(host.get("tags"))
 
-        # Если уже есть хотя бы один из тегов — пропускаем
         if has_tag(tags, OWNER_NAME_TAG) or has_tag(tags, OWNER_ID_TAG):
             skipped_existing += 1
             continue
 
-        new_tags = tags
-        new_tags = add_or_replace_tag(new_tags, OWNER_NAME_TAG, owner_name_value)
-        new_tags = add_or_replace_tag(new_tags, OWNER_ID_TAG, owner_id_value)
-
-        iface = (host.get("interfaces") or [{}])[0]
+        tags = add_or_replace_tag(tags, OWNER_NAME_TAG, row["service"])
+        tags = add_or_replace_tag(tags, OWNER_ID_TAG, row["owner_id"])
 
         log.info(
-            "DRY_RUN=%s | HOST=%s | DNS=%s | IP=%s | ADD TAGS: %s=%s, %s=%s",
+            "DRY_RUN=%s | HOST=%s | ADD TAGS: %s=%s, %s=%s",
             DRY_RUN,
             host.get("name"),
-            iface.get("dns"),
-            iface.get("ip"),
             OWNER_NAME_TAG,
-            owner_name_value,
+            row["service"],
             OWNER_ID_TAG,
-            owner_id_value,
+            row["owner_id"],
         )
 
         applied += 1
@@ -437,19 +414,19 @@ def main():
         if DRY_RUN:
             continue
 
-        api.host.update(hostid=hostid, tags=new_tags)
+        api.host.update(
+            hostid=row["zabbix_hostid"],
+            tags=tags,
+        )
 
         if UPDATE_DELAY_SEC:
             time.sleep(UPDATE_DELAY_SEC)
 
     log.info(
-        "%s/%s: добавлено=%d пропущено_существует=%d пропущено_нет_owner_id=%d пропущено_нет_хоста=%d",
-        OWNER_NAME_TAG,
-        OWNER_ID_TAG,
+        "ГОТОВО: добавлено=%d пропущено_существует=%d пропущено_нет_id=%d",
         applied,
         skipped_existing,
-        skipped_no_owner_id,
-        skipped_missing_host,
+        skipped_no_id,
     )
 
 
