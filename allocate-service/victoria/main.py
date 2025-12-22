@@ -14,6 +14,9 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+ACTIVE_WINDOW = "1d"
+OUTPUT_FILE = "victoriametrics_repot.xlsx"
+
 
 def safe_query(prom, q):
     log.info(f"QUERY: {q}")
@@ -27,7 +30,7 @@ def safe_query(prom, q):
 
 
 def count_metric_names_for_job(prom, job):
-    q = f'count(count by (__name__) ({{job="{job}"}}))'
+    q = f'count(count by (__name__) (last_over_time({{job="{job}"}}[{ACTIVE_WINDOW}])))'
     res = safe_query(prom, q)
     if not res:
         return 0
@@ -35,7 +38,7 @@ def count_metric_names_for_job(prom, job):
 
 
 def count_time_series_for_job(prom, job):
-    q = f'count({{job="{job}"}})'
+    q = f'count(last_over_time({{job="{job}"}}[{ACTIVE_WINDOW}]))'
     res = safe_query(prom, q)
     if not res:
         return 0
@@ -43,7 +46,7 @@ def count_time_series_for_job(prom, job):
 
 
 def get_instances_for_job(prom, job):
-    q = f'count by (instance) ({{job="{job}"}})'
+    q = f'count by (instance) (last_over_time({{job="{job}"}}[{ACTIVE_WINDOW}]))'
     res = safe_query(prom, q)
     if not res:
         return []
@@ -75,9 +78,8 @@ def main():
         log.error(f"Ошибка получения job: {e}")
         jobs = []
 
-    workbook = xlsxwriter.Workbook("job_metrics.xlsx")
+    workbook = xlsxwriter.Workbook(OUTPUT_FILE)
 
-    # ---------- JOB SHEET ----------
     sheet_jobs = workbook.add_worksheet("job_metrics")
     headers_jobs = ["job", "metric_names", "time_series", "instances_count", "instances_list"]
     for col, name in enumerate(headers_jobs):
@@ -100,7 +102,6 @@ def main():
         sheet_jobs.write(row, 4, ", ".join(sorted(instances)))
         row += 1
 
-    # ---------- TEAM → SERVICE_ID ----------
     log.info("Получение списка team...")
     try:
         teams = prom.get_label_values("team")
@@ -119,7 +120,7 @@ def main():
 
         log.info(f"[TEAM] {team}")
 
-        q_svc = f'count by (service_id) ({{team="{team}"}})'
+        q_svc = f'count by (service_id) (last_over_time({{team="{team}", service_id!=""}}[{ACTIVE_WINDOW}]))'
         svc_rows = safe_query(prom, q_svc)
         service_ids = set()
         if svc_rows:
@@ -128,30 +129,32 @@ def main():
                 if sid:
                     service_ids.add(sid)
 
-        q_total = f'count({{team="{team}"}})'
+        q_total = f'count(last_over_time({{team="{team}"}}[{ACTIVE_WINDOW}]))'
         total_res = safe_query(prom, q_total)
         total = int(total_res[0]["value"][1]) if total_res else 0
 
-        q_with_svc = f'count({{team="{team}", service_id!=""}})'
+        q_with_svc = f'count(last_over_time({{team="{team}", service_id!=""}}[{ACTIVE_WINDOW}]))'
         with_svc_res = safe_query(prom, q_with_svc)
         with_svc = int(with_svc_res[0]["value"][1]) if with_svc_res else 0
 
-        no_svc = max(total - with_svc, 0)
+        q_no_svc = f'count(last_over_time({{team="{team}", service_id=""}}[{ACTIVE_WINDOW}]))'
+        no_svc_res = safe_query(prom, q_no_svc)
+        no_svc = int(no_svc_res[0]["value"][1]) if no_svc_res else 0
+
         log.info(f"[TEAM] {team}: total={total}, with_service_id={with_svc}, no_service_id={no_svc}")
 
-        # ---- TEAM + SERVICE_ID ----
         for service_id in sorted(service_ids):
             log.info(f"[TEAM-SVC] {team}/{service_id}")
 
-            q_series = f'count({{team="{team}", service_id="{service_id}"}})'
+            q_series = f'count(last_over_time({{team="{team}", service_id="{service_id}"}}[{ACTIVE_WINDOW}]))'
             res_series = safe_query(prom, q_series)
             time_series_count = int(res_series[0]["value"][1]) if res_series else 0
 
-            q_instances = f'count by (instance) ({{team="{team}", service_id="{service_id}"}})'
+            q_instances = f'count by (instance) (last_over_time({{team="{team}", service_id="{service_id}"}}[{ACTIVE_WINDOW}]))'
             inst_rows = safe_query(prom, q_instances)
             inst_list = {r["metric"].get("instance", "<none>") for r in inst_rows} if inst_rows else set()
 
-            q_metrics = f'count by (__name__) ({{team="{team}", service_id="{service_id}"}})'
+            q_metrics = f'count by (__name__) (last_over_time({{team="{team}", service_id="{service_id}"}}[{ACTIVE_WINDOW}]))'
             mn_rows = safe_query(prom, q_metrics)
             metric_names = {r["metric"].get("__name__", "<noname>") for r in mn_rows} if mn_rows else set()
 
@@ -161,15 +164,14 @@ def main():
             g["instances"].update(inst_list)
             g["time_series"] += time_series_count
 
-        # ---- TEAM WITHOUT service_id ----
         if no_svc > 0:
             log.info(f"[TEAM-<none>] {team} — time_series без service_id: {no_svc}")
 
-            q_instances_ns = f'count by (instance) ({{team="{team}", service_id=""}})'
+            q_instances_ns = f'count by (instance) (last_over_time({{team="{team}", service_id=""}}[{ACTIVE_WINDOW}]))'
             inst_ns_rows = safe_query(prom, q_instances_ns)
             inst_ns = {r["metric"].get("instance", "<none>") for r in inst_ns_rows} if inst_ns_rows else set()
 
-            q_metrics_ns = f'count by (__name__) ({{team="{team}", service_id=""}})'
+            q_metrics_ns = f'count by (__name__) (last_over_time({{team="{team}", service_id=""}}[{ACTIVE_WINDOW}]))'
             mn_ns_rows = safe_query(prom, q_metrics_ns)
             metric_ns = {r["metric"].get("__name__", "<noname>") for r in mn_ns_rows} if mn_ns_rows else set()
 
@@ -179,25 +181,27 @@ def main():
             g["instances"].update(inst_ns)
             g["time_series"] += no_svc
 
-    # ---- SERVICE_ID WITHOUT TEAM ----
     log.info("Обработка service_id без team...")
 
-    q_svc_no_team = 'count by (service_id) ({team="", service_id!=""})'
+    q_svc_no_team = f'count by (service_id) (last_over_time({{team="", service_id!=""}}[{ACTIVE_WINDOW}]))'
     svc_no_team_rows = safe_query(prom, q_svc_no_team)
     svc_no_team_ids = {r["metric"].get("service_id") for r in svc_no_team_rows} if svc_no_team_rows else set()
 
     for service_id in sorted(svc_no_team_ids):
+        if not service_id:
+            continue
+
         log.info(f"[<none>-SVC] {service_id}")
 
-        q_series = f'count({{team="", service_id="{service_id}"}})'
+        q_series = f'count(last_over_time({{team="", service_id="{service_id}"}}[{ACTIVE_WINDOW}]))'
         res_series = safe_query(prom, q_series)
         time_series_count = int(res_series[0]["value"][1]) if res_series else 0
 
-        q_instances = f'count by (instance) ({{team="", service_id="{service_id}"}})'
+        q_instances = f'count by (instance) (last_over_time({{team="", service_id="{service_id}"}}[{ACTIVE_WINDOW}]))'
         inst_rows = safe_query(prom, q_instances)
         inst_list = {r["metric"].get("instance", "<none>") for r in inst_rows} if inst_rows else set()
 
-        q_metrics = f'count by (__name__) ({{team="", service_id="{service_id}"}})'
+        q_metrics = f'count by (__name__) (last_over_time({{team="", service_id="{service_id}"}}[{ACTIVE_WINDOW}]))'
         mn_rows = safe_query(prom, q_metrics)
         metric_names = {r["metric"].get("__name__", "<noname>") for r in mn_rows} if mn_rows else set()
 
@@ -207,21 +211,20 @@ def main():
         g["instances"].update(inst_list)
         g["time_series"] += time_series_count
 
-    # ---- UNLABELED ----
     log.info("Обработка полностью неразмеченных...")
 
-    q_unlabeled = 'count({team="", service_id=""})'
+    q_unlabeled = f'count(last_over_time({{team="", service_id=""}}[{ACTIVE_WINDOW}]))'
     unlabeled_res = safe_query(prom, q_unlabeled)
     unlabeled_series = int(unlabeled_res[0]["value"][1]) if unlabeled_res else 0
 
     if unlabeled_series > 0:
         log.info(f"[unlabeled] time_series: {unlabeled_series}")
 
-        q_inst_unl = 'count by (instance) ({team="", service_id=""})'
+        q_inst_unl = f'count by (instance) (last_over_time({{team="", service_id=""}}[{ACTIVE_WINDOW}]))'
         inst_unl_rows = safe_query(prom, q_inst_unl)
         inst_unl = {r["metric"].get("instance", "<none>") for r in inst_unl_rows} if inst_unl_rows else set()
 
-        q_mn_unl = 'count by (__name__) ({team="", service_id=""})'
+        q_mn_unl = f'count by (__name__) (last_over_time({{team="", service_id=""}}[{ACTIVE_WINDOW}]))'
         mn_unl_rows = safe_query(prom, q_mn_unl)
         mn_unl = {r["metric"].get("__name__", "<noname>") for r in mn_unl_rows} if mn_unl_rows else set()
 
@@ -230,17 +233,10 @@ def main():
         g["instances"].update(inst_unl)
         g["time_series"] += unlabeled_series
 
-    # ---------- WRITE GROUP SHEET ----------
     log.info("Запись листа team_service_metrics...")
 
     sheet_groups = workbook.add_worksheet("team_service_metrics")
-    headers_groups = [
-        "team_service",
-        "metric_names",
-        "time_series",
-        "instances_count",
-        "instances_list",
-    ]
+    headers_groups = ["team_service", "metric_names", "time_series", "instances_count", "instances_list"]
     for col, name in enumerate(headers_groups):
         sheet_groups.write(0, col, name)
 
@@ -254,7 +250,6 @@ def main():
         sheet_groups.write(row, 4, ", ".join(sorted(data["instances"])))
         row += 1
 
-    # ---------- SUMMARY ----------
     log.info("Формирование summary...")
 
     sheet_summary = workbook.add_worksheet("summary")
@@ -267,9 +262,8 @@ def main():
     all_service_ids = set()
     total_time_series_sum = 0
 
-    # job-данные
     for job in jobs:
-        q = f'count by (__name__) ({{job="{job}"}})'
+        q = f'count by (__name__) (last_over_time({{job="{job}"}}[{ACTIVE_WINDOW}]))'
         res = safe_query(prom, q)
         if res:
             for r in res:
@@ -281,7 +275,6 @@ def main():
         instances = get_instances_for_job(prom, job)
         all_instances.update(instances)
 
-    # group-данные
     for group_name, data in groups.items():
         all_instances.update(data["instances"])
         all_metric_names.update(data["metric_names"])
@@ -309,10 +302,9 @@ def main():
         sheet_summary.write_number(row_s, 1, v)
         row_s += 1
 
-    # ---------- FINAL ----------
-    log.info("Сохранение файла job_metrics.xlsx...")
+    log.info(f"Сохранение файла {OUTPUT_FILE}...")
     workbook.close()
-    log.info("✔ Готово. Файл job_metrics.xlsx создан.")
+    log.info(f"✔ Готово. Файл {OUTPUT_FILE} создан.")
 
 
 if __name__ == "__main__":
