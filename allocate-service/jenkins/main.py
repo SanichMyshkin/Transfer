@@ -245,18 +245,28 @@ def split_unmatched_into_tech_and_fired(unmatched):
     tech = []
     fired = []
 
-    def is_full_cyrillic_fio(name: str) -> bool:
+    def is_cyrillic_fio(name: str) -> bool:
         name = (name or "").strip()
         parts = name.split()
         if len(parts) < 2:
             return False
         return all(re.fullmatch(r"[А-Яа-яЁё]+", p) for p in parts)
 
+    def is_latin_name(name: str) -> bool:
+        name = (name or "").strip()
+        if not name:
+            return False
+        return bool(re.search(r"[A-Za-z]", name))
+
     for u in unmatched:
         name = (u.get("fullName") or "").strip()
         login = (u.get("id") or "").strip()
 
-        if is_full_cyrillic_fio(name):
+        if is_latin_name(name):
+            tech.append(u)
+            continue
+
+        if is_cyrillic_fio(name):
             fired.append(u)
             continue
 
@@ -379,11 +389,14 @@ def main():
         users = get_users()
         jobs = get_jobs()
         nodes = get_nodes()
+
         bk_users = load_bk_users()
         bk_matched, bk_unmatched = match_jenkins_with_bk(users, bk_users)
         bk_tech, bk_fired = split_unmatched_into_tech_and_fired(bk_unmatched)
+
         ad_group_members = fetch_ldap_group_members()
         user_ad_match = match_jenkins_to_ad(users, ad_group_members)
+
         write_excel(users, jobs, nodes, ad_group_members, user_ad_match, bk_matched, bk_tech, bk_fired)
         logger.info("Инвентаризация завершена успешно.")
     except Exception as e:
