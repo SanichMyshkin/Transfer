@@ -1,6 +1,7 @@
 import os
 import re
 import logging
+import urllib3
 from dotenv import load_dotenv
 
 import hvac
@@ -12,18 +13,13 @@ load_dotenv()
 VAULT_ADDR = os.getenv("VAULT_ADDR")
 VAULT_TOKEN = os.getenv("VAULT_TOKEN")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("vault_kv_report")
 
 
-def get_vault_metrics_prometheus() -> str | None:
-    """
-    Получаем метрики Vault в формате Prometheus.
-    Обычно работает /v1/sys/metrics?format=prometheus.
-    """
+def get_vault_metrics_prometheus():
     url = f"{VAULT_ADDR}/v1/sys/metrics?format=prometheus"
     try:
         r = requests.get(url, verify=False, timeout=20)
@@ -34,13 +30,14 @@ def get_vault_metrics_prometheus() -> str | None:
         return None
 
 
-def parse_kv_metrics(metrics_text: str):
-    """
-    Ищем метрику вида:
-      vault_secret_kv_count{...,mount_point="kv/",...} 123
+def make_code(mount: str) -> str:
+    m = (mount or "").rstrip("/")
+    if m.startswith("kv-"):
+        m = m[3:]
+    return m
 
-    Разные версии могут писать через '_'/' ' — делаем regex гибким.
-    """
+
+def parse_kv_metrics(metrics_text: str):
     pattern = re.compile(
         r'vault[_\s]*secret[_\s]*kv[_\s]*count\s*\{[^}]*mount_point="([^"]+)"[^}]*\}\s+(\d+)',
         re.IGNORECASE,
@@ -48,19 +45,19 @@ def parse_kv_metrics(metrics_text: str):
 
     rows = []
     total = 0
+
     for m in pattern.finditer(metrics_text):
-        mount = (m.group(1) or "").rstrip("/")  # kv/ -> kv
+        mount = (m.group(1) or "").rstrip("/")
+        if "test" in mount.lower():
+            continue
         count = int(m.group(2))
-        rows.append({"kv": mount, "count": count})
+        rows.append({"kv": mount, "code": make_code(mount), "count": count})
         total += count
 
-    # Проценты
     for r in rows:
         r["percent"] = (r["count"] / total * 100.0) if total else 0.0
 
-    # Сортировка по убыванию кол-ва секретов
     rows.sort(key=lambda x: x["count"], reverse=True)
-
     return rows, total
 
 
@@ -68,36 +65,35 @@ def write_excel_one_sheet(filename: str, rows, total: int):
     wb = xlsxwriter.Workbook(filename)
     ws = wb.add_worksheet("KV")
 
-    # Форматы
     fmt_header = wb.add_format({"bold": True})
     fmt_int = wb.add_format({"num_format": "0"})
     fmt_pct = wb.add_format({"num_format": "0.00%"})
     fmt_bold = wb.add_format({"bold": True})
 
-    # Колонки (одна “страница” / один лист)
-    ws.write(0, 0, "KV mount", fmt_header)
-    ws.write(0, 1, "Secrets", fmt_header)
-    ws.write(0, 2, "% of total", fmt_header)
+    ws.write(0, 0, "kv", fmt_header)
+    ws.write(0, 1, "code", fmt_header)
+    ws.write(0, 2, "secrets", fmt_header)
+    ws.write(0, 3, "%", fmt_header)
 
-    # Данные
     for i, r in enumerate(rows, start=1):
         ws.write(i, 0, r["kv"])
-        ws.write_number(i, 1, r["count"], fmt_int)
-        ws.write_number(i, 2, r["percent"] / 100.0, fmt_pct)  # xlsx проценты = доля
+        ws.write(i, 1, r["code"])
+        ws.write_number(i, 2, r["count"], fmt_int)
+        ws.write_number(i, 3, r["percent"] / 100.0, fmt_pct)
 
-    # Итого
     last_row = len(rows) + 2
     ws.write(last_row, 0, "TOTAL", fmt_bold)
-    ws.write_number(last_row, 1, total, fmt_bold)
-    ws.write_number(last_row, 2, 1.0 if total else 0.0, fmt_bold)  # 100%
+    ws.write(last_row, 2, total, fmt_bold)
+    ws.write_number(last_row, 3, 1.0 if total else 0.0, fmt_bold)
 
-    # Авто-ширина + “влезть на 1 страницу при печати”
     ws.set_column(0, 0, 35)
-    ws.set_column(1, 1, 12)
+    ws.set_column(1, 1, 25)
     ws.set_column(2, 2, 12)
+    ws.set_column(3, 3, 10)
+
     ws.freeze_panes(1, 0)
     ws.set_landscape()
-    ws.fit_to_pages(1, 1)  # 1 страница по ширине и высоте
+    ws.fit_to_pages(1, 1)
 
     wb.close()
     log.info(f"Excel сохранён: {filename}")
@@ -107,7 +103,7 @@ def main():
     if not VAULT_ADDR or not VAULT_TOKEN:
         raise SystemExit("Не заданы VAULT_ADDR или VAULT_TOKEN")
 
-    client = hvac.Client(url=VAULT_ADDR, token=VAULT_TOKEN, verify=CA_CERT)
+    client = hvac.Client(url=VAULT_ADDR, token=VAULT_TOKEN, verify=False)
     if not client.is_authenticated():
         raise SystemExit("Не удалось аутентифицироваться в Vault")
 
@@ -116,9 +112,9 @@ def main():
         raise SystemExit("Не удалось получить метрики Vault")
 
     rows, total = parse_kv_metrics(metrics)
-    log.info(f"KV-монтов: {len(rows)}, секретов всего: {total}")
+    log.info(f"KV-монтов (без test): {len(rows)}, секретов всего (без test): {total}")
 
-    write_excel_one_sheet("vault_report.xlsx", rows, total)
+    write_excel_one_sheet("kv_usage_report.xlsx", rows, total)
 
 
 if __name__ == "__main__":
