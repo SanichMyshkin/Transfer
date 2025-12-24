@@ -4,7 +4,6 @@ import logging
 import urllib3
 
 import requests
-import hvac
 import pandas as pd
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -13,7 +12,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger("vault_kv_business_report")
 
 VAULT_ADDR = os.getenv("VAULT_ADDR")
-VAULT_TOKEN = os.getenv("VAULT_TOKEN")
 
 
 def get_vault_metrics_prometheus() -> str:
@@ -43,13 +41,7 @@ def parse_kv_metrics_to_df(metrics_text: str) -> pd.DataFrame:
     total = df["secrets"].sum()
     df["percent"] = (df["secrets"] / total) * 100 if total else 0.0
 
-    df["code"] = (
-        df["kv"]
-        .astype(str)
-        .str.replace(r"/$", "", regex=True)
-        .str.extract(r"(\d+)$", expand=False)
-    )
-
+    df["code"] = df["kv"].astype(str).str.extract(r"(\d+)$", expand=False)
     df = df[df["code"].notna()].copy()
     df["code"] = df["code"].astype(str)
 
@@ -60,42 +52,30 @@ def parse_kv_metrics_to_df(metrics_text: str) -> pd.DataFrame:
 def read_business_df(path: str) -> pd.DataFrame:
     b = pd.read_excel(path, sheet_name=0, header=None)
 
-    # A=0 (имя сервиса), B=1 (код), E=4 (тип бизнеса)
     b = b.iloc[:, [0, 1, 4]].copy()
     b.columns = ["service_name", "code", "business_type"]
 
-    b["code"] = (
-        b["code"]
-        .astype(str)
-        .str.strip()
-        .str.extract(r"(\d+)", expand=False)
-    )
+    b["code"] = b["code"].astype(str).str.extract(r"(\d+)", expand=False)
     b = b[b["code"].notna()].copy()
     b["code"] = b["code"].astype(str)
 
-    b = b.drop_duplicates(subset=["code"], keep="first")
-    return b
+    return b.drop_duplicates(subset=["code"], keep="first")
 
 
 def main():
-    if not VAULT_ADDR or not VAULT_TOKEN:
-        raise SystemExit("Не заданы VAULT_ADDR или VAULT_TOKEN")
-
-    client = hvac.Client(url=VAULT_ADDR, token=VAULT_TOKEN, verify=False)
-    if not client.is_authenticated():
-        raise SystemExit("Не удалось аутентифицироваться в Vault")
+    if not VAULT_ADDR:
+        raise SystemExit("Не задан VAULT_ADDR")
 
     metrics = get_vault_metrics_prometheus()
     kv_df = parse_kv_metrics_to_df(metrics)
 
     if kv_df.empty:
-        raise SystemExit("Нет данных KV после фильтров (test / парсинг метрик).")
+        raise SystemExit("Нет данных KV после фильтрации")
 
     business_df = read_business_df("business.xlsx")
 
     out = kv_df.merge(business_df, on="code", how="left")
-
-    out = out[["kv", "code", "secrets", "percent", "service_name", "business_type"]].copy()
+    out = out[["kv", "code", "secrets", "percent", "service_name", "business_type"]]
     out["percent"] = out["percent"].round(2)
 
     out.to_excel("kv_usage_report.xlsx", index=False, sheet_name="KV")
