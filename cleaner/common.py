@@ -38,11 +38,11 @@ def get_matching_rule(
 ):
     import re
 
-    version_lower = version.lower()
+    #version_lower = version #version.lower()
     matched_rules = []
 
     for pattern, rules in regex_rules.items():
-        if re.match(pattern, version_lower):
+        if re.match(pattern, version):
             matched_rules.append((pattern, rules))
 
     if matched_rules:
