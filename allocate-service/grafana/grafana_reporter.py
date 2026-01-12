@@ -2,9 +2,8 @@ import os
 import re
 import time
 import logging
-from unidecode import (
-    unidecode,
-)  # для тире нужен, потому что кто-то использует вордовское тире в названии
+import unicodedata
+
 import pandas as pd
 import requests
 from dotenv import load_dotenv
@@ -24,9 +23,7 @@ SLEEP_BETWEEN_CALLS = 0.2
 
 logger = logging.getLogger("grafana_usage_report")
 logger.setLevel(logging.INFO)
-fmt = logging.Formatter(
-    "%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S"
-)
+fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S")
 handler = logging.StreamHandler()
 handler.setFormatter(fmt)
 logger.addHandler(handler)
@@ -110,18 +107,21 @@ def get_dashboard_panels(uid):
 
 
 def split_org_name(raw: str):
-    s = unidecode(raw).strip()
-    idx = s.rfind("-")
-    if idx == -1:
+    s = raw.strip()
+    m = re.search(r"(\d+)\s*$", s)
+    if not m:
         return s, ""
-
-    name = s[:idx].strip()
-    tail = s[idx + 1 :].strip()
-
-    if tail.isdigit():
-        return name, tail
-
-    return raw.strip(), ""
+    number = m.group(1)
+    i = m.start()
+    j = i - 1
+    while j >= 0:
+        ch = s[j]
+        if ch.isspace() or unicodedata.category(ch) == "Pd":
+            j -= 1
+            continue
+        break
+    name = s[: j + 1].strip()
+    return name, number
 
 
 def normalize_number(x):
@@ -149,21 +149,24 @@ def load_business_mapping(path):
     map_by_name = {}
 
     for _, row in df_b.iterrows():
-        num = normalize_number(row.iloc[1])  # колонка B
-        name = normalize_name(row.iloc[3])  # колонка D
-        biz_type = row.iloc[4]  # колонка E
+        num = normalize_number(row.iloc[1])     # B
+        sd_name_raw = row.iloc[3]               # D
+        biz_type = row.iloc[4]                  # E
 
-        if pd.isna(biz_type):
+        if pd.isna(biz_type) and pd.isna(sd_name_raw):
             continue
 
-        bt = str(biz_type).strip()
+        bt = None if pd.isna(biz_type) else str(biz_type).strip()
+        sd_name = None if pd.isna(sd_name_raw) else str(sd_name_raw).strip()
+        key_name = normalize_name(sd_name_raw)
+
         if num:
-            map_by_number[num] = bt
-        if name:
-            map_by_name[name] = bt
+            map_by_number[num] = (bt, sd_name)
+        if key_name:
+            map_by_name[key_name] = (bt, sd_name)
 
     logger.info(
-        f"Загружено типов бизнеса из SD-портала: по номеру={len(map_by_number)}, по имени={len(map_by_name)}"
+        f"Загружено записей из SD-портала: по номеру={len(map_by_number)}, по имени={len(map_by_name)}"
     )
     return map_by_number, map_by_name
 
@@ -186,22 +189,25 @@ def main():
         norm_name = normalize_name(org_name)
 
         biz_type = None
+        sd_name = None
         source = None
 
         if norm_number and norm_number in map_by_number:
-            biz_type = map_by_number[norm_number]
+            biz_type, sd_name = map_by_number[norm_number]
             source = "номер"
         elif norm_name and norm_name in map_by_name:
-            biz_type = map_by_name[norm_name]
+            biz_type, sd_name = map_by_name[norm_name]
             source = "имя"
 
         if not switch_org(org_id):
             logger.warning(
-                f'Нет доступа к организации {org_id}: "{raw_org_name}". Тип бизнеса: {biz_type or "не определён"}'
+                f'Нет доступа к организации {org_id}: "{raw_org_name}". '
+                f'Тип бизнеса: {biz_type or "не определён"}, имя в SD: {sd_name or "не найдено"}'
             )
             rows_orgs.append(
                 {
                     "Тип бизнеса": biz_type,
+                    "Наименование в SD": sd_name,
                     "Наименование сервиса": org_name,
                     "Номер": "NO ACCESS",
                     "Кол-во дашбордов": "NO ACCESS",
@@ -231,18 +237,19 @@ def main():
             logger.info(
                 f'Организация {org_id}: "{org_name}" ({org_number}) — '
                 f"дашбордов={dashboards_total}, панелей={panels_total}, "
-                f'тип бизнеса="{biz_type}" (найден по {source} в SD-портале)'
+                f'тип бизнеса="{biz_type}", имя в SD="{sd_name}" (найдено по {source})'
             )
         else:
             logger.info(
                 f'Организация {org_id}: "{org_name}" ({org_number}) — '
                 f"дашбордов={dashboards_total}, панелей={panels_total}, "
-                "тип бизнеса не найден в SD-портале"
+                "тип бизнеса и имя в SD не найдены"
             )
 
         rows_orgs.append(
             {
                 "Тип бизнеса": biz_type,
+                "Наименование в SD": sd_name,
                 "Наименование сервиса": org_name,
                 "Номер": org_number,
                 "Кол-во дашбордов": dashboards_total,
@@ -257,9 +264,7 @@ def main():
         if isinstance(p, int):
             total_panels += p
 
-    logger.info(
-        f"Общее количество панелей по всем доступным организациям: {total_panels}"
-    )
+    logger.info(f"Общее количество панелей по всем доступным организациям: {total_panels}")
 
     for row in rows_orgs:
         p = row["Кол-во панелей"]
