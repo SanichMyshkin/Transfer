@@ -10,6 +10,9 @@ from gitlab_config_loader import get_unique_org_ids
 
 load_dotenv()
 
+GRAFANA_URL = os.getenv("GRAFANA_URL")
+GRAFANA_USER = os.getenv("GRAFANA_USER")
+GRAFANA_PASS = os.getenv("GRAFANA_PASS")
 
 OUTPUT_FILE = os.getenv("OUTPUT_FILE", "grafana_usage_report.xlsx")
 ORG_LIMIT = int(os.getenv("ORG_LIMIT", "100"))
