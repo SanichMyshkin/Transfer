@@ -107,16 +107,20 @@ def get_dashboard_panels(uid):
 
 def split_org_name(raw: str):
     s = raw.strip()
-    idx = s.rfind("-")
-    if idx == -1:
+
+    # Ищем число в конце строки
+    m = re.search(r"(\d+)\s*$", s)
+    if not m:
         return s, ""
 
-    name = s[:idx].strip()
-    tail = s[idx+1:].strip()
+    number = m.group(1)
 
-    if tail.isdigit():
-        return name, tail
-    return s, ""
+    # Всё, что до числа — имя (без хвостового тире/пробелов)
+    name_part = s[:m.start()]
+    name = name_part.rstrip(" -–—‒―\u2010\u2011\u2012\u2013\u2014\u2015").rstrip()
+
+    return name, number
+
 
 
 
