@@ -2,7 +2,9 @@ import os
 import re
 import time
 import logging
-
+from unidecode import (
+    unidecode,
+)  # для тире нужен, потому что кто-то использует вордовское тире в названии
 import pandas as pd
 import requests
 from dotenv import load_dotenv
@@ -22,7 +24,9 @@ SLEEP_BETWEEN_CALLS = 0.2
 
 logger = logging.getLogger("grafana_usage_report")
 logger.setLevel(logging.INFO)
-fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S")
+fmt = logging.Formatter(
+    "%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S"
+)
 handler = logging.StreamHandler()
 handler.setFormatter(fmt)
 logger.addHandler(handler)
@@ -106,22 +110,18 @@ def get_dashboard_panels(uid):
 
 
 def split_org_name(raw: str):
-    s = raw.strip()
-
-    # Ищем число в конце строки
-    m = re.search(r"(\d+)\s*$", s)
-    if not m:
+    s = unidecode(raw).strip()
+    idx = s.rfind("-")
+    if idx == -1:
         return s, ""
 
-    number = m.group(1)
+    name = s[:idx].strip()
+    tail = s[idx + 1 :].strip()
 
-    # Всё, что до числа — имя (без хвостового тире/пробелов)
-    name_part = s[:m.start()]
-    name = name_part.rstrip(" -–—‒―\u2010\u2011\u2012\u2013\u2014\u2015").rstrip()
+    if tail.isdigit():
+        return name, tail
 
-    return name, number
-
-
+    return raw.strip(), ""
 
 
 def normalize_number(x):
@@ -149,9 +149,9 @@ def load_business_mapping(path):
     map_by_name = {}
 
     for _, row in df_b.iterrows():
-        num = normalize_number(row.iloc[1])   # колонка B
-        name = normalize_name(row.iloc[3])    # колонка D
-        biz_type = row.iloc[4]                # колонка E
+        num = normalize_number(row.iloc[1])  # колонка B
+        name = normalize_name(row.iloc[3])  # колонка D
+        biz_type = row.iloc[4]  # колонка E
 
         if pd.isna(biz_type):
             continue
@@ -257,7 +257,9 @@ def main():
         if isinstance(p, int):
             total_panels += p
 
-    logger.info(f"Общее количество панелей по всем доступным организациям: {total_panels}")
+    logger.info(
+        f"Общее количество панелей по всем доступным организациям: {total_panels}"
+    )
 
     for row in rows_orgs:
         p = row["Кол-во панелей"]
