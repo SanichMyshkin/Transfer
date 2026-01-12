@@ -1,11 +1,13 @@
 import os
+import re
 import time
 import logging
-import requests
+
 import pandas as pd
-import re
+import requests
 from dotenv import load_dotenv
 from tqdm import tqdm
+
 from gitlab_config_loader import get_unique_org_ids
 
 load_dotenv()
@@ -14,16 +16,14 @@ GRAFANA_URL = os.getenv("GRAFANA_URL")
 GRAFANA_USER = os.getenv("GRAFANA_USER")
 GRAFANA_PASS = os.getenv("GRAFANA_PASS")
 ORG_LIMIT = int(os.getenv("ORG_LIMIT", "5"))
-BUSINESS_FILE = os.getenv("BUSINESS_FILE", "business.xlsx")
+BUSINESS_FILE = os.getenv("BUSINESS_FILE", "buisness.xlsx")
 
 SLEEP_AFTER_SWITCH = 1
 SLEEP_BETWEEN_CALLS = 0.2
 
 logger = logging.getLogger("grafana_usage_report")
 logger.setLevel(logging.INFO)
-fmt = logging.Formatter(
-    "%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S"
-)
+fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S")
 handler = logging.StreamHandler()
 handler.setFormatter(fmt)
 logger.addHandler(handler)
@@ -119,58 +119,72 @@ def split_org_name(raw):
 
 
 def normalize_number(x):
-    """Приводим номер к строке для сопоставления (7704, '7704.0', '7704' -> '7704')."""
     if pd.isna(x):
         return None
     s = str(x).strip()
-    # если формат типа 7704.0
     if re.fullmatch(r"\d+\.0+", s):
         s = s.split(".", 1)[0]
     return s
 
 
-def load_business_mapping(path: str) -> dict:
-    """
-    Читаем business.xlsx и строим мапу:
-    колонка B (индекс 1) -> колонка E (индекс 4).
-    """
+def normalize_name(x):
+    if pd.isna(x):
+        return None
+    return str(x).strip().casefold()
+
+
+def load_business_mapping(path):
     if not os.path.exists(path):
         logger.warning(f"Файл {path} не найден, тип бизнеса подставлен не будет")
-        return {}
+        return {}, {}
 
     df_b = pd.read_excel(path)
-    mapping = {}
+    map_by_number = {}
+    map_by_name = {}
 
     for _, row in df_b.iterrows():
-        num = normalize_number(row.iloc[1])   # колонка B
-        biz_type = row.iloc[4]               # колонка E
-        if num and not pd.isna(biz_type):
-            mapping[num] = str(biz_type).strip()
+        num = normalize_number(row.iloc[1])
+        name = normalize_name(row.iloc[3])
+        biz_type = row.iloc[4]
 
-    return mapping
+        if pd.isna(biz_type):
+            continue
+
+        bt = str(biz_type).strip()
+        if num:
+            map_by_number[num] = bt
+        if name:
+            map_by_name[name] = bt
+
+    return map_by_number, map_by_name
 
 
 def main():
     login_cookie()
 
-    # мапа номер -> тип бизнеса из business.xlsx
-    business_map = load_business_mapping(BUSINESS_FILE)
-
+    map_by_number, map_by_name = load_business_mapping(BUSINESS_FILE)
     org_ids = sorted(get_unique_org_ids())[:ORG_LIMIT]
     rows_orgs = []
 
     for org_id in tqdm(org_ids, desc="Организации"):
         raw_org_name = get_org_name(org_id)
         org_name, org_number = split_org_name(raw_org_name)
+
         norm_number = normalize_number(org_number)
-        biz_type = business_map.get(norm_number)
+        norm_name = normalize_name(org_name)
+
+        biz_type = None
+        if norm_number and norm_number in map_by_number:
+            biz_type = map_by_number[norm_number]
+        elif norm_name and norm_name in map_by_name:
+            biz_type = map_by_name[norm_name]
 
         if not switch_org(org_id):
             rows_orgs.append(
                 {
                     "Тип бизнеса": biz_type,
                     "Наименование сервиса": org_name,
-                    "Номер": org_number if org_number else "NO ACCESS",
+                    "Номер": "NO ACCESS",
                     "Кол-во дашбордов": "NO ACCESS",
                     "Кол-во панелей": "NO ACCESS",
                     "Потребление в %": None,
@@ -205,14 +219,12 @@ def main():
             }
         )
 
-    # считаем общий объём только по панелям
     total_panels = 0
     for row in rows_orgs:
         p = row["Кол-во панелей"]
         if isinstance(p, int):
             total_panels += p
 
-    # проценты тоже только по панелям
     for row in rows_orgs:
         p = row["Кол-во панелей"]
         if isinstance(p, int) and total_panels > 0:
