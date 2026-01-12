@@ -3,7 +3,7 @@ import time
 import logging
 import requests
 import pandas as pd
-
+import re
 from dotenv import load_dotenv
 from tqdm import tqdm
 from gitlab_config_loader import get_unique_org_ids
@@ -13,9 +13,8 @@ load_dotenv()
 GRAFANA_URL = os.getenv("GRAFANA_URL")
 GRAFANA_USER = os.getenv("GRAFANA_USER")
 GRAFANA_PASS = os.getenv("GRAFANA_PASS")
-
-OUTPUT_FILE = os.getenv("OUTPUT_FILE", "grafana_usage_report.xlsx")
-ORG_LIMIT = int(os.getenv("ORG_LIMIT", "100"))
+ORG_LIMIT = int(os.getenv("ORG_LIMIT", "5"))
+BUSINESS_FILE = os.getenv("BUSINESS_FILE", "business.xlsx")
 
 SLEEP_AFTER_SWITCH = 1
 SLEEP_BETWEEN_CALLS = 0.2
@@ -106,24 +105,75 @@ def get_dashboard_panels(uid):
     return count
 
 
+def split_org_name(raw):
+    s = raw.strip()
+    m = re.search(r"-\s*(\d+)$", s)
+    if m:
+        name = s[: m.start()].strip()
+        number = m.group(1)
+        return name, number
+    if "-" in s:
+        name, number = s.rsplit("-", 1)
+        return name.strip(), number.strip()
+    return s, ""
+
+
+def normalize_number(x):
+    """Приводим номер к строке для сопоставления (7704, '7704.0', '7704' -> '7704')."""
+    if pd.isna(x):
+        return None
+    s = str(x).strip()
+    # если формат типа 7704.0
+    if re.fullmatch(r"\d+\.0+", s):
+        s = s.split(".", 1)[0]
+    return s
+
+
+def load_business_mapping(path: str) -> dict:
+    """
+    Читаем business.xlsx и строим мапу:
+    колонка B (индекс 1) -> колонка E (индекс 4).
+    """
+    if not os.path.exists(path):
+        logger.warning(f"Файл {path} не найден, тип бизнеса подставлен не будет")
+        return {}
+
+    df_b = pd.read_excel(path)
+    mapping = {}
+
+    for _, row in df_b.iterrows():
+        num = normalize_number(row.iloc[1])   # колонка B
+        biz_type = row.iloc[4]               # колонка E
+        if num and not pd.isna(biz_type):
+            mapping[num] = str(biz_type).strip()
+
+    return mapping
+
+
 def main():
     login_cookie()
 
-    org_ids = sorted(get_unique_org_ids())[:ORG_LIMIT]
+    # мапа номер -> тип бизнеса из business.xlsx
+    business_map = load_business_mapping(BUSINESS_FILE)
 
+    org_ids = sorted(get_unique_org_ids())[:ORG_LIMIT]
     rows_orgs = []
 
     for org_id in tqdm(org_ids, desc="Организации"):
-        org_name = get_org_name(org_id)
+        raw_org_name = get_org_name(org_id)
+        org_name, org_number = split_org_name(raw_org_name)
+        norm_number = normalize_number(org_number)
+        biz_type = business_map.get(norm_number)
 
         if not switch_org(org_id):
             rows_orgs.append(
                 {
-                    "organization": org_name,
-                    "org_id": org_id,
-                    "dashboards_total": "NO ACCESS",
-                    "panels_total": "NO ACCESS",
-                    "usage_percent": None,
+                    "Тип бизнеса": biz_type,
+                    "Наименование сервиса": org_name,
+                    "Номер": org_number if org_number else "NO ACCESS",
+                    "Кол-во дашбордов": "NO ACCESS",
+                    "Кол-во панелей": "NO ACCESS",
+                    "Потребление в %": None,
                 }
             )
             continue
@@ -135,7 +185,6 @@ def main():
         for f in folders:
             dashboards = get_dashboards_in_folder(f["id"])
             dashboards_total += len(dashboards)
-
             for d in dashboards:
                 panels = get_dashboard_panels(d["uid"])
                 panels_total += panels
@@ -147,35 +196,36 @@ def main():
 
         rows_orgs.append(
             {
-                "organization": org_name,
-                "org_id": org_id,
-                "dashboards_total": dashboards_total,
-                "panels_total": panels_total,
-                "usage_percent": None,
+                "Тип бизнеса": biz_type,
+                "Наименование сервиса": org_name,
+                "Номер": org_number,
+                "Кол-во дашбордов": dashboards_total,
+                "Кол-во панелей": panels_total,
+                "Потребление в %": None,
             }
         )
 
-    total_resources = 0
+    # считаем общий объём только по панелям
+    total_panels = 0
     for row in rows_orgs:
-        d = row["dashboards_total"]
-        p = row["panels_total"]
-        if isinstance(d, int) and isinstance(p, int):
-            total_resources += d + p
+        p = row["Кол-во панелей"]
+        if isinstance(p, int):
+            total_panels += p
 
+    # проценты тоже только по панелям
     for row in rows_orgs:
-        d = row["dashboards_total"]
-        p = row["panels_total"]
-        if isinstance(d, int) and isinstance(p, int) and total_resources > 0:
-            resources = d + p
-            row["usage_percent"] = round(resources / total_resources * 100, 2)
+        p = row["Кол-во панелей"]
+        if isinstance(p, int) and total_panels > 0:
+            row["Потребление в %"] = round(p / total_panels * 100, 2)
         else:
-            row["usage_percent"] = None
+            row["Потребление в %"] = None
 
     df = pd.DataFrame(rows_orgs)
-    with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
-        df.to_excel(writer, sheet_name="OrgUsage", index=False)
 
-    logger.info(f"Готово. Файл сохранён: {OUTPUT_FILE}")
+    with pd.ExcelWriter("grafana_report.xlsx", engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="Отчет", index=False)
+
+    logger.info("Готово. Файл сохранён: grafana_report.xlsx")
 
 
 if __name__ == "__main__":
