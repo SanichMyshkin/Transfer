@@ -6,7 +6,6 @@ import logging
 import pandas as pd
 import requests
 from dotenv import load_dotenv
-from tqdm import tqdm
 
 from gitlab_config_loader import get_unique_org_ids
 
@@ -40,6 +39,7 @@ def login_cookie():
     )
     r.raise_for_status()
     time.sleep(SLEEP_BETWEEN_CALLS)
+    logger.info("Успешный логин в Grafana")
 
 
 def switch_org(org_id):
@@ -143,9 +143,9 @@ def load_business_mapping(path):
     map_by_name = {}
 
     for _, row in df_b.iterrows():
-        num = normalize_number(row.iloc[1])
-        name = normalize_name(row.iloc[3])
-        biz_type = row.iloc[4]
+        num = normalize_number(row.iloc[1])   # колонка B
+        name = normalize_name(row.iloc[3])    # колонка D
+        biz_type = row.iloc[4]                # колонка E
 
         if pd.isna(biz_type):
             continue
@@ -156,17 +156,23 @@ def load_business_mapping(path):
         if name:
             map_by_name[name] = bt
 
+    logger.info(
+        f"Загружено типов бизнеса из SD-портала: по номеру={len(map_by_number)}, по имени={len(map_by_name)}"
+    )
     return map_by_number, map_by_name
 
 
 def main():
+    logger.info("Старт формирования отчёта по использованию Grafana")
     login_cookie()
 
     map_by_number, map_by_name = load_business_mapping(BUSINESS_FILE)
     org_ids = sorted(get_unique_org_ids())[:ORG_LIMIT]
+    logger.info(f"Будет обработано организаций: {len(org_ids)}")
+
     rows_orgs = []
 
-    for org_id in tqdm(org_ids, desc="Организации"):
+    for org_id in org_ids:
         raw_org_name = get_org_name(org_id)
         org_name, org_number = split_org_name(raw_org_name)
 
@@ -174,12 +180,19 @@ def main():
         norm_name = normalize_name(org_name)
 
         biz_type = None
+        source = None
+
         if norm_number and norm_number in map_by_number:
             biz_type = map_by_number[norm_number]
+            source = "номер"
         elif norm_name and norm_name in map_by_name:
             biz_type = map_by_name[norm_name]
+            source = "имя"
 
         if not switch_org(org_id):
+            logger.warning(
+                f'Нет доступа к организации {org_id}: "{raw_org_name}". Тип бизнеса: {biz_type or "не определён"}'
+            )
             rows_orgs.append(
                 {
                     "Тип бизнеса": biz_type,
@@ -208,6 +221,19 @@ def main():
             panels_total += panels
             dashboards_total += 1
 
+        if biz_type:
+            logger.info(
+                f'Организация {org_id}: "{org_name}" ({org_number}) — '
+                f"дашбордов={dashboards_total}, панелей={panels_total}, "
+                f'тип бизнеса="{biz_type}" (найден по {source} в SD-портале)'
+            )
+        else:
+            logger.info(
+                f'Организация {org_id}: "{org_name}" ({org_number}) — '
+                f"дашбордов={dashboards_total}, панелей={panels_total}, "
+                "тип бизнеса не найден в SD-портале"
+            )
+
         rows_orgs.append(
             {
                 "Тип бизнеса": biz_type,
@@ -225,6 +251,8 @@ def main():
         if isinstance(p, int):
             total_panels += p
 
+    logger.info(f"Общее количество панелей по всем доступным организациям: {total_panels}")
+
     for row in rows_orgs:
         p = row["Кол-во панелей"]
         if isinstance(p, int) and total_panels > 0:
@@ -234,10 +262,11 @@ def main():
 
     df = pd.DataFrame(rows_orgs)
 
-    with pd.ExcelWriter("grafana_report.xlsx", engine="openpyxl") as writer:
+    output_file = "grafana_report.xlsx"
+    with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
         df.to_excel(writer, sheet_name="Отчет", index=False)
 
-    logger.info("Готово. Файл сохранён: grafana_report.xlsx")
+    logger.info(f"Готово. Файл сохранён: {output_file}")
 
 
 if __name__ == "__main__":
