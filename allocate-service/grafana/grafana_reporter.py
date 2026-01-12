@@ -105,17 +105,19 @@ def get_dashboard_panels(uid):
     return count
 
 
-def split_org_name(raw):
+def split_org_name(raw: str):
     s = raw.strip()
-    m = re.search(r"-\s*(\d+)$", s)
-    if m:
-        name = s[: m.start()].strip()
-        number = m.group(1)
-        return name, number
-    if "-" in s:
-        name, number = s.rsplit("-", 1)
-        return name.strip(), number.strip()
+    idx = s.rfind("-")
+    if idx == -1:
+        return s, ""
+
+    name = s[:idx].strip()
+    tail = s[idx+1:].strip()
+
+    if tail.isdigit():
+        return name, tail
     return s, ""
+
 
 
 def normalize_number(x):
