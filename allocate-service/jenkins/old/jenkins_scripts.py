@@ -1,3 +1,6 @@
+# -*- coding: utf-8 -*-
+# jenkins_scripts.py
+# --- Получение пользователей ---
 SCRIPT_USERS = """
 import hudson.model.User
 import hudson.tasks.Mailer
@@ -11,6 +14,7 @@ def userList = users.collect { u ->
 JsonOutput.toJson([users: userList, total: users.size()])
 """
 
+# --- Получение джоб ---
 SCRIPT_JOBS = """
 import jenkins.model.Jenkins
 import groovy.json.JsonOutput
@@ -40,4 +44,23 @@ def jobList = jobs.collect { j ->
     return info
 }
 JsonOutput.toJson([jobs: jobList, total: jobs.size()])
+"""
+
+# --- Получение нод ---
+SCRIPT_NODES = """
+import jenkins.model.Jenkins
+import groovy.json.JsonOutput
+
+def nodes = Jenkins.instance.nodes
+def nodeList = nodes.collect { n ->
+    [
+        name: n.displayName,
+        online: n.computer?.isOnline(),
+        executors: n.numExecutors,
+        labels: n.getLabelString(),
+        mode: n.mode?.toString(),
+        description: n.nodeDescription ?: ""
+    ]
+}
+JsonOutput.toJson([nodes: nodeList, total: nodes.size()])
 """
