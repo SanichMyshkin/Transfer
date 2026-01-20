@@ -65,11 +65,11 @@ def find_node_key(project, collected_node):
     return None
 
 
-def split_node(node_name):
-    parts = (node_name or "").rsplit("-", 1)
+def split_name_number(s):
+    parts = (s or "").rsplit("-", 1)
     if len(parts) == 2 and parts[1].isdigit():
         return parts[0], parts[1]
-    return node_name, ""
+    return s or "", ""
 
 
 def build_rows(jobs_n_builds, collected_node):
@@ -80,25 +80,25 @@ def build_rows(jobs_n_builds, collected_node):
         node_key = find_node_key(project, collected_node)
         labels = collected_node.get(node_key) if node_key else []
         labels = labels or []
+        nodes_count = len(labels)
 
         if node_key:
-            team_name, team_number = split_node(node_key)
+            team_name, team_number = split_name_number(node_key)
         else:
-            team_name = project
-            team_number = ""
-
-        nodes_count = len(labels)
+            team_name, team_number = split_name_number(project)
 
         rows.append([
             team_name,
             team_number,
+            project,
             sums.get("jobs_sum", 0),
             sums.get("build_sum", 0),
             nodes_count,
         ])
 
         logger.info(
-            f"project={project} node={node_key or '-'} nodes_count={nodes_count}"
+            f"project={project} node={node_key or '-'} nodes_count={nodes_count} "
+            f"team_name={team_name} team_number={team_number}"
         )
 
     return rows
@@ -112,6 +112,7 @@ def export_excel(rows, filename="inventory.xlsx"):
     ws.append([
         "team_name",
         "team_number",
+        "project",
         "jobs_sum",
         "build_sum",
         "nodes_count",
