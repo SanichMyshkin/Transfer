@@ -4,15 +4,12 @@ import logging
 import urllib3
 from dotenv import load_dotenv
 from collections import defaultdict
-
 from openpyxl import Workbook
 
 from jenkins_client import JenkinsGroovyClient
 from jenkins_scripts import SCRIPT_JOBS
 from jenkins_node import collect_node
 
-
-# ===== logging =====
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 formatter = logging.Formatter(
@@ -26,7 +23,6 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 load_dotenv()
 
-# ===== env =====
 JENKINS_URL = os.getenv("JENKINS_URL")
 USER = os.getenv("USER")
 TOKEN = os.getenv("TOKEN")
@@ -34,7 +30,6 @@ TOKEN = os.getenv("TOKEN")
 client = JenkinsGroovyClient(JENKINS_URL, USER, TOKEN, is_https=False)
 
 
-# ===== jobs =====
 def get_jobs():
     logger.info("Получаем джобы...")
     data = client.run_script(SCRIPT_JOBS)
@@ -44,24 +39,18 @@ def get_jobs():
 
 def get_sum_build_and_jobs(data):
     acc = defaultdict(lambda: {"jobs_sum": 0, "build_sum": 0})
-
     for j in data.get("jobs", []):
         if j.get("isFolder"):
             continue
-
         project = j.get("name", "").split("/", 1)[0]
         if not project:
             continue
-
         acc[project]["jobs_sum"] += 1
-
         if j.get("lastBuild") is not None:
             acc[project]["build_sum"] += j["lastBuild"]
-
     return dict(acc)
 
 
-# ===== matching =====
 def norm(s):
     s = (s or "").lower()
     return "".join(ch for ch in s if ch.isalnum())
@@ -76,17 +65,15 @@ def find_node_key(project, collected_node):
     return None
 
 
-def extract_team_number(node_name):
+def split_node(node_name):
     parts = (node_name or "").rsplit("-", 1)
     if len(parts) == 2 and parts[1].isdigit():
-        return parts[1]
-    return ""
+        return parts[0], parts[1]
+    return node_name, ""
 
 
-# ===== rows =====
 def build_rows(jobs_n_builds, collected_node):
     rows = []
-
     logger.info(f"Всего нод (ключей): {len(collected_node)}")
 
     for project, sums in jobs_n_builds.items():
@@ -95,53 +82,40 @@ def build_rows(jobs_n_builds, collected_node):
         labels = labels or []
 
         if node_key:
-            team_name = node_key
-            team_number = extract_team_number(node_key)
+            team_name, team_number = split_node(node_key)
         else:
             team_name = project
             team_number = ""
 
         nodes_count = len(labels)
 
-        rows.append(
-            [
-                team_name,
-                team_number,
-                project,
-                sums.get("jobs_sum", 0),
-                sums.get("build_sum", 0),
-                nodes_count,
-                ", ".join(labels) if labels else "",
-            ]
-        )
+        rows.append([
+            team_name,
+            team_number,
+            sums.get("jobs_sum", 0),
+            sums.get("build_sum", 0),
+            nodes_count,
+        ])
 
         logger.info(
-            f"project={project} "
-            f"node={node_key or '-'} "
-            f"nodes_count={nodes_count} "
-            f"labels={labels}"
+            f"project={project} node={node_key or '-'} nodes_count={nodes_count}"
         )
 
     return rows
 
 
-# ===== excel =====
 def export_excel(rows, filename="inventory.xlsx"):
     wb = Workbook()
     ws = wb.active
     ws.title = "inventory"
 
-    ws.append(
-        [
-            "team_name",
-            "team_number",
-            "project",
-            "jobs_sum",
-            "build_sum",
-            "nodes_count",
-            "labels",
-        ]
-    )
+    ws.append([
+        "team_name",
+        "team_number",
+        "jobs_sum",
+        "build_sum",
+        "nodes_count",
+    ])
 
     for r in rows:
         ws.append(r)
@@ -150,17 +124,13 @@ def export_excel(rows, filename="inventory.xlsx"):
     logger.info(f"Excel сохранён: {filename}")
 
 
-# ===== main =====
 def main():
     try:
         jobs = get_jobs()
         collected_node = collect_node()
-
         jobs_n_builds = get_sum_build_and_jobs(jobs)
         rows = build_rows(jobs_n_builds, collected_node)
-
         export_excel(rows)
-
         logger.info("Инвентаризация завершена успешно.")
     except Exception as e:
         logger.exception(f"Ошибка при инвентаризации: {e}")
