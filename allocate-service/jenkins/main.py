@@ -4,7 +4,7 @@ import logging
 import urllib3
 from dotenv import load_dotenv
 from collections import defaultdict
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 
 from jenkins_client import JenkinsGroovyClient
 from jenkins_scripts import SCRIPT_JOBS
@@ -26,6 +26,7 @@ load_dotenv()
 JENKINS_URL = os.getenv("JENKINS_URL")
 USER = os.getenv("USER")
 TOKEN = os.getenv("TOKEN")
+BUSINESS_XLSX = os.getenv("BUSINESS_XLSX", "business.xlsx")
 
 client = JenkinsGroovyClient(JENKINS_URL, USER, TOKEN, is_https=False)
 
@@ -72,7 +73,91 @@ def split_name_number(s):
     return s or "", ""
 
 
-def build_rows(jobs_n_builds, collected_node):
+def hnorm(s):
+    return norm(str(s or ""))
+
+
+def load_business_index(xlsx_path):
+    if not xlsx_path or not os.path.exists(xlsx_path):
+        logger.info(f"business xlsx not found: {xlsx_path}")
+        return {}
+
+    wb = load_workbook(xlsx_path, data_only=True)
+    ws = wb.active
+
+    header_row = None
+    for r in range(1, min(ws.max_row, 30) + 1):
+        vals = [ws.cell(row=r, column=c).value for c in range(1, ws.max_column + 1)]
+        if any(v is not None for v in vals):
+            header_row = r
+            break
+
+    if header_row is None:
+        return {}
+
+    headers = {}
+    for c in range(1, ws.max_column + 1):
+        v = ws.cell(row=header_row, column=c).value
+        key = hnorm(v)
+        if key:
+            headers[key] = c
+
+    def pick_col(*names):
+        for n in names:
+            k = hnorm(n)
+            for hk, col in headers.items():
+                if hk == k or k in hk or hk in k:
+                    return col
+        return None
+
+    col_num = pick_col("team_number", "номер", "номеркоманды", "командаid", "id")
+    col_team = pick_col("team_name", "команда", "названиекоманды", "team")
+    col_bus = pick_col("business_name", "business", "бизнес", "названиебизнеса", "бизнеснаправление")
+
+    if not col_num:
+        logger.info("business xlsx: не нашёл колонку номера команды (team_number/номер/...)")
+        return {}
+
+    idx = {}
+    for r in range(header_row + 1, ws.max_row + 1):
+        num = ws.cell(row=r, column=col_num).value
+        if num is None:
+            continue
+        num_s = str(num).strip()
+        if not num_s.isdigit():
+            num_s = "".join(ch for ch in num_s if ch.isdigit())
+        if not num_s:
+            continue
+
+        team_name = ""
+        business_name = ""
+
+        if col_team:
+            v = ws.cell(row=r, column=col_team).value
+            if v is not None:
+                team_name = str(v).strip()
+
+        if col_bus:
+            v = ws.cell(row=r, column=col_bus).value
+            if v is not None:
+                business_name = str(v).strip()
+
+        idx[num_s] = {"team_name": team_name, "business_name": business_name}
+
+    logger.info(f"business xlsx loaded: {len(idx)} rows")
+    return idx
+
+
+def business_lookup(biz_idx, team_number):
+    if not team_number:
+        return "", ""
+    rec = biz_idx.get(str(team_number))
+    if not rec:
+        return "", ""
+    return rec.get("business_name", "") or "", rec.get("team_name", "") or ""
+
+
+def build_rows(jobs_n_builds, collected_node, biz_idx):
     rows = []
     logger.info(f"Всего нод (ключей): {len(collected_node)}")
 
@@ -83,11 +168,24 @@ def build_rows(jobs_n_builds, collected_node):
         nodes_count = len(labels)
 
         if node_key:
-            team_name, team_number = split_name_number(node_key)
+            node_team_name, team_number = split_name_number(node_key)
+            fallback_team_name = node_team_name
         else:
-            team_name, team_number = split_name_number(project)
+            fallback_team_name = project
+            _, team_number = split_name_number(project)
+
+        business_name = ""
+        team_name = ""
+
+        if team_number:
+            business_name, team_name = business_lookup(biz_idx, team_number)
+            if not team_name:
+                team_name = fallback_team_name
+        else:
+            team_name = fallback_team_name
 
         rows.append([
+            business_name,
             team_name,
             team_number,
             project,
@@ -97,8 +195,8 @@ def build_rows(jobs_n_builds, collected_node):
         ])
 
         logger.info(
-            f"project={project} node={node_key or '-'} nodes_count={nodes_count} "
-            f"team_name={team_name} team_number={team_number}"
+            f"project={project} node={node_key or '-'} team_number={team_number or '-'} "
+            f"nodes_count={nodes_count} business={'+' if business_name else '-'} team={'+' if team_name else '-'}"
         )
 
     return rows
@@ -110,6 +208,7 @@ def export_excel(rows, filename="inventory.xlsx"):
     ws.title = "inventory"
 
     ws.append([
+        "business_name",
         "team_name",
         "team_number",
         "project",
@@ -129,9 +228,12 @@ def main():
     try:
         jobs = get_jobs()
         collected_node = collect_node()
+        biz_idx = load_business_index(BUSINESS_XLSX)
+
         jobs_n_builds = get_sum_build_and_jobs(jobs)
-        rows = build_rows(jobs_n_builds, collected_node)
+        rows = build_rows(jobs_n_builds, collected_node, biz_idx)
         export_excel(rows)
+
         logger.info("Инвентаризация завершена успешно.")
     except Exception as e:
         logger.exception(f"Ошибка при инвентаризации: {e}")
