@@ -84,7 +84,7 @@ def extract_labels(doc):
     return sorted(labels), len(nodes_list)
 
 
-def collect_project_labels():
+def collect_node():
     gl = get_gitlab_client()
     result = {}
 
