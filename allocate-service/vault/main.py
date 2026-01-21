@@ -14,11 +14,11 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
-log = logging.getLogger("vault_kv_sd_report")
+log = logging.getLogger("vault_report")
 
 load_dotenv()
 VAULT_ADDR = os.getenv("VAULT_ADDR")
-SD_FILE = os.getenv("SD_FILE", "sd.xlsx")
+SD_FILE = os.getenv("SD_FILE")
 
 
 def get_vault_metrics_prometheus() -> str:
@@ -120,9 +120,10 @@ def main():
     ]
 
     out["% потребления"] = out["% потребления"].round(2)
+    sheet_name = "Отчет Vault"
     with pd.ExcelWriter("vault_report.xlsx", engine="openpyxl") as writer:
-        out.to_excel(writer, index=False, sheet_name="Vault")
-        ws = writer.book["Vault"]
+        out.to_excel(writer, index=False, sheet_name=sheet_name)
+        ws = writer.book[sheet_name]
 
         bold = Font(bold=True)
         for cell in ws[1]:
