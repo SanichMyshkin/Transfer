@@ -5,17 +5,18 @@ import urllib3
 
 import requests
 import pandas as pd
+from openpyxl.styles import Font
 from dotenv import load_dotenv
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
 )
 log = logging.getLogger("vault_kv_sd_report")
 
 load_dotenv()
-
 VAULT_ADDR = os.getenv("VAULT_ADDR")
 SD_FILE = os.getenv("SD_FILE", "sd.xlsx")
 
@@ -61,6 +62,7 @@ def parse_kv_metrics_to_df(metrics_text: str) -> pd.DataFrame:
 
 def read_sd_df(path: str) -> pd.DataFrame:
     df = pd.read_excel(path, sheet_name=0, header=None)
+
     df = df.iloc[:, [1, 2, 3]].copy()
     df.columns = ["code", "category", "sd_name"]
 
@@ -88,10 +90,13 @@ def main():
         raise SystemExit("Нет данных KV после фильтрации")
 
     sd_df = read_sd_df(SD_FILE)
+
     out = kv_df.merge(sd_df, on="code", how="left")
+
     out["name"] = out["sd_name"]
     out.loc[
-        out["name"].isna() | (out["name"].astype(str).str.strip() == ""), "name"
+        out["name"].isna() | (out["name"].astype(str).str.strip() == ""),
+        "name"
     ] = out["kv"]
 
     out = out.rename(
@@ -115,8 +120,14 @@ def main():
     ]
 
     out["% потребления"] = out["% потребления"].round(2)
+    with pd.ExcelWriter("vault_report.xlsx", engine="openpyxl") as writer:
+        out.to_excel(writer, index=False, sheet_name="Vault")
+        ws = writer.book["Vault"]
 
-    out.to_excel("vault_report.xlsx", index=False, sheet_name="Vault")
+        bold = Font(bold=True)
+        for cell in ws[1]:
+            cell.font = bold
+
     log.info(f"Excel сохранён: vault_report.xlsx (строк: {len(out)})")
 
 
