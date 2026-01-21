@@ -23,6 +23,8 @@ JENKINS_URL = os.getenv("JENKINS_URL")
 USER = os.getenv("USER")
 TOKEN = os.getenv("TOKEN")
 
+EXCLUDE_PROJECTS_WITHOUT_TEAM_NUMBER = True
+
 SCRIPT_BUILDS = r"""
 import jenkins.model.Jenkins
 import groovy.json.JsonOutput
@@ -33,12 +35,9 @@ def jobList = []
 jobs.each { j ->
     def info = [
         name: j.fullName,
-        url: (j.metaClass.respondsTo(j, "getAbsoluteUrl") ? j.absoluteUrl : ""),
-        type: j.class.simpleName,
         isFolder: j.class.simpleName.contains("Folder")
     ]
 
-    // Считаем только билды
     try {
         if (!info.isFolder && j.metaClass.respondsTo(j, "getBuilds")) {
             def builds = j.getBuilds()
@@ -70,45 +69,49 @@ def get_builds_inventory():
 def split_project_and_team(project_raw: str):
     if not project_raw:
         return "", ""
-
     parts = project_raw.split("-")
     if len(parts) >= 2 and parts[-1].isdigit():
-        team = parts[-1]
-        project = "-".join(parts[:-1])
-        return project, team
-
+        return "-".join(parts[:-1]), parts[-1]
     return project_raw, ""
 
 
-def aggregate_builds_by_project(data):
-    acc = defaultdict(lambda: {"builds": 0})
+def aggregate_builds_by_project(data, exclude_without_team=True):
+    acc = defaultdict(int)
 
     for j in data.get("jobs", []):
         if j.get("isFolder"):
             continue
 
-        full_name = j.get("name", "")
+        full_name = (j.get("name") or "").strip()
+        if not full_name:
+            continue
+
         root = full_name.split("/", 1)[0].strip()
         if not root:
             continue
 
-        acc[root]["builds"] += int(j.get("buildCount") or 0)
-    total_builds = sum(v["builds"] for v in acc.values())
-    rows = []
-    for root, v in sorted(acc.items(), key=lambda kv: kv[1]["builds"], reverse=True):
         project_name, team_number = split_project_and_team(root)
-        builds = v["builds"]
+        if exclude_without_team and not team_number:
+            continue
+
+        acc[(project_name, team_number)] += int(j.get("buildCount") or 0)
+
+    total_builds = sum(acc.values())
+
+    rows = []
+    for (project_name, team_number), builds in sorted(
+        acc.items(), key=lambda kv: kv[1], reverse=True
+    ):
         pct = (builds / total_builds * 100.0) if total_builds > 0 else 0.0
         rows.append([project_name, team_number, builds, round(pct, 2)])
 
-    return rows, total_builds
+    return rows
 
 
-def export_excel(rows, total_builds, filename="jenkins_report.xlsx"):
+def export_excel(rows, filename="jenkins_report.xlsx"):
     wb = Workbook()
     ws = wb.active
     ws.title = "Отчет"
-
     ws.append(
         [
             "Название проекта",
@@ -119,7 +122,6 @@ def export_excel(rows, total_builds, filename="jenkins_report.xlsx"):
     )
     for r in rows:
         ws.append(r)
-
     wb.save(filename)
     logger.info(f"Excel сохранён: {filename}")
 
@@ -127,8 +129,11 @@ def export_excel(rows, total_builds, filename="jenkins_report.xlsx"):
 def main():
     try:
         data = get_builds_inventory()
-        rows, total_builds = aggregate_builds_by_project(data)
-        export_excel(rows, total_builds)
+        rows = aggregate_builds_by_project(
+            data,
+            exclude_without_team=EXCLUDE_PROJECTS_WITHOUT_TEAM_NUMBER,
+        )
+        export_excel(rows)
         logger.info("Инвентаризация билдов завершена успешно.")
     except Exception as e:
         logger.exception(f"Ошибка при инвентаризации: {e}")
