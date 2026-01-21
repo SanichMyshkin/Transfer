@@ -4,14 +4,12 @@ import logging
 import urllib3
 from dotenv import load_dotenv
 from collections import defaultdict
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from jenkins_client import JenkinsGroovyClient
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
-formatter = logging.Formatter(
-    "%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S"
-)
+formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S")
 console_handler = logging.StreamHandler(sys.stdout)
 console_handler.setFormatter(formatter)
 logger.addHandler(console_handler)
@@ -24,6 +22,7 @@ USER = os.getenv("USER")
 TOKEN = os.getenv("TOKEN")
 
 EXCLUDE_PROJECTS_WITHOUT_TEAM_NUMBER = True
+BUSINESS_XLSX_PATH = os.getenv("BUSINESS_XLSX_PATH", "buissnes.xlsx")
 
 SCRIPT_BUILDS = r"""
 import jenkins.model.Jenkins
@@ -75,7 +74,36 @@ def split_project_and_team(project_raw: str):
     return project_raw, ""
 
 
-def aggregate_builds_by_project(data, exclude_without_team=True):
+def load_business_mapping(path: str):
+    mapping = {}
+    if not path or not os.path.exists(path):
+        logger.warning(f"Файл buissnes не найден: {path}")
+        return mapping
+
+    wb = load_workbook(path, data_only=True)
+    ws = wb.active
+
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        b = row[1] if len(row) > 1 else None
+        c = row[2] if len(row) > 2 else None
+        d = row[3] if len(row) > 3 else None
+
+        if b is None:
+            continue
+
+        team = str(b).strip()
+        if not team:
+            continue
+
+        category = (str(c).strip() if c is not None else "")
+        name = (str(d).strip() if d is not None else "")
+        mapping[team] = {"category": category, "name": name}
+
+    logger.info(f"Загружено соответствий из buissnes: {len(mapping)}")
+    return mapping
+
+
+def aggregate_builds_by_project(data, business_map, exclude_without_team=True):
     acc = defaultdict(int)
 
     for j in data.get("jobs", []):
@@ -99,27 +127,23 @@ def aggregate_builds_by_project(data, exclude_without_team=True):
     total_builds = sum(acc.values())
 
     rows = []
-    for (project_name, team_number), builds in sorted(
-        acc.items(), key=lambda kv: kv[1], reverse=True
-    ):
+    idx = 1
+    for (project_name, team_number), builds in sorted(acc.items(), key=lambda kv: kv[1], reverse=True):
+        bm = business_map.get(team_number or "", {})
+        display_name = bm.get("name") or project_name
+        category = bm.get("category") or ""
         pct = (builds / total_builds * 100.0) if total_builds > 0 else 0.0
-        rows.append([project_name, team_number, builds, round(pct, 2)])
+        rows.append([idx, display_name, team_number, category, builds, round(pct, 2)])
+        idx += 1
 
     return rows
 
 
-def export_excel(rows, filename="jenkins_report.xlsx"):
+def export_excel(rows, filename="inventory.xlsx"):
     wb = Workbook()
     ws = wb.active
-    ws.title = "Отчет"
-    ws.append(
-        [
-            "Название проекта",
-            "Номер команды",
-            "Кол-во билдов",
-            "% от общего кол-ва билдов",
-        ]
-    )
+    ws.title = "inventory"
+    ws.append(["№", "Название команды", "Номер команды", "Категория", "Кол-во билдов", "% от общего кол-ва билдов"])
     for r in rows:
         ws.append(r)
     wb.save(filename)
@@ -128,12 +152,14 @@ def export_excel(rows, filename="jenkins_report.xlsx"):
 
 def main():
     try:
+        business_map = load_business_mapping(BUSINESS_XLSX_PATH)
         data = get_builds_inventory()
         rows = aggregate_builds_by_project(
             data,
+            business_map=business_map,
             exclude_without_team=EXCLUDE_PROJECTS_WITHOUT_TEAM_NUMBER,
         )
-        export_excel(rows)
+        export_excel(rows, filename="inventory.xlsx")
         logger.info("Инвентаризация билдов завершена успешно.")
     except Exception as e:
         logger.exception(f"Ошибка при инвентаризации: {e}")
