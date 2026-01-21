@@ -144,7 +144,7 @@ def aggregate_builds_by_project(data, business_map, exclude_without_team=True):
 def export_excel(rows, filename="jenkins_report.xlsx"):
     wb = Workbook()
     ws = wb.active
-    ws.title = "inventory"
+    ws.title = "Отчет"
     ws.append(
         [
             "Название команды",

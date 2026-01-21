@@ -21,6 +21,9 @@ BUSINESS_FILE = os.getenv("BUSINESS_FILE", "buisness.xlsx")
 SLEEP_AFTER_SWITCH = 1
 SLEEP_BETWEEN_CALLS = 0.2
 
+# 4) Флаг: не учитывать вообще команды, у которых номер состоит только из нулей
+EXCLUDE_ALL_ZERO_NUMBERS = True
+
 logger = logging.getLogger("grafana_usage_report")
 logger.setLevel(logging.INFO)
 fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S")
@@ -139,9 +142,17 @@ def normalize_name(x):
     return str(x).strip().casefold()
 
 
-def load_business_mapping(path):
+def is_all_zeros_number(num: str | None) -> bool:
+    if not num:
+        return False
+    s = str(num).strip()
+    return bool(re.fullmatch(r"0+", s))
+
+
+# 1) тип бизнеса убираем; 3) добавляем категорию из столбца C
+def load_sd_mapping_with_category(path):
     if not os.path.exists(path):
-        logger.warning(f"Файл {path} не найден, тип бизнеса подставлен не будет")
+        logger.warning(f"Файл {path} не найден, категория/имя в SD подставлены не будут")
         return {}, {}
 
     df_b = pd.read_excel(path)
@@ -149,21 +160,21 @@ def load_business_mapping(path):
     map_by_name = {}
 
     for _, row in df_b.iterrows():
-        num = normalize_number(row.iloc[1])     # B
-        sd_name_raw = row.iloc[3]               # D
-        biz_type = row.iloc[4]                  # E
+        num = normalize_number(row.iloc[1])       # B: номер
+        category_raw = row.iloc[2]                # C: категория
+        sd_name_raw = row.iloc[3]                 # D: имя в SD
 
-        if pd.isna(biz_type) and pd.isna(sd_name_raw):
+        if pd.isna(category_raw) and pd.isna(sd_name_raw):
             continue
 
-        bt = None if pd.isna(biz_type) else str(biz_type).strip()
+        category = None if pd.isna(category_raw) else str(category_raw).strip()
         sd_name = None if pd.isna(sd_name_raw) else str(sd_name_raw).strip()
         key_name = normalize_name(sd_name_raw)
 
         if num:
-            map_by_number[num] = (bt, sd_name)
+            map_by_number[num] = (category, sd_name)
         if key_name:
-            map_by_name[key_name] = (bt, sd_name)
+            map_by_name[key_name] = (category, sd_name)
 
     logger.info(
         f"Загружено записей из SD-портала: по номеру={len(map_by_number)}, по имени={len(map_by_name)}"
@@ -175,7 +186,7 @@ def main():
     logger.info("Старт формирования отчёта по использованию Grafana")
     login_cookie()
 
-    map_by_number, map_by_name = load_business_mapping(BUSINESS_FILE)
+    map_by_number, map_by_name = load_sd_mapping_with_category(BUSINESS_FILE)
     org_ids = sorted(get_unique_org_ids())[:ORG_LIMIT]
     logger.info(f"Будет обработано организаций: {len(org_ids)}")
 
@@ -188,29 +199,35 @@ def main():
         norm_number = normalize_number(org_number)
         norm_name = normalize_name(org_name)
 
-        biz_type = None
+        # 4) полностью исключаем команды с номером из одних нулей
+        if EXCLUDE_ALL_ZERO_NUMBERS and is_all_zeros_number(norm_number):
+            logger.info(
+                f'Организация {org_id}: "{org_name}" ({org_number}) — пропуск (номер из нулей)'
+            )
+            continue
+
+        category = None
         sd_name = None
         source = None
 
         if norm_number and norm_number in map_by_number:
-            biz_type, sd_name = map_by_number[norm_number]
+            category, sd_name = map_by_number[norm_number]
             source = "номер"
         elif norm_name and norm_name in map_by_name:
-            biz_type, sd_name = map_by_name[norm_name]
+            category, sd_name = map_by_name[norm_name]
             source = "имя"
 
         if not switch_org(org_id):
             logger.warning(
                 f'Нет доступа к организации {org_id}: "{raw_org_name}". '
-                f'Тип бизнеса: {biz_type or "не определён"}, имя в SD: {sd_name or "не найдено"}'
+                f'Категория: {category or "не определена"}, имя в SD: {sd_name or "не найдено"}'
             )
             rows_orgs.append(
                 {
-                    "Тип бизнеса": biz_type,
+                    "Категория": category,
                     "Наименование в SD": sd_name,
                     "Наименование сервиса": org_name,
                     "Номер": "NO ACCESS",
-                    "Кол-во дашбордов": "NO ACCESS",
                     "Кол-во панелей": "NO ACCESS",
                     "Потребление в %": None,
                 }
@@ -218,41 +235,35 @@ def main():
             continue
 
         folders = get_folders()
-        dashboards_total = 0
         panels_total = 0
 
+        # 2) считаем только панели (дашборды не считаем)
         for f in folders:
             dashboards = get_dashboards_in_folder(f["id"])
-            dashboards_total += len(dashboards)
             for d in dashboards:
-                panels = get_dashboard_panels(d["uid"])
-                panels_total += panels
+                panels_total += get_dashboard_panels(d["uid"])
 
         for d in get_root_dashboards():
-            panels = get_dashboard_panels(d["uid"])
-            panels_total += panels
-            dashboards_total += 1
+            panels_total += get_dashboard_panels(d["uid"])
 
-        if biz_type:
+        if category or sd_name:
             logger.info(
                 f'Организация {org_id}: "{org_name}" ({org_number}) — '
-                f"дашбордов={dashboards_total}, панелей={panels_total}, "
-                f'тип бизнеса="{biz_type}", имя в SD="{sd_name}" (найдено по {source})'
+                f"панелей={panels_total}, "
+                f'категория="{category}", имя в SD="{sd_name}" (найдено по {source})'
             )
         else:
             logger.info(
                 f'Организация {org_id}: "{org_name}" ({org_number}) — '
-                f"дашбордов={dashboards_total}, панелей={panels_total}, "
-                "тип бизнеса и имя в SD не найдены"
+                f"панелей={panels_total}, категория/имя в SD не найдены"
             )
 
         rows_orgs.append(
             {
-                "Тип бизнеса": biz_type,
+                "Категория": category,
                 "Наименование в SD": sd_name,
                 "Наименование сервиса": org_name,
                 "Номер": org_number,
-                "Кол-во дашбордов": dashboards_total,
                 "Кол-во панелей": panels_total,
                 "Потребление в %": None,
             }
