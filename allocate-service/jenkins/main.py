@@ -9,7 +9,9 @@ from jenkins_client import JenkinsGroovyClient
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
-formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S")
+formatter = logging.Formatter(
+    "%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S"
+)
 console_handler = logging.StreamHandler(sys.stdout)
 console_handler.setFormatter(formatter)
 logger.addHandler(console_handler)
@@ -95,8 +97,8 @@ def load_business_mapping(path: str):
         if not team:
             continue
 
-        category = (str(c).strip() if c is not None else "")
-        name = (str(d).strip() if d is not None else "")
+        category = str(c).strip() if c is not None else ""
+        name = str(d).strip() if d is not None else ""
         mapping[team] = {"category": category, "name": name}
 
     logger.info(f"Загружено соответствий из buissnes: {len(mapping)}")
@@ -127,23 +129,31 @@ def aggregate_builds_by_project(data, business_map, exclude_without_team=True):
     total_builds = sum(acc.values())
 
     rows = []
-    idx = 1
-    for (project_name, team_number), builds in sorted(acc.items(), key=lambda kv: kv[1], reverse=True):
+    for (project_name, team_number), builds in sorted(
+        acc.items(), key=lambda kv: kv[1], reverse=True
+    ):
         bm = business_map.get(team_number or "", {})
         display_name = bm.get("name") or project_name
         category = bm.get("category") or ""
         pct = (builds / total_builds * 100.0) if total_builds > 0 else 0.0
-        rows.append([idx, display_name, team_number, category, builds, round(pct, 2)])
-        idx += 1
+        rows.append([display_name, team_number, category, builds, round(pct, 2)])
 
     return rows
 
 
-def export_excel(rows, filename="inventory.xlsx"):
+def export_excel(rows, filename="jenkins_report.xlsx"):
     wb = Workbook()
     ws = wb.active
     ws.title = "inventory"
-    ws.append(["№", "Название команды", "Номер команды", "Категория", "Кол-во билдов", "% от общего кол-ва билдов"])
+    ws.append(
+        [
+            "Название команды",
+            "Номер команды",
+            "Категория",
+            "Кол-во билдов",
+            "% от общего кол-ва билдов",
+        ]
+    )
     for r in rows:
         ws.append(r)
     wb.save(filename)
