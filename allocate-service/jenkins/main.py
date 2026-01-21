@@ -120,9 +120,6 @@ def export_excel(rows, total_builds, filename="jenkins_report.xlsx"):
     for r in rows:
         ws.append(r)
 
-    ws.append([])
-    ws.append(["ИТОГО", "", total_builds, 100.0 if total_builds > 0 else 0.0])
-
     wb.save(filename)
     logger.info(f"Excel сохранён: {filename}")
 
@@ -131,7 +128,7 @@ def main():
     try:
         data = get_builds_inventory()
         rows, total_builds = aggregate_builds_by_project(data)
-        export_excel(rows, total_builds, filename="inventory.xlsx")
+        export_excel(rows, total_builds)
         logger.info("Инвентаризация билдов завершена успешно.")
     except Exception as e:
         logger.exception(f"Ошибка при инвентаризации: {e}")
