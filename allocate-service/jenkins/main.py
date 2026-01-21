@@ -5,6 +5,7 @@ import urllib3
 from dotenv import load_dotenv
 from collections import defaultdict
 from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Font
 from jenkins_client import JenkinsGroovyClient
 
 logger = logging.getLogger()
@@ -15,30 +16,23 @@ formatter = logging.Formatter(
 console_handler = logging.StreamHandler(sys.stdout)
 console_handler.setFormatter(formatter)
 logger.addHandler(console_handler)
-
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 load_dotenv()
-
 JENKINS_URL = os.getenv("JENKINS_URL")
 USER = os.getenv("USER")
 TOKEN = os.getenv("TOKEN")
-
 EXCLUDE_PROJECTS_WITHOUT_TEAM_NUMBER = True
-BUSINESS_XLSX_PATH = os.getenv("BUSINESS_XLSX_PATH", "buissnes.xlsx")
-
+SD_FILE = os.getenv("SD_FILE", "sd.xlsx")
 SCRIPT_BUILDS = r"""
 import jenkins.model.Jenkins
 import groovy.json.JsonOutput
-
 def jobs = Jenkins.instance.getAllItems()
 def jobList = []
-
 jobs.each { j ->
     def info = [
         name: j.fullName,
         isFolder: j.class.simpleName.contains("Folder")
     ]
-
     try {
         if (!info.isFolder && j.metaClass.respondsTo(j, "getBuilds")) {
             def builds = j.getBuilds()
@@ -50,13 +44,10 @@ jobs.each { j ->
         info.buildCount = 0
         info.error = e.message
     }
-
     jobList << info
 }
-
 JsonOutput.toJson([jobs: jobList, total: jobs.size()])
 """
-
 client = JenkinsGroovyClient(JENKINS_URL, USER, TOKEN, is_https=False)
 
 
@@ -81,53 +72,40 @@ def load_business_mapping(path: str):
     if not path or not os.path.exists(path):
         logger.warning(f"Файл buissnes не найден: {path}")
         return mapping
-
     wb = load_workbook(path, data_only=True)
     ws = wb.active
-
     for row in ws.iter_rows(min_row=2, values_only=True):
         b = row[1] if len(row) > 1 else None
         c = row[2] if len(row) > 2 else None
         d = row[3] if len(row) > 3 else None
-
         if b is None:
             continue
-
         team = str(b).strip()
         if not team:
             continue
-
         category = str(c).strip() if c is not None else ""
         name = str(d).strip() if d is not None else ""
         mapping[team] = {"category": category, "name": name}
-
     logger.info(f"Загружено соответствий из buissnes: {len(mapping)}")
     return mapping
 
 
 def aggregate_builds_by_project(data, business_map, exclude_without_team=True):
     acc = defaultdict(int)
-
     for j in data.get("jobs", []):
         if j.get("isFolder"):
             continue
-
         full_name = (j.get("name") or "").strip()
         if not full_name:
             continue
-
         root = full_name.split("/", 1)[0].strip()
         if not root:
             continue
-
         project_name, team_number = split_project_and_team(root)
         if exclude_without_team and not team_number:
             continue
-
         acc[(project_name, team_number)] += int(j.get("buildCount") or 0)
-
     total_builds = sum(acc.values())
-
     rows = []
     for (project_name, team_number), builds in sorted(
         acc.items(), key=lambda kv: kv[1], reverse=True
@@ -137,39 +115,45 @@ def aggregate_builds_by_project(data, business_map, exclude_without_team=True):
         category = bm.get("category") or ""
         pct = (builds / total_builds * 100.0) if total_builds > 0 else 0.0
         rows.append([display_name, team_number, category, builds, round(pct, 2)])
-
     return rows
 
 
 def export_excel(rows, filename="jenkins_report.xlsx"):
     wb = Workbook()
     ws = wb.active
-    ws.title = "Отчет"
-    ws.append(
-        [
-            "Название команды",
-            "Номер команды",
-            "Категория",
-            "Кол-во билдов",
-            "% от общего кол-ва билдов",
-        ]
-    )
+    ws.title = "Отчет Jenkins"
+
+    headers = [
+        "Наименование сервиса",
+        "КОД",
+        "Категория",
+        "Кол-во билдов",
+        "% от общего кол-ва билдов",
+    ]
+
+    ws.append(headers)
+
+    bold = Font(bold=True)
+    for cell in ws[1]:  # первая строка — заголовки
+        cell.font = bold
+
     for r in rows:
         ws.append(r)
+
     wb.save(filename)
     logger.info(f"Excel сохранён: {filename}")
 
 
 def main():
     try:
-        business_map = load_business_mapping(BUSINESS_XLSX_PATH)
+        business_map = load_business_mapping(SD_FILE)
         data = get_builds_inventory()
         rows = aggregate_builds_by_project(
             data,
             business_map=business_map,
             exclude_without_team=EXCLUDE_PROJECTS_WITHOUT_TEAM_NUMBER,
         )
-        export_excel(rows, filename="inventory.xlsx")
+        export_excel(rows)
         logger.info("Инвентаризация билдов завершена успешно.")
     except Exception as e:
         logger.exception(f"Ошибка при инвентаризации: {e}")
