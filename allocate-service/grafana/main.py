@@ -16,7 +16,12 @@ GRAFANA_URL = os.getenv("GRAFANA_URL")
 GRAFANA_USER = os.getenv("GRAFANA_USER")
 GRAFANA_PASS = os.getenv("GRAFANA_PASS")
 ORG_LIMIT = int(os.getenv("ORG_LIMIT", "5"))
-BUSINESS_FILE = os.getenv("BUSINESS_FILE", "buisness.xlsx")
+
+# SD-файл (бывший business.xlsx / buisness.xlsx)
+SD_FILE = os.getenv("SD_FILE", "sd.xlsx")
+
+# файл отчёта берём из .env
+GRAFANA_REPORT_FILE = os.getenv("GRAFANA_REPORT_FILE", "grafana_report.xlsx")
 
 SLEEP_AFTER_SWITCH = 1
 SLEEP_BETWEEN_CALLS = 0.2
@@ -184,7 +189,7 @@ def main():
     logger.info("Старт формирования отчёта по использованию Grafana")
     login_cookie()
 
-    map_by_number, map_by_name = load_sd_mapping_with_category(BUSINESS_FILE)
+    map_by_number, map_by_name = load_sd_mapping_with_category(SD_FILE)
     org_ids = sorted(get_unique_org_ids())[:ORG_LIMIT]
     logger.info(f"Будет обработано организаций: {len(org_ids)}")
 
@@ -197,7 +202,7 @@ def main():
         norm_number = normalize_number(org_number)
         norm_name = normalize_name(org_name)
 
-        # 4) полностью исключаем команды с номером из одних нулей
+        # полностью исключаем команды с номером из одних нулей
         if EXCLUDE_ALL_ZERO_NUMBERS and is_all_zeros_number(norm_number):
             logger.info(
                 f'Организация {org_id}: "{org_name}" ({org_number}) — пропуск (номер из нулей)'
@@ -235,7 +240,7 @@ def main():
         folders = get_folders()
         panels_total = 0
 
-        # 2) считаем только панели (дашборды не считаем)
+        # считаем только панели (дашборды не считаем)
         for f in folders:
             dashboards = get_dashboards_in_folder(f["id"])
             for d in dashboards:
@@ -284,11 +289,10 @@ def main():
 
     df = pd.DataFrame(rows_orgs)
 
-    output_file = "grafana_report.xlsx"
-    with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
-        df.to_excel(writer, sheet_name="Отчет", index=False)
+    with pd.ExcelWriter(GRAFANA_REPORT_FILE, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="Отчет Grafana", index=False)
 
-    logger.info(f"Готово. Файл сохранён: {output_file}")
+    logger.info(f"Готово. Файл сохранён: {GRAFANA_REPORT_FILE}")
 
 
 if __name__ == "__main__":
