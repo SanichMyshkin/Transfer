@@ -5,13 +5,19 @@ import urllib3
 
 import requests
 import pandas as pd
+from dotenv import load_dotenv
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger("vault_kv_category_report")
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
+)
+log = logging.getLogger("vault_kv_sd_report")
+
+load_dotenv()
 
 VAULT_ADDR = os.getenv("VAULT_ADDR")
+SD_FILE = os.getenv("SD_FILE", "sd.xlsx")
 
 
 def get_vault_metrics_prometheus() -> str:
@@ -32,7 +38,12 @@ def parse_kv_metrics_to_df(metrics_text: str) -> pd.DataFrame:
         kv = (m.group(1) or "").rstrip("/")
         if "test" in kv.lower():
             continue
-        rows.append({"kv": kv, "secrets": int(m.group(2))})
+        rows.append(
+            {
+                "kv": kv,
+                "secrets": int(m.group(2)),
+            }
+        )
 
     df = pd.DataFrame(rows)
     if df.empty:
@@ -48,23 +59,27 @@ def parse_kv_metrics_to_df(metrics_text: str) -> pd.DataFrame:
     return df.sort_values("secrets", ascending=False).reset_index(drop=True)
 
 
-def read_business_df(path: str) -> pd.DataFrame:
-    b = pd.read_excel(path, sheet_name=0, header=None)
+def read_sd_df(path: str) -> pd.DataFrame:
+    df = pd.read_excel(path, sheet_name=0, header=None)
+    df = df.iloc[:, [1, 2, 3]].copy()
+    df.columns = ["code", "category", "sd_name"]
 
-    # A — service_name, B — code, C — category
-    b = b.iloc[:, [0, 1, 2]].copy()
-    b.columns = ["service_name", "code", "category"]
+    df["code"] = df["code"].astype(str).str.extract(r"(\d+)", expand=False)
+    df = df[df["code"].notna()].copy()
+    df["code"] = df["code"].astype(str)
 
-    b["code"] = b["code"].astype(str).str.extract(r"(\d+)", expand=False)
-    b = b[b["code"].notna()].copy()
-    b["code"] = b["code"].astype(str)
+    df["sd_name"] = df["sd_name"].astype(str).str.strip()
+    df["category"] = df["category"].astype(str).str.strip()
 
-    return b.drop_duplicates(subset=["code"], keep="first")
+    return df.drop_duplicates(subset=["code"], keep="first")
 
 
 def main():
     if not VAULT_ADDR:
         raise SystemExit("Не задан VAULT_ADDR")
+
+    if not SD_FILE:
+        raise SystemExit("Не задан SD_FILE")
 
     metrics = get_vault_metrics_prometheus()
     kv_df = parse_kv_metrics_to_df(metrics)
@@ -72,14 +87,37 @@ def main():
     if kv_df.empty:
         raise SystemExit("Нет данных KV после фильтрации")
 
-    category_df = read_business_df("business.xlsx")
+    sd_df = read_sd_df(SD_FILE)
+    out = kv_df.merge(sd_df, on="code", how="left")
+    out["name"] = out["sd_name"]
+    out.loc[
+        out["name"].isna() | (out["name"].astype(str).str.strip() == ""), "name"
+    ] = out["kv"]
 
-    out = kv_df.merge(category_df, on="code", how="left")
-    out = out[["kv", "code", "secrets", "percent", "service_name", "category"]]
-    out["percent"] = out["percent"].round(2)
+    out = out.rename(
+        columns={
+            "name": "Наименование сервиса",
+            "code": "КОД",
+            "category": "Категория",
+            "secrets": "Кол-во секретов",
+            "percent": "% потребления",
+        }
+    )
 
-    out.to_excel("kv_usage_report.xlsx", index=False, sheet_name="KV")
-    log.info(f"Excel сохранён: kv_usage_report.xlsx (строк: {len(out)})")
+    out = out[
+        [
+            "Наименование сервиса",
+            "КОД",
+            "Категория",
+            "Кол-во секретов",
+            "% потребления",
+        ]
+    ]
+
+    out["% потребления"] = out["% потребления"].round(2)
+
+    out.to_excel("vault_report.xlsx", index=False, sheet_name="Vault")
+    log.info(f"Excel сохранён: vault_report.xlsx (строк: {len(out)})")
 
 
 if __name__ == "__main__":
