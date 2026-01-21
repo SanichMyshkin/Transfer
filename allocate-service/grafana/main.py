@@ -21,7 +21,6 @@ BUSINESS_FILE = os.getenv("BUSINESS_FILE", "buisness.xlsx")
 SLEEP_AFTER_SWITCH = 1
 SLEEP_BETWEEN_CALLS = 0.2
 
-# 4) Флаг: не учитывать вообще команды, у которых номер состоит только из нулей
 EXCLUDE_ALL_ZERO_NUMBERS = True
 
 logger = logging.getLogger("grafana_usage_report")
@@ -149,7 +148,6 @@ def is_all_zeros_number(num: str | None) -> bool:
     return bool(re.fullmatch(r"0+", s))
 
 
-# 1) тип бизнеса убираем; 3) добавляем категорию из столбца C
 def load_sd_mapping_with_category(path):
     if not os.path.exists(path):
         logger.warning(f"Файл {path} не найден, категория/имя в SD подставлены не будут")
