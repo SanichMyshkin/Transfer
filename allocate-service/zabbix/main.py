@@ -15,7 +15,7 @@ BK_FILE = os.getenv("BK_FILE")
 
 OUTPUT_XLSX = os.getenv("OUTPUT_XLSX", "report.xlsx")
 
-BAN_SERVICE_IDS = [11111]
+BAN_SERVICE_IDS = [15473]
 SKIP_EMPTY_SERVICE_ID = True
 
 logger = logging.getLogger("zabbix_report")
@@ -143,13 +143,14 @@ def load_sd_owner_map(path):
 
 
 def load_bk_business_type_map(path):
-    # A,B,C = ФИО частями (как есть в файле), AS = тип бизнеса
     df = pd.read_excel(path, usecols="A:C,AS", dtype=str, engine="openpyxl")
     df = df.fillna("")
     df.columns = ["c1", "c2", "c3", "business_type"]
 
     def make_fio(r):
-        fio = " ".join([clean_spaces(r["c1"]), clean_spaces(r["c2"]), clean_spaces(r["c3"])])
+        fio = " ".join(
+            [clean_spaces(r["c2"]), clean_spaces(r["c1"]), clean_spaces(r["c3"])]
+        )
         fio = clean_spaces(fio)
         return fio
 
@@ -234,7 +235,9 @@ def main():
         if amb:
             ambiguous += 1
 
-        per_service[(service, service_id)] = per_service.get((service, service_id), 0) + 1
+        per_service[(service, service_id)] = (
+            per_service.get((service, service_id), 0) + 1
+        )
 
     rows = []
     for (service, service_id), cnt in per_service.items():
@@ -245,10 +248,10 @@ def main():
 
         rows.append(
             {
+                "business_type": business_type,
                 "service": service,
                 "service_id": service_id,
                 "owner": owner,
-                "business_type": business_type,
                 "hosts_found": cnt,
                 "percent": round(pct, 2),
             }
@@ -256,7 +259,14 @@ def main():
 
     df_report = pd.DataFrame(
         rows,
-        columns=["service", "service_id", "owner", "business_type", "hosts_found", "percent"],
+        columns=[
+            "Тип бизнеса",
+            "Наименование сервиса",
+            "КОД",
+            "Владелец сервиса",
+            "Кол-во хостов",
+            "% потребления",
+        ],
     )
 
     if not df_report.empty:
