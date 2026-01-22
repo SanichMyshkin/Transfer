@@ -13,7 +13,7 @@ DB_FILE = os.getenv("DB_FILE")
 SD_FILE = os.getenv("SD_FILE")
 BK_FILE = os.getenv("BK_FILE")
 
-OUTPUT_XLSX = os.getenv("OUTPUT_XLSX", "report.xlsx")
+OUTPUT_XLSX = os.getenv("OUTPUT_XLSX", "zabbix_report.xlsx")
 
 BAN_SERVICE_IDS = [15473]
 SKIP_EMPTY_SERVICE_ID = True
@@ -151,11 +151,9 @@ def load_bk_business_type_map(path):
         fio = " ".join(
             [clean_spaces(r["c2"]), clean_spaces(r["c1"]), clean_spaces(r["c3"])]
         )
-        fio = clean_spaces(fio)
-        return fio
+        return clean_spaces(fio)
 
-    df["fio"] = df.apply(make_fio, axis=1)
-    df["fio_key"] = df["fio"].map(normalize_name_key)
+    df["fio_key"] = df.apply(make_fio, axis=1).map(normalize_name_key)
     df["business_type"] = df["business_type"].astype(str).map(clean_spaces)
 
     df = df[df["fio_key"] != ""].copy()
@@ -243,8 +241,7 @@ def main():
     for (service, service_id), cnt in per_service.items():
         pct = (cnt / matched) * 100 if matched else 0
         owner = owner_map.get(service_id, "")
-        owner_key = normalize_name_key(owner)
-        business_type = bk_type_map.get(owner_key, "")
+        business_type = bk_type_map.get(normalize_name_key(owner), "")
 
         rows.append(
             {
@@ -257,23 +254,33 @@ def main():
             }
         )
 
-    df_report = pd.DataFrame(
-        rows,
-        columns=[
-            "Тип бизнеса",
-            "Наименование сервиса",
-            "КОД",
-            "Владелец сервиса",
-            "Кол-во хостов",
-            "% потребления",
-        ],
-    )
+    df_report = pd.DataFrame(rows)
 
     if not df_report.empty:
         df_report = df_report.sort_values(
             ["hosts_found", "service", "service_id"],
             ascending=[False, True, True],
         )
+
+    rename_map = {
+        "business_type": "Тип бизнеса",
+        "service": "Наименование сервиса",
+        "service_id": "КОД",
+        "owner": "Владелец сервиса",
+        "hosts_found": "Кол-во хостов",
+        "percent": "% потребления",
+    }
+    df_report = df_report.rename(columns=rename_map)
+
+    out_cols = [
+        "Тип бизнеса",
+        "Наименование сервиса",
+        "КОД",
+        "Владелец сервиса",
+        "Кол-во хостов",
+        "% потребления",
+    ]
+    df_report = df_report.reindex(columns=out_cols)
 
     logger.info(f"Активных хостов: {total_active}")
     logger.info(
