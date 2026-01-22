@@ -3,7 +3,7 @@ import logging
 import requests
 import urllib3
 from dotenv import load_dotenv
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -14,7 +14,8 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 SONAR_URL = os.getenv("SONAR_URL", "").rstrip("/")
 TOKEN = os.getenv("SONAR_TOKEN", "")
-OUT_FILE = os.getenv("OUT_FILE", "sonar_services_report.xlsx")
+OUT_FILE = os.getenv("OUT_FILE", "sonarQube_report.xlsx")
+SD_FILE = os.getenv("SD_FILE")
 
 if not SONAR_URL or not TOKEN:
     raise SystemExit(1)
@@ -104,14 +105,50 @@ def split_service_name_code(prefix: str):
     return prefix, ""
 
 
+def normalize_code(v):
+    if v is None:
+        return ""
+    if isinstance(v, bool):
+        return ""
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, float):
+        if v.is_integer():
+            return str(int(v))
+        return str(v).strip()
+    s = str(v).strip()
+    if s.endswith(".0"):
+        s2 = s[:-2]
+        if s2.isdigit():
+            return s2
+    return s
+
+
+def load_sd_map(path: str):
+    if not path or not os.path.exists(path):
+        return {}
+    wb = load_workbook(path, data_only=True)
+    ws = wb.active
+    m = {}
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        code = normalize_code(row[1] if len(row) > 1 else None)
+        if not code:
+            continue
+        category = (str(row[2]).strip() if len(row) > 2 and row[2] is not None else "")
+        name = (str(row[3]).strip() if len(row) > 3 and row[3] is not None else "")
+        m[code] = (category, name)
+    return m
+
+
 def write_xlsx(rows):
     wb = Workbook()
     ws = wb.active
-    ws.title = "Services"
+    ws.title = "Отчет SonarQube (fix)"
 
     headers = [
         "Наименование сервиса",
         "КОД",
+        "Категория",
         "кол-во тасок",
         "Обработано кол-во строк",
         "% потребления",
@@ -128,6 +165,7 @@ def write_xlsx(rows):
         ws.append([
             r["service"],
             r["code"],
+            r["category"],
             r["tasks_total"],
             r["total_lines"],
             r["total_lines"] / total_lines,
@@ -137,6 +175,7 @@ def write_xlsx(rows):
 
 
 def main():
+    sd_map = load_sd_map(SD_FILE)
     projects = get_projects()
 
     ncloc_cache = {}
@@ -176,12 +215,20 @@ def main():
 
         prefix = parse_service_prefix(project_key)
         svc_name, svc_code = split_service_name_code(prefix)
-        svc_key = (svc_name.lower(), svc_code)
+
+        category = ""
+        if svc_code and svc_code in sd_map:
+            category, mapped_name = sd_map[svc_code]
+            if mapped_name:
+                svc_name = mapped_name
+
+        svc_key = (svc_name.lower(), svc_code, category)
 
         if svc_key not in services:
             services[svc_key] = {
                 "service": svc_name,
                 "code": svc_code,
+                "category": category,
                 "tasks_total": 0,
                 "total_lines": 0,
             }
