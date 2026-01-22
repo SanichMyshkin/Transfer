@@ -9,14 +9,16 @@ load_dotenv()
 ZABBIX_URL = os.getenv("ZABBIX_URL", "").rstrip("/")
 ZABBIX_TOKEN = os.getenv("ZABBIX_TOKEN", "")
 
-DB_XLSX = os.getenv("DB_XLSX", "")
-SD_XLSX = os.getenv("SD_XLSX", "")
+DB_FILE = os.getenv("DB_FILE")
+SD_FILE = os.getenv("SD_FILE")
+BK_FILE = os.getenv("BK_FILE")
+
 OUTPUT_XLSX = os.getenv("OUTPUT_XLSX", "report.xlsx")
 
 BAN_SERVICE_IDS = [11111]
 SKIP_EMPTY_SERVICE_ID = True
 
-logger = logging.getLogger("zabbix_ownership")
+logger = logging.getLogger("zabbix_report")
 logger.setLevel(logging.INFO)
 handler = logging.StreamHandler()
 handler.setFormatter(
@@ -37,15 +39,20 @@ def validate_env_and_files():
     if not ZABBIX_TOKEN:
         die("ENV ZABBIX_TOKEN пустой")
 
-    if not DB_XLSX:
-        die("ENV DB_XLSX пустой")
-    if not os.path.isfile(DB_XLSX):
-        die(f"DB_XLSX не найден: {DB_XLSX}")
+    if not DB_FILE:
+        die("ENV DB_FILE пустой")
+    if not os.path.isfile(DB_FILE):
+        die(f"DB_FILE не найден: {DB_FILE}")
 
-    if not SD_XLSX:
-        die("ENV SD_XLSX пустой")
-    if not os.path.isfile(SD_XLSX):
-        die(f"SD_XLSX не найден: {SD_XLSX}")
+    if not SD_FILE:
+        die("ENV SD_FILE пустой")
+    if not os.path.isfile(SD_FILE):
+        die(f"SD_FILE не найден: {SD_FILE}")
+
+    if not BK_FILE:
+        die("ENV BK_FILE пустой")
+    if not os.path.isfile(BK_FILE):
+        die(f"BK_FILE не найден: {BK_FILE}")
 
     out_dir = os.path.dirname(OUTPUT_XLSX)
     if out_dir and not os.path.exists(out_dir):
@@ -59,6 +66,17 @@ def build_ban_set(ban_list):
 
 
 ban_set = build_ban_set(BAN_SERVICE_IDS)
+
+
+def clean_spaces(s: str) -> str:
+    s = (s or "").strip()
+    s = s.replace(",", " ")
+    s = " ".join(s.split())
+    return s
+
+
+def normalize_name_key(s: str) -> str:
+    return clean_spaces(s).lower()
 
 
 def clean_dns(s: str) -> str:
@@ -105,7 +123,7 @@ def load_db(path):
     df.columns = ["service", "service_id", "dns", "ip"]
     df = df.fillna("")
 
-    df["service"] = df["service"].astype(str).str.strip()
+    df["service"] = df["service"].astype(str).map(clean_spaces)
     df["service_id"] = df["service_id"].astype(str).str.strip()
     df["ip"] = df["ip"].astype(str).map(clean_ip_only_32)
     df["dns"] = df["dns"].astype(str).map(clean_dns)
@@ -113,22 +131,35 @@ def load_db(path):
     return df
 
 
-def clean_owner(s):
-    s = (s or "").strip()
-    s = s.replace(",", " ")
-    s = " ".join(s.split())
-    return s
-
-
 def load_sd_owner_map(path):
     df = pd.read_excel(path, usecols="B,H", dtype=str, engine="openpyxl")
     df.columns = ["service_id", "owner"]
     df = df.fillna("")
     df["service_id"] = df["service_id"].astype(str).str.strip()
-    df["owner"] = df["owner"].astype(str).map(clean_owner)
+    df["owner"] = df["owner"].astype(str).map(clean_spaces)
     df = df[df["service_id"] != ""].copy()
     last = df.drop_duplicates("service_id", keep="last")
     return dict(zip(last["service_id"], last["owner"]))
+
+
+def load_bk_business_type_map(path):
+    # A,B,C = ФИО частями (как есть в файле), AS = тип бизнеса
+    df = pd.read_excel(path, usecols="A:C,AS", dtype=str, engine="openpyxl")
+    df = df.fillna("")
+    df.columns = ["c1", "c2", "c3", "business_type"]
+
+    def make_fio(r):
+        fio = " ".join([clean_spaces(r["c1"]), clean_spaces(r["c2"]), clean_spaces(r["c3"])])
+        fio = clean_spaces(fio)
+        return fio
+
+    df["fio"] = df.apply(make_fio, axis=1)
+    df["fio_key"] = df["fio"].map(normalize_name_key)
+    df["business_type"] = df["business_type"].astype(str).map(clean_spaces)
+
+    df = df[df["fio_key"] != ""].copy()
+    last = df.drop_duplicates("fio_key", keep="last")
+    return dict(zip(last["fio_key"], last["business_type"]))
 
 
 def build_map(df, keys):
@@ -158,8 +189,9 @@ def main():
 
     total_active = len(df_hosts)
 
-    df_db = load_db(DB_XLSX)
-    owner_map = load_sd_owner_map(SD_XLSX)
+    df_db = load_db(DB_FILE)
+    owner_map = load_sd_owner_map(SD_FILE)
+    bk_type_map = load_bk_business_type_map(BK_FILE)
 
     map_both, dup_both = build_map(df_db, ["ip", "dns"])
     map_ip, dup_ip = build_map(df_db[df_db["ip"] != ""], ["ip"])
@@ -202,25 +234,29 @@ def main():
         if amb:
             ambiguous += 1
 
-        per_service[(service, service_id)] = per_service.get(
-            (service, service_id), 0
-        ) + 1
+        per_service[(service, service_id)] = per_service.get((service, service_id), 0) + 1
 
     rows = []
     for (service, service_id), cnt in per_service.items():
         pct = (cnt / matched) * 100 if matched else 0
+        owner = owner_map.get(service_id, "")
+        owner_key = normalize_name_key(owner)
+        business_type = bk_type_map.get(owner_key, "")
+
         rows.append(
             {
                 "service": service,
                 "service_id": service_id,
-                "owner": owner_map.get(service_id, ""),
+                "owner": owner,
+                "business_type": business_type,
                 "hosts_found": cnt,
                 "percent": round(pct, 2),
             }
         )
 
     df_report = pd.DataFrame(
-        rows, columns=["service", "service_id", "owner", "hosts_found", "percent"]
+        rows,
+        columns=["service", "service_id", "owner", "business_type", "hosts_found", "percent"],
     )
 
     if not df_report.empty:
