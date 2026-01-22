@@ -8,25 +8,68 @@ load_dotenv()
 
 ZABBIX_URL = os.getenv("ZABBIX_URL", "").rstrip("/")
 ZABBIX_TOKEN = os.getenv("ZABBIX_TOKEN", "")
+
 DB_XLSX = os.getenv("DB_XLSX", "")
 SD_XLSX = os.getenv("SD_XLSX", "")
 OUTPUT_XLSX = os.getenv("OUTPUT_XLSX", "report.xlsx")
-BAN_SERVICE_IDS = os.getenv("BAN_SERVICE_IDS", "")
+
+BAN_SERVICE_IDS = [11111]
+SKIP_EMPTY_SERVICE_ID = True
 
 logger = logging.getLogger("zabbix_ownership")
 logger.setLevel(logging.INFO)
 handler = logging.StreamHandler()
-handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S"))
+handler.setFormatter(
+    logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S")
+)
 logger.handlers.clear()
 logger.addHandler(handler)
 
-if not ZABBIX_URL or not ZABBIX_TOKEN or not DB_XLSX or not SD_XLSX:
-    raise SystemExit(1)
 
-if not os.path.exists(DB_XLSX) or not os.path.exists(SD_XLSX):
-    raise SystemExit(1)
+def die(msg: str, code: int = 2):
+    logger.error(msg)
+    raise SystemExit(code)
 
-ban_set = {x.strip() for x in BAN_SERVICE_IDS.split(",") if x.strip()}
+
+def validate_env_and_files():
+    if not ZABBIX_URL:
+        die("ENV ZABBIX_URL пустой")
+    if not ZABBIX_TOKEN:
+        die("ENV ZABBIX_TOKEN пустой")
+
+    if not DB_XLSX:
+        die("ENV DB_XLSX пустой")
+    if not os.path.isfile(DB_XLSX):
+        die(f"DB_XLSX не найден: {DB_XLSX}")
+
+    if not SD_XLSX:
+        die("ENV SD_XLSX пустой")
+    if not os.path.isfile(SD_XLSX):
+        die(f"SD_XLSX не найден: {SD_XLSX}")
+
+    out_dir = os.path.dirname(OUTPUT_XLSX)
+    if out_dir and not os.path.exists(out_dir):
+        os.makedirs(out_dir, exist_ok=True)
+
+
+def build_ban_set(ban_list):
+    if not isinstance(ban_list, (list, tuple, set)):
+        die("BAN_SERVICE_IDS должен быть list / tuple / set")
+    return {str(x).strip() for x in ban_list if str(x).strip()}
+
+
+ban_set = build_ban_set(BAN_SERVICE_IDS)
+
+
+def clean_dns(s: str) -> str:
+    return (s or "").strip().lower()
+
+
+def clean_ip_only_32(s: str) -> str:
+    s = (s or "").strip()
+    if s.endswith("/32"):
+        s = s[:-3].strip()
+    return s
 
 
 def pick_primary_interface(interfaces):
@@ -45,14 +88,13 @@ def fetch_hosts(api):
     )
     rows = []
     for h in raw or []:
-        status = int(h.get("status", 0))
-        if status != 0:
+        if int(h.get("status", 0)) != 0:
             continue
         iface = pick_primary_interface(h.get("interfaces") or [])
         rows.append(
             {
-                "ip": (iface.get("ip") or "").strip(),
-                "dns": (iface.get("dns") or "").strip().lower(),
+                "ip": clean_ip_only_32(iface.get("ip")),
+                "dns": clean_dns(iface.get("dns")),
             }
         )
     return pd.DataFrame(rows)
@@ -62,10 +104,12 @@ def load_db(path):
     df = pd.read_excel(path, usecols="A,B,N,V", dtype=str, engine="openpyxl")
     df.columns = ["service", "service_id", "dns", "ip"]
     df = df.fillna("")
+
     df["service"] = df["service"].astype(str).str.strip()
     df["service_id"] = df["service_id"].astype(str).str.strip()
-    df["ip"] = df["ip"].astype(str).str.strip()
-    df["dns"] = df["dns"].astype(str).str.strip().str.lower()
+    df["ip"] = df["ip"].astype(str).map(clean_ip_only_32)
+    df["dns"] = df["dns"].astype(str).map(clean_dns)
+
     return df
 
 
@@ -84,23 +128,33 @@ def load_sd_owner_map(path):
     df["owner"] = df["owner"].astype(str).map(clean_owner)
     df = df[df["service_id"] != ""].copy()
     last = df.drop_duplicates("service_id", keep="last")
-    return {k: v for k, v in zip(last["service_id"].tolist(), last["owner"].tolist())}
+    return dict(zip(last["service_id"], last["owner"]))
 
 
 def build_map(df, keys):
     tmp = df.copy()
-    tmp["_k"] = list(zip(*[tmp[k].tolist() for k in keys]))
+    tmp["_k"] = list(map(tuple, tmp[keys].to_numpy()))
     counts = tmp["_k"].value_counts().to_dict()
     last = tmp.drop_duplicates("_k", keep="last")
-    mp = {k: (r["service"], r["service_id"]) for k, r in zip(last["_k"], last.to_dict("records"))}
+    mp = {
+        k: (r["service"], r["service_id"])
+        for k, r in zip(last["_k"], last.to_dict("records"))
+    }
     return mp, counts
 
 
 def main():
+    validate_env_and_files()
+
     api = ZabbixAPI(url=ZABBIX_URL)
-    api.login(token=ZABBIX_TOKEN)
-    df_hosts = fetch_hosts(api)
-    api.logout()
+    try:
+        api.login(token=ZABBIX_TOKEN)
+        df_hosts = fetch_hosts(api)
+    finally:
+        try:
+            api.logout()
+        except Exception:
+            pass
 
     total_active = len(df_hosts)
 
@@ -115,28 +169,31 @@ def main():
     matched = 0
     ambiguous = 0
     banned_hits = 0
+    skipped_empty = 0
 
-    for _, h in df_hosts.iterrows():
-        ip = h["ip"]
-        dns = h["dns"]
-
-        owner = None
+    for ip, dns in df_hosts[["ip", "dns"]].itertuples(index=False, name=None):
+        svc_key = None
         amb = False
 
         if ip and dns and (ip, dns) in map_both:
-            owner = map_both[(ip, dns)]
+            svc_key = map_both[(ip, dns)]
             amb = dup_both.get((ip, dns), 0) > 1
         elif ip and (ip,) in map_ip:
-            owner = map_ip[(ip,)]
+            svc_key = map_ip[(ip,)]
             amb = dup_ip.get((ip,), 0) > 1
         elif dns and (dns,) in map_dns:
-            owner = map_dns[(dns,)]
+            svc_key = map_dns[(dns,)]
             amb = dup_dns.get((dns,), 0) > 1
 
-        if not owner:
+        if not svc_key:
             continue
 
-        service, service_id = owner
+        service, service_id = svc_key
+
+        if SKIP_EMPTY_SERVICE_ID and not service_id:
+            skipped_empty += 1
+            continue
+
         if service_id in ban_set:
             banned_hits += 1
             continue
@@ -145,7 +202,9 @@ def main():
         if amb:
             ambiguous += 1
 
-        per_service[(service, service_id)] = per_service.get((service, service_id), 0) + 1
+        per_service[(service, service_id)] = per_service.get(
+            (service, service_id), 0
+        ) + 1
 
     rows = []
     for (service, service_id), cnt in per_service.items():
@@ -160,14 +219,25 @@ def main():
             }
         )
 
-    df_report = pd.DataFrame(rows, columns=["service", "service_id", "owner", "hosts_found", "percent"])
+    df_report = pd.DataFrame(
+        rows, columns=["service", "service_id", "owner", "hosts_found", "percent"]
+    )
+
     if not df_report.empty:
-        df_report = df_report.sort_values(["hosts_found", "service", "service_id"], ascending=[False, True, True])
+        df_report = df_report.sort_values(
+            ["hosts_found", "service", "service_id"],
+            ascending=[False, True, True],
+        )
 
     logger.info(f"Активных хостов: {total_active}")
-    logger.info(f"Определено хостов: {matched} ({(matched / total_active * 100) if total_active else 0:.2f}%)")
+    logger.info(
+        f"Определено хостов: {matched} "
+        f"({(matched / total_active * 100) if total_active else 0:.2f}%)"
+    )
     logger.info(f"Сомнительных совпадений: {ambiguous}")
-    logger.info(f"Скип по бан-листу (service_id): {banned_hits}")
+    logger.info(f"Скип по бан-листу: {banned_hits}")
+    logger.info(f"Скип пустых service_id: {skipped_empty}")
+    logger.info(f"Сервисов в отчёте: {len(df_report)}")
 
     with pd.ExcelWriter(OUTPUT_XLSX, engine="openpyxl") as writer:
         df_report.to_excel(writer, index=False, sheet_name="report")
