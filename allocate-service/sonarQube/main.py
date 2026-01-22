@@ -2,18 +2,15 @@ import os
 import logging
 import requests
 import urllib3
+from collections import defaultdict
 from dotenv import load_dotenv
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
 load_dotenv()
-
 SONAR_URL = os.getenv("SONAR_URL", "").rstrip("/")
 TOKEN = os.getenv("SONAR_TOKEN", "")
 
@@ -28,6 +25,8 @@ session.headers.update({"Accept": "application/json"})
 
 def sonar_get(path: str, params: dict):
     r = session.get(f"{SONAR_URL}{path}", params=params, verify=False, timeout=60)
+    if r.status_code == 403:
+        logger.error("403 %s params=%s body=%s", path, params, r.text)
     r.raise_for_status()
     return r.json()
 
@@ -37,31 +36,23 @@ def get_projects():
     projects = []
     page = 1
     size = 500
-
     while True:
-        logger.info(f"[PROJECTS] GET page={page}")
         data = sonar_get("/api/projects/search", {"p": page, "ps": size})
         batch = data.get("components", [])
         projects.extend(batch)
-        logger.info(f"[PROJECTS] Получено {len(batch)} (всего: {len(projects)})")
-
         total = data.get("paging", {}).get("total", 0)
+        logger.info("[PROJECTS] page=%d got=%d total=%d", page, len(batch), len(projects))
         if page * size >= total:
             break
         page += 1
-
-    logger.info(f"Проекты получены: {len(projects)}")
     return projects
 
 
 def get_ce_tasks(project_key: str):
-    logger.info(f"[CE TASKS] Получение задач CE для {project_key}")
     tasks_all = []
     page = 1
     size = 100
-
     while True:
-        logger.info(f"[CE TASKS] {project_key} GET page={page}")
         data = sonar_get(
             "/api/ce/activity",
             {
@@ -73,35 +64,34 @@ def get_ce_tasks(project_key: str):
         )
         batch = data.get("tasks", [])
         tasks_all.extend(batch)
-        logger.info(
-            f"[CE TASKS] {project_key} Получено {len(batch)}, всего {len(tasks_all)}"
-        )
-
         total = data.get("paging", {}).get("total", 0)
         if page * size >= total:
             break
         page += 1
-
     return tasks_all
 
 
-def get_measure_value(
-    component_key: str,
-    metric: str,
-    branch: str | None = None,
-    pull_request: str | None = None,
-) -> int:
-    params = {"component": component_key, "metricKeys": metric}
+def measure_value(project_key: str, metric: str, branch: str | None = None, pull_request: str | None = None) -> int:
+    params = {"component": project_key, "metricKeys": metric}
     if branch:
         params["branch"] = branch
     if pull_request:
-        params["pullRequest"] = pull_request
+        params["pullRequest"] = str(pull_request)
 
     data = sonar_get("/api/measures/component", params)
     measures = data.get("component", {}).get("measures", [])
     if not measures:
         return 0
-    v = measures[0].get("value", "0")
+
+    m = measures[0]
+    if pull_request:
+        v = (m.get("period") or {}).get("value")
+    else:
+        v = m.get("value")
+
+    if v is None:
+        return 0
+
     try:
         return int(float(v))
     except Exception:
@@ -110,15 +100,12 @@ def get_measure_value(
 
 def main():
     logger.info("==== START ====")
-
     projects = get_projects()
 
-    ncloc_cache: dict[
-        tuple[str, str], int
-    ] = {}  # (project_key, branch|__main__) -> ncloc
-    newlines_cache: dict[tuple[str, str], int] = {}  # (project_key, pr) -> new_lines
+    ncloc_cache = {}
+    newlines_cache = {}
 
-    report = []
+    results = []
 
     for p in projects:
         project_key = p.get("key")
@@ -128,74 +115,55 @@ def main():
 
         tasks = get_ce_tasks(project_key)
 
-        total_tasks = 0
-        pr_tasks = 0
-        branch_tasks = 0
+        tasks_total = 0
+        tasks_branch = 0
+        tasks_pr = 0
 
-        total_lines_checked = 0
-        total_pr_new_lines = 0
-        total_branch_ncloc = 0
+        lines_branch_sum = 0
+        lines_pr_sum = 0
 
         for t in tasks:
-            total_tasks += 1
-
+            tasks_total += 1
             pr = t.get("pullRequest")
             branch = t.get("branch")
 
             if pr:
-                pr_tasks += 1
-                cache_key = (project_key, str(pr))
-                if cache_key not in newlines_cache:
-                    newlines_cache[cache_key] = get_measure_value(
-                        project_key, "new_lines", pull_request=str(pr)
-                    )
-                nl = newlines_cache[cache_key]
-                total_lines_checked += nl
-                total_pr_new_lines += nl
-                continue
+                tasks_pr += 1
+                ck = (project_key, str(pr))
+                if ck not in newlines_cache:
+                    newlines_cache[ck] = measure_value(project_key, "new_lines", pull_request=str(pr))
+                lines_pr_sum += newlines_cache[ck]
+            else:
+                tasks_branch += 1
+                b = branch if branch else "__main__"
+                ck = (project_key, b)
+                if ck not in ncloc_cache:
+                    if b == "__main__":
+                        ncloc_cache[ck] = measure_value(project_key, "ncloc")
+                    else:
+                        ncloc_cache[ck] = measure_value(project_key, "ncloc", branch=b)
+                lines_branch_sum += ncloc_cache[ck]
 
-            branch_tasks += 1
-            branch_name = branch if branch else "__main__"
-            cache_key = (project_key, branch_name)
-            if cache_key not in ncloc_cache:
-                if branch:
-                    ncloc_cache[cache_key] = get_measure_value(
-                        project_key, "ncloc", branch=branch
-                    )
-                else:
-                    ncloc_cache[cache_key] = get_measure_value(project_key, "ncloc")
-            ncloc = ncloc_cache[cache_key]
-            total_lines_checked += ncloc
-            total_branch_ncloc += ncloc
-
-        report.append(
+        results.append(
             {
                 "project": project_name,
                 "key": project_key,
-                "tasks_total": total_tasks,
-                "tasks_branch": branch_tasks,
-                "tasks_pr": pr_tasks,
-                "lines_checked_total": total_lines_checked,
-                "lines_checked_branch_ncloc_sum": total_branch_ncloc,
-                "lines_checked_pr_new_lines_sum": total_pr_new_lines,
+                "tasks_total": tasks_total,
+                "tasks_branch": tasks_branch,
+                "tasks_pr": tasks_pr,
+                "branch_lines_sum": lines_branch_sum,
+                "pr_new_lines_sum": lines_pr_sum,
             }
         )
 
-        logger.info(
-            f"[REPORT] {project_key}: tasks={total_tasks} (branch={branch_tasks}, pr={pr_tasks}), "
-            f"lines={total_lines_checked} (branch_sum={total_branch_ncloc}, pr_sum={total_pr_new_lines})"
-        )
-
-    report.sort(key=lambda x: x["lines_checked_total"], reverse=True)
+    results.sort(key=lambda x: (x["branch_lines_sum"] + x["pr_new_lines_sum"]), reverse=True)
 
     print("\n==== RESULT ====")
-    for row in report:
+    for r in results:
         print(
-            f"{row['project']} | tasks={row['tasks_total']} (branch={row['tasks_branch']}, pr={row['tasks_pr']}) | "
-            f"lines_total={row['lines_checked_total']} | branch_sum={row['lines_checked_branch_ncloc_sum']} | "
-            f"pr_sum={row['lines_checked_pr_new_lines_sum']} | key={row['key']}"
+            f"{r['project']} | tasks={r['tasks_total']} (branch={r['tasks_branch']}, pr={r['tasks_pr']}) | "
+            f"branch_lines={r['branch_lines_sum']} | pr_new_lines={r['pr_new_lines_sum']} | key={r['key']}"
         )
-
     logger.info("==== DONE ====")
 
 
