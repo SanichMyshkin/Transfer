@@ -28,51 +28,92 @@ def pick_primary_interface(interfaces):
     return interfaces[0]
 
 
-def normalize_host(h):
-    hostid = str(h.get("hostid", ""))
-    host = h.get("host", "")
-    name = h.get("name", "")
-    status = int(h.get("status", 0)) if str(h.get("status", "")).isdigit() else h.get("status")
+def normalize_macros(macros):
+    out = []
+    for m in macros or []:
+        macro = m.get("macro")
+        value = m.get("value")
+        if macro:
+            out.append({"macro": macro, "value": value})
+    return out
 
-    iface = pick_primary_interface(h.get("interfaces") or [])
-    ip = iface.get("ip") or ""
-    dns = iface.get("dns") or ""
-    port = iface.get("port") or ""
-    useip = iface.get("useip")
 
-    groups = [g.get("name", "") for g in (h.get("groups") or []) if g.get("name")]
-    templates = [t.get("name", "") for t in (h.get("parentTemplates") or []) if t.get("name")]
-    tags = []
-    for t in h.get("tags") or []:
+def normalize_tags(tags):
+    out = []
+    for t in tags or []:
         tag = t.get("tag")
         val = t.get("value")
         if tag:
-            tags.append({"tag": tag, "value": val})
+            out.append({"tag": tag, "value": val})
+    return out
+
+
+def normalize_host(h):
+    iface = pick_primary_interface(h.get("interfaces") or [])
+
+    groups = [g.get("name", "") for g in (h.get("groups") or []) if g.get("name")]
+    templates = [t.get("name", "") for t in (h.get("parentTemplates") or []) if t.get("name")]
+
+    inventory = h.get("inventory") or {}
+    inventory_mode = h.get("inventory_mode")
 
     return {
-        "hostid": hostid,
-        "host": host,
-        "name": name,
-        "status": status,
-        "ip": ip,
-        "dns": dns,
-        "port": port,
-        "useip": useip,
+        "hostid": str(h.get("hostid", "")),
+        "host": h.get("host", ""),
+        "name": h.get("name", ""),
+        "status": int(h.get("status", 0)) if str(h.get("status", "")).isdigit() else h.get("status"),
+        "maintenance_status": h.get("maintenance_status"),
+        "proxy_hostid": h.get("proxy_hostid"),
+        "description": h.get("description", ""),
+
+        "available": h.get("available"),
+        "snmp_available": h.get("snmp_available"),
+        "ipmi_available": h.get("ipmi_available"),
+        "jmx_available": h.get("jmx_available"),
+
+        "ip": iface.get("ip") or "",
+        "dns": iface.get("dns") or "",
+        "port": iface.get("port") or "",
+        "useip": iface.get("useip"),
+        "interface_type": iface.get("type"),
+        "interface_available": iface.get("available"),
+        "interface_error": iface.get("error"),
+
         "groups": groups,
         "templates": templates,
-        "tags": tags,
+        "tags": normalize_tags(h.get("tags")),
+
+        "inventory_mode": inventory_mode,
+        "inventory": inventory,
+
+        "macros": normalize_macros(h.get("macros")),
     }
 
 
 def fetch_hosts(api):
     raw = api.host.get(
-        output=["hostid", "host", "name", "status"],
-        selectInterfaces=["ip", "dns", "port", "useip", "main"],
+        output=[
+            "hostid",
+            "host",
+            "name",
+            "status",
+            "description",
+            "proxy_hostid",
+            "maintenance_status",
+            "available",
+            "snmp_available",
+            "ipmi_available",
+            "jmx_available",
+            "inventory_mode",
+        ],
+        selectInterfaces=["ip", "dns", "port", "useip", "main", "type", "available", "error"],
         selectGroups=["name"],
         selectParentTemplates=["templateid", "name"],
         selectTags="extend",
+        selectInventory="extend",
+        selectMacros=["macro", "value"],
     )
-    return [normalize_host(h) for h in raw or []]
+    return [normalize_host(h) for h in (raw or [])]
 
 
 def main():
@@ -81,14 +122,15 @@ def main():
     api.login(token=ZABBIX_TOKEN)
     logger.info("Ок")
 
-    logger.info("Получаю хосты...")
+    logger.info("Получаю хосты + данные...")
     hosts = fetch_hosts(api)
     logger.info(f"Хостов: {len(hosts)}")
 
     enabled = sum(1 for h in hosts if h.get("status") == 0)
     disabled = sum(1 for h in hosts if h.get("status") == 1)
     no_ip = sum(1 for h in hosts if not h.get("ip"))
-    logger.info(f"Enabled: {enabled}, Disabled: {disabled}, Без IP: {no_ip}")
+    inv_filled = sum(1 for h in hosts if (h.get("inventory") or {}).get("os") or (h.get("inventory") or {}).get("name"))
+    logger.info(f"Enabled: {enabled}, Disabled: {disabled}, Без IP: {no_ip}, Inventory хоть что-то: {inv_filled}")
 
     api.logout()
     logger.info("Сессия закрыта")
