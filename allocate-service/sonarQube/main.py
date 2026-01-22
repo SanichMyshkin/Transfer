@@ -1,9 +1,7 @@
 import os
 import logging
 import requests
-import xlsxwriter
 import urllib3
-import sqlite3
 from dotenv import load_dotenv
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -16,8 +14,8 @@ logger = logging.getLogger(__name__)
 
 load_dotenv()
 
-SONAR_URL = os.getenv("SONAR_URL")
-TOKEN = os.getenv("SONAR_TOKEN")
+SONAR_URL = os.getenv("SONAR_URL", "").rstrip("/")
+TOKEN = os.getenv("SONAR_TOKEN", "")
 
 if not SONAR_URL or not TOKEN:
     logger.error("Не заданы переменные окружения SONAR_URL и SONAR_TOKEN")
@@ -25,80 +23,13 @@ if not SONAR_URL or not TOKEN:
 
 session = requests.Session()
 session.auth = (TOKEN, "")
-
-DB_PATH = "sonar_history.db"
-
-
-def init_db():
-    logger.info("Инициализация базы данных...")
-    with sqlite3.connect(DB_PATH) as conn:
-        cur = conn.cursor()
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS ce_tasks_history (
-            id TEXT PRIMARY KEY,
-            project_key TEXT,
-            status TEXT,
-            type TEXT,
-            executedAt TEXT,
-            createdAt TEXT,
-            updatedAt TEXT
-        )
-        """)
-    logger.info("База данных готова.")
+session.headers.update({"Accept": "application/json"})
 
 
-def save_ce_tasks_to_db(project_key, tasks):
-    new_count = 0
-    with sqlite3.connect(DB_PATH) as conn:
-        cur = conn.cursor()
-        for t in tasks:
-            try:
-                cur.execute("""
-                    INSERT INTO ce_tasks_history (id, project_key, status, type, executedAt, createdAt, updatedAt)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    t.get("id"),
-                    project_key,
-                    t.get("status"),
-                    t.get("type"),
-                    t.get("executionTime"),
-                    t.get("submittedAt"),
-                    t.get("updatedAt")
-                ))
-                new_count += 1
-            except sqlite3.IntegrityError:
-                pass
-    logger.info(f"[DB] Новых задач добавлено: {new_count}")
-    return new_count
-
-
-def get_total_runs_from_db(project_key):
-    with sqlite3.connect(DB_PATH) as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM ce_tasks_history WHERE project_key = ?", (project_key,))
-        total = cur.fetchone()[0]
-    logger.info(f"[DB] Полное количество запусков проекта {project_key}: {total}")
-    return total
-
-
-def get_sonar_users():
-    logger.info("Получение списка пользователей...")
-    users = []
-    page = 1
-    size = 500
-    while True:
-        logger.info(f"[USERS] GET page={page}")
-        r = session.get(f"{SONAR_URL}/api/users/search", params={"p": page, "ps": size}, verify=False)
-        r.raise_for_status()
-        data = r.json()
-        batch = data.get("users", [])
-        users.extend(batch)
-        logger.info(f"[USERS] Получено {len(batch)} пользователей (всего: {len(users)})")
-        if page * size >= data.get("paging", {}).get("total", 0):
-            break
-        page += 1
-    logger.info(f"Пользователи получены: {len(users)}")
-    return users
+def sonar_get(path: str, params: dict):
+    r = session.get(f"{SONAR_URL}{path}", params=params, verify=False, timeout=60)
+    r.raise_for_status()
+    return r.json()
 
 
 def get_projects():
@@ -106,160 +37,165 @@ def get_projects():
     projects = []
     page = 1
     size = 500
+
     while True:
         logger.info(f"[PROJECTS] GET page={page}")
-        r = session.get(f"{SONAR_URL}/api/projects/search", params={"p": page, "ps": size}, verify=False)
-        r.raise_for_status()
-        data = r.json()
+        data = sonar_get("/api/projects/search", {"p": page, "ps": size})
         batch = data.get("components", [])
         projects.extend(batch)
         logger.info(f"[PROJECTS] Получено {len(batch)} (всего: {len(projects)})")
-        if page * size >= data.get("paging", {}).get("total", 0):
+
+        total = data.get("paging", {}).get("total", 0)
+        if page * size >= total:
             break
         page += 1
+
     logger.info(f"Проекты получены: {len(projects)}")
     return projects
 
 
-def get_ncloc(project_key):
-    logger.info(f"[NCLOC] Получение строк кода для {project_key}")
-    r = session.get(
-        f"{SONAR_URL}/api/measures/component",
-        params={"component": project_key, "metricKeys": "ncloc"},
-        verify=False
-    )
-    r.raise_for_status()
-    measures = r.json().get("component", {}).get("measures", [])
-    n = int(measures[0].get("value", 0)) if measures else 0
-    logger.info(f"[NCLOC] {project_key}: {n}")
-    return n
-
-
-def get_issues_count(project_key):
-    r = session.get(
-        f"{SONAR_URL}/api/issues/search",
-        params={"componentKeys": project_key, "ps": 1},
-        verify=False
-    )
-    r.raise_for_status()
-    total = r.json().get("total", 0)
-    logger.info(f"[ISSUES] {project_key}: {total}")
-    return total
-
-
-def get_ce_tasks(project_key):
-    logger.info(f"[TASKS] Получение CE задач для {project_key}")
+def get_ce_tasks(project_key: str):
+    logger.info(f"[CE TASKS] Получение задач CE для {project_key}")
+    tasks_all = []
     page = 1
     size = 100
-    tasks_all = []
+
     while True:
-        logger.info(f"[TASKS] GET page={page}")
-        r = session.get(
-            f"{SONAR_URL}/api/ce/activity",
-            params={
-                "status": "IN_PROGRESS,SUCCESS,FAILED,CANCELED",
+        logger.info(f"[CE TASKS] {project_key} GET page={page}")
+        data = sonar_get(
+            "/api/ce/activity",
+            {
                 "component": project_key,
-                "p": page, "ps": size,
+                "status": "IN_PROGRESS,SUCCESS,FAILED,CANCELED",
+                "p": page,
+                "ps": size,
             },
-            verify=False
         )
-        r.raise_for_status()
-        data = r.json()
         batch = data.get("tasks", [])
         tasks_all.extend(batch)
-        logger.info(f"[TASKS] Получено {len(batch)} задач (всего: {len(tasks_all)})")
-        if page * size >= data.get("paging", {}).get("total", 0):
+        logger.info(
+            f"[CE TASKS] {project_key} Получено {len(batch)}, всего {len(tasks_all)}"
+        )
+
+        total = data.get("paging", {}).get("total", 0)
+        if page * size >= total:
             break
         page += 1
-    return len(tasks_all), tasks_all
+
+    return tasks_all
 
 
-def write_report(users, projects, filename="sonar_report.xlsx"):
-    logger.info("Формирование Excel отчёта...")
+def get_measure_value(
+    component_key: str,
+    metric: str,
+    branch: str | None = None,
+    pull_request: str | None = None,
+) -> int:
+    params = {"component": component_key, "metricKeys": metric}
+    if branch:
+        params["branch"] = branch
+    if pull_request:
+        params["pullRequest"] = pull_request
 
-    workbook = xlsxwriter.Workbook(filename)
-
-    ws_users = workbook.add_worksheet("users")
-    headers_users = [
-        "login", "name", "email", "active", "groups", "tokensCount",
-        "local", "externalIdentity", "externalProvider", "avatar",
-        "lastConnectionDate", "managed"
-    ]
-    for col, h in enumerate(headers_users):
-        ws_users.write(0, col, h)
-
-    for row, u in enumerate(users, start=1):
-        ws_users.write(row, 0, u.get("login"))
-        ws_users.write(row, 1, u.get("name") or u.get("fullName"))
-        ws_users.write(row, 2, u.get("email"))
-        ws_users.write(row, 3, u.get("active"))
-        ws_users.write(row, 4, "; ".join(u.get("groups", [])))
-        ws_users.write(row, 5, u.get("tokensCount"))
-        ws_users.write(row, 6, u.get("local"))
-        ws_users.write(row, 7, u.get("externalIdentity"))
-        ws_users.write(row, 8, u.get("externalProvider"))
-        ws_users.write(row, 9, u.get("avatar"))
-        ws_users.write(row, 10, u.get("lastConnectionDate"))
-        ws_users.write(row, 11, u.get("managed"))
-
-    ws_projects = workbook.add_worksheet("projects")
-    headers_projects = [
-        "project_name",
-        "lines_of_code",
-        "issues_total",
-        "run_count_total"
-    ]
-    for col, h in enumerate(headers_projects):
-        ws_projects.write(0, col, h)
-
-    total_runs = 0
-
-    for i, p in enumerate(projects, start=1):
-        key = p.get("key")
-        name = p.get("name")
-
-        logger.info(f"=== [{i}/{len(projects)}] Обработка проекта: {key} ===")
-
-        ncloc = get_ncloc(key)
-        issues = get_issues_count(key)
-
-        _, tasks = get_ce_tasks(key)
-        save_ce_tasks_to_db(key, tasks)
-
-        runs_total = get_total_runs_from_db(key)
-        total_runs += runs_total
-
-        ws_projects.write(i, 0, name)
-        ws_projects.write(i, 1, ncloc)
-        ws_projects.write(i, 2, issues)
-        ws_projects.write(i, 3, runs_total)
-
-    ws_summary = workbook.add_worksheet("summary")
-
-    local_users = len([u for u in users if u.get("local")])
-    external_users = len([u for u in users if not u.get("local")])
-
-    ws_summary.write(0, 0, "total_users")
-    ws_summary.write(0, 1, len(users))
-    ws_summary.write(1, 0, "local_users")
-    ws_summary.write(1, 1, local_users)
-    ws_summary.write(2, 0, "external_users")
-    ws_summary.write(2, 1, external_users)
-    ws_summary.write(3, 0, "total_projects")
-    ws_summary.write(3, 1, len(projects))
-    ws_summary.write(4, 0, "total_runs")
-    ws_summary.write(4, 1, total_runs)
-
-    workbook.close()
-    logger.info(f"Отчёт сформирован: {filename}")
+    data = sonar_get("/api/measures/component", params)
+    measures = data.get("component", {}).get("measures", [])
+    if not measures:
+        return 0
+    v = measures[0].get("value", "0")
+    try:
+        return int(float(v))
+    except Exception:
+        return 0
 
 
 def main():
     logger.info("==== START ====")
-    init_db()
-    users = get_sonar_users()
+
     projects = get_projects()
-    write_report(users, projects)
+
+    ncloc_cache: dict[
+        tuple[str, str], int
+    ] = {}  # (project_key, branch|__main__) -> ncloc
+    newlines_cache: dict[tuple[str, str], int] = {}  # (project_key, pr) -> new_lines
+
+    report = []
+
+    for p in projects:
+        project_key = p.get("key")
+        project_name = p.get("name") or project_key
+        if not project_key:
+            continue
+
+        tasks = get_ce_tasks(project_key)
+
+        total_tasks = 0
+        pr_tasks = 0
+        branch_tasks = 0
+
+        total_lines_checked = 0
+        total_pr_new_lines = 0
+        total_branch_ncloc = 0
+
+        for t in tasks:
+            total_tasks += 1
+
+            pr = t.get("pullRequest")
+            branch = t.get("branch")
+
+            if pr:
+                pr_tasks += 1
+                cache_key = (project_key, str(pr))
+                if cache_key not in newlines_cache:
+                    newlines_cache[cache_key] = get_measure_value(
+                        project_key, "new_lines", pull_request=str(pr)
+                    )
+                nl = newlines_cache[cache_key]
+                total_lines_checked += nl
+                total_pr_new_lines += nl
+                continue
+
+            branch_tasks += 1
+            branch_name = branch if branch else "__main__"
+            cache_key = (project_key, branch_name)
+            if cache_key not in ncloc_cache:
+                if branch:
+                    ncloc_cache[cache_key] = get_measure_value(
+                        project_key, "ncloc", branch=branch
+                    )
+                else:
+                    ncloc_cache[cache_key] = get_measure_value(project_key, "ncloc")
+            ncloc = ncloc_cache[cache_key]
+            total_lines_checked += ncloc
+            total_branch_ncloc += ncloc
+
+        report.append(
+            {
+                "project": project_name,
+                "key": project_key,
+                "tasks_total": total_tasks,
+                "tasks_branch": branch_tasks,
+                "tasks_pr": pr_tasks,
+                "lines_checked_total": total_lines_checked,
+                "lines_checked_branch_ncloc_sum": total_branch_ncloc,
+                "lines_checked_pr_new_lines_sum": total_pr_new_lines,
+            }
+        )
+
+        logger.info(
+            f"[REPORT] {project_key}: tasks={total_tasks} (branch={branch_tasks}, pr={pr_tasks}), "
+            f"lines={total_lines_checked} (branch_sum={total_branch_ncloc}, pr_sum={total_pr_new_lines})"
+        )
+
+    report.sort(key=lambda x: x["lines_checked_total"], reverse=True)
+
+    print("\n==== RESULT ====")
+    for row in report:
+        print(
+            f"{row['project']} | tasks={row['tasks_total']} (branch={row['tasks_branch']}, pr={row['tasks_pr']}) | "
+            f"lines_total={row['lines_checked_total']} | branch_sum={row['lines_checked_branch_ncloc_sum']} | "
+            f"pr_sum={row['lines_checked_pr_new_lines_sum']} | key={row['key']}"
+        )
+
     logger.info("==== DONE ====")
 
 
