@@ -17,6 +17,8 @@ TOKEN = os.getenv("SONAR_TOKEN", "")
 OUT_FILE = os.getenv("OUT_FILE", "sonarQube_report.xlsx")
 SD_FILE = os.getenv("SD_FILE")
 
+SKIP_IF_CODE_NOT_IN_SD = os.getenv("SKIP_IF_CODE_NOT_IN_SD", "true").strip().lower() in {"1", "true", "yes", "y"}
+
 if not SONAR_URL or not TOKEN:
     logger.error("Не заданы SONAR_URL/SONAR_TOKEN")
     raise SystemExit(1)
@@ -27,36 +29,27 @@ session.headers.update({"Accept": "application/json"})
 
 
 def sonar_get(path: str, params: dict):
-    url = f"{SONAR_URL}{path}"
-    logger.info("API GET %s params=%s", path, params)
-    r = session.get(url, params=params, verify=False, timeout=60)
-    logger.info("API RESP %s -> %s", path, r.status_code)
-    if r.status_code >= 400:
-        logger.error("API ERROR %s -> %s body=%s", path, r.status_code, r.text)
+    r = session.get(f"{SONAR_URL}{path}", params=params, verify=False, timeout=60)
     r.raise_for_status()
     return r.json()
 
 
 def get_projects():
-    logger.info("Получаем список проектов...")
     projects = []
     page = 1
     size = 500
     while True:
         data = sonar_get("/api/projects/search", {"p": page, "ps": size})
-        batch = data.get("components", [])
-        projects.extend(batch)
+        projects.extend(data.get("components", []))
         total = data.get("paging", {}).get("total", 0)
-        logger.info("Проекты: page=%d получили=%d всего=%d", page, len(batch), len(projects))
         if page * size >= total:
             break
         page += 1
-    logger.info("Итого проектов: %d", len(projects))
+    logger.info("Проектов получено: %d", len(projects))
     return projects
 
 
 def get_ce_tasks(project_key: str):
-    logger.info("Получаем CE tasks для проекта: %s", project_key)
     tasks = []
     page = 1
     size = 100
@@ -70,10 +63,8 @@ def get_ce_tasks(project_key: str):
                 "ps": size,
             },
         )
-        batch = data.get("tasks", [])
-        tasks.extend(batch)
+        tasks.extend(data.get("tasks", []))
         total = data.get("paging", {}).get("total", 0)
-        logger.info("CE tasks %s: page=%d получили=%d всего=%d", project_key, page, len(batch), len(tasks))
         if page * size >= total:
             break
         page += 1
@@ -90,30 +81,17 @@ def measure_value(project_key: str, metric: str, branch=None, pull_request=None)
     data = sonar_get("/api/measures/component", params)
     measures = data.get("component", {}).get("measures", [])
     if not measures:
-        logger.info("MEASURE EMPTY project=%s metric=%s branch=%s pr=%s", project_key, metric, branch, pull_request)
         return 0
 
     m = measures[0]
-    if pull_request:
-        v = (m.get("period") or {}).get("value")
-    else:
-        v = m.get("value")
-
+    v = (m.get("period") or {}).get("value") if pull_request else m.get("value")
     if v is None:
-        logger.info("MEASURE NO_VALUE project=%s metric=%s branch=%s pr=%s", project_key, metric, branch, pull_request)
         return 0
 
     try:
-        val = int(float(v))
-        logger.info("MEASURE OK project=%s metric=%s branch=%s pr=%s value=%s", project_key, metric, branch, pull_request, val)
-        return val
+        return int(float(v))
     except Exception:
-        logger.info("MEASURE BAD_VALUE project=%s metric=%s branch=%s pr=%s raw=%s", project_key, metric, branch, pull_request, v)
         return 0
-
-
-def parse_service_prefix(project_key: str):
-    return project_key.split(":", 1)[0]
 
 
 def split_service_name_code(prefix: str):
@@ -126,14 +104,10 @@ def split_service_name_code(prefix: str):
 def normalize_code(v):
     if v is None:
         return ""
-    if isinstance(v, bool):
-        return ""
     if isinstance(v, int):
         return str(v)
-    if isinstance(v, float):
-        if v.is_integer():
-            return str(int(v))
-        return str(v).strip()
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
     s = str(v).strip()
     if s.endswith(".0"):
         s2 = s[:-2]
@@ -144,37 +118,30 @@ def normalize_code(v):
 
 def load_sd_map(path: str):
     if not path:
-        logger.info("SD_FILE не задан, маппинг сервисов пропущен")
+        logger.info("SD_FILE не задан, маппинг пустой")
         return {}
     if not os.path.exists(path):
-        logger.info("SD_FILE не найден: %s (маппинг сервисов пропущен)", path)
+        logger.info("SD_FILE не найден: %s, маппинг пустой", path)
         return {}
 
-    logger.info("Загружаем SD файл: %s", path)
     wb = load_workbook(path, data_only=True)
     ws = wb.active
     m = {}
-    loaded = 0
-    skipped = 0
     for row in ws.iter_rows(min_row=2, values_only=True):
         code = normalize_code(row[1] if len(row) > 1 else None)
         if not code:
-            skipped += 1
             continue
-        category = (str(row[2]).strip() if len(row) > 2 and row[2] is not None else "")
-        name = (str(row[3]).strip() if len(row) > 3 and row[3] is not None else "")
+        category = str(row[2]).strip() if len(row) > 2 and row[2] is not None else ""
+        name = str(row[3]).strip() if len(row) > 3 and row[3] is not None else ""
         m[code] = (category, name)
-        loaded += 1
-    logger.info("SD маппинг загружен: %d записей (пропущено строк без кода: %d)", loaded, skipped)
+    logger.info("SD маппинг: %d кодов", len(m))
     return m
 
 
 def write_xlsx(rows):
-    logger.info("Пишем XLSX отчет: %s", OUT_FILE)
-
     wb = Workbook()
     ws = wb.active
-    ws.title = "Отчет SonarQube (fix)"
+    ws.title = "Отчет SonarQube"
 
     headers = [
         "Наименование сервиса",
@@ -190,9 +157,7 @@ def write_xlsx(rows):
     for c in range(1, len(headers) + 1):
         ws.cell(row=1, column=c).font = bold
 
-    total_lines = sum(r["total_lines"] for r in rows)
-    if total_lines == 0:
-        total_lines = 1
+    total_lines = sum(r["total_lines"] for r in rows) or 1
 
     for r in rows:
         pct = round((r["total_lines"] / total_lines) * 100, 2)
@@ -206,11 +171,12 @@ def write_xlsx(rows):
         ])
 
     wb.save(OUT_FILE)
-    logger.info("Готово. Строк в отчете: %d", len(rows))
+    logger.info("Отчет сохранен: %s (строк: %d)", OUT_FILE, len(rows))
 
 
 def main():
     logger.info("==== START ====")
+    logger.info("SKIP_IF_CODE_NOT_IN_SD=%s", SKIP_IF_CODE_NOT_IN_SD)
 
     sd_map = load_sd_map(SD_FILE)
     projects = get_projects()
@@ -219,15 +185,34 @@ def main():
     newlines_cache = {}
     services = {}
 
-    for i, p in enumerate(projects, start=1):
+    skipped_no_code = 0
+    skipped_no_sd_match = 0
+
+    for idx, p in enumerate(projects, start=1):
         project_key = p.get("key")
         if not project_key:
             continue
 
-        logger.info("Обработка проекта %d/%d: %s", i, len(projects), project_key)
+        prefix = project_key.split(":", 1)[0]
+        svc_name, svc_code = split_service_name_code(prefix)
+
+        if not svc_code:
+            skipped_no_code += 1
+            logger.info("SKIP project=%s (не выделен код из префикса '%s')", project_key, prefix)
+            continue
+
+        if SKIP_IF_CODE_NOT_IN_SD and svc_code not in sd_map:
+            skipped_no_sd_match += 1
+            logger.info("SKIP project=%s (код %s не найден в SD)", project_key, svc_code)
+            continue
+
+        category = ""
+        if svc_code in sd_map:
+            category, mapped_name = sd_map[svc_code]
+            if mapped_name:
+                svc_name = mapped_name
 
         tasks = get_ce_tasks(project_key)
-        logger.info("Проект %s: tasks=%d", project_key, len(tasks))
 
         tasks_total = 0
         branch_lines = 0
@@ -253,27 +238,14 @@ def main():
                         ncloc_cache[ck] = measure_value(project_key, "ncloc", branch=b)
                 branch_lines += ncloc_cache[ck]
 
-        logger.info("Проект %s: tasks_total=%d branch_lines=%d pr_new_lines=%d", project_key, tasks_total, branch_lines, pr_lines)
+        total_lines = branch_lines + pr_lines
 
-        prefix = project_key.split(":", 1)[0]
-        svc_name, svc_code = split_service_name_code(prefix)
-
-        category = ""
-        if svc_code and svc_code in sd_map:
-            category, mapped_name = sd_map[svc_code]
-            if mapped_name:
-                logger.info("SD match code=%s: name '%s' -> '%s', category='%s'", svc_code, svc_name, mapped_name, category)
-                svc_name = mapped_name
-            else:
-                logger.info("SD match code=%s: category='%s', name not provided", svc_code, category)
-        else:
-            if svc_code:
-                logger.info("SD no match for code=%s (оставляем имя='%s', категория пустая)", svc_code, svc_name)
-            else:
-                logger.info("Код не выделен из префикса '%s' (оставляем имя='%s', категория пустая)", prefix, svc_name)
+        logger.info(
+            "AGG project=%s -> service=%s code=%s cat=%s tasks=%d lines=%d (branch=%d pr=%d)",
+            project_key, svc_name, svc_code, category, tasks_total, total_lines, branch_lines, pr_lines
+        )
 
         svc_key = (svc_name.lower(), svc_code, category)
-
         if svc_key not in services:
             services[svc_key] = {
                 "service": svc_name,
@@ -284,21 +256,16 @@ def main():
             }
 
         services[svc_key]["tasks_total"] += tasks_total
-        services[svc_key]["total_lines"] += branch_lines + pr_lines
-
-        logger.info(
-            "Агрегация сервис=%s code=%s category=%s -> tasks_total=%d total_lines=%d",
-            services[svc_key]["service"],
-            services[svc_key]["code"],
-            services[svc_key]["category"],
-            services[svc_key]["tasks_total"],
-            services[svc_key]["total_lines"],
-        )
+        services[svc_key]["total_lines"] += total_lines
 
     rows = list(services.values())
     rows.sort(key=lambda x: x["total_lines"], reverse=True)
 
-    logger.info("Сервисов в отчете: %d", len(rows))
+    logger.info(
+        "Итог: сервисов=%d | skipped(no_code)=%d | skipped(no_sd_match)=%d",
+        len(rows), skipped_no_code, skipped_no_sd_match
+    )
+
     write_xlsx(rows)
 
     logger.info("==== DONE ====")
