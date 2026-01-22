@@ -17,7 +17,7 @@ TOKEN = os.getenv("SONAR_TOKEN", "")
 OUT_FILE = os.getenv("OUT_FILE", "sonarQube_report.xlsx")
 SD_FILE = os.getenv("SD_FILE")
 
-SKIP_IF_CODE_NOT_IN_SD = os.getenv("SKIP_IF_CODE_NOT_IN_SD", "true").strip().lower() in {"1", "true", "yes", "y"}
+SKIP_IF_CODE_NOT_IN_SD = True
 
 if not SONAR_URL or not TOKEN:
     logger.error("Не заданы SONAR_URL/SONAR_TOKEN")
