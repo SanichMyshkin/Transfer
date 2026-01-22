@@ -131,15 +131,24 @@ def load_db(path):
     return df
 
 
-def load_sd_owner_map(path):
-    df = pd.read_excel(path, usecols="B,H", dtype=str, engine="openpyxl")
-    df.columns = ["service_id", "owner"]
+def load_sd_people_map(path):
+    # B = service_id, H = owner, I = manager
+    df = pd.read_excel(path, usecols="B,H,I", dtype=str, engine="openpyxl")
+    df.columns = ["service_id", "owner", "manager"]
     df = df.fillna("")
+
     df["service_id"] = df["service_id"].astype(str).str.strip()
     df["owner"] = df["owner"].astype(str).map(clean_spaces)
+    df["manager"] = df["manager"].astype(str).map(clean_spaces)
+
     df = df[df["service_id"] != ""].copy()
     last = df.drop_duplicates("service_id", keep="last")
-    return dict(zip(last["service_id"], last["owner"]))
+
+    # value: {"owner": "...", "manager": "..."}
+    return {
+        sid: {"owner": o, "manager": m}
+        for sid, o, m in zip(last["service_id"].tolist(), last["owner"].tolist(), last["manager"].tolist())
+    }
 
 
 def load_bk_business_type_map(path):
@@ -148,9 +157,8 @@ def load_bk_business_type_map(path):
     df.columns = ["c1", "c2", "c3", "business_type"]
 
     def make_fio(r):
-        fio = " ".join(
-            [clean_spaces(r["c2"]), clean_spaces(r["c1"]), clean_spaces(r["c3"])]
-        )
+        # порядок оставляю как у тебя: c2 c1 c3
+        fio = " ".join([clean_spaces(r["c2"]), clean_spaces(r["c1"]), clean_spaces(r["c3"])])
         return clean_spaces(fio)
 
     df["fio_key"] = df.apply(make_fio, axis=1).map(normalize_name_key)
@@ -166,11 +174,22 @@ def build_map(df, keys):
     tmp["_k"] = list(map(tuple, tmp[keys].to_numpy()))
     counts = tmp["_k"].value_counts().to_dict()
     last = tmp.drop_duplicates("_k", keep="last")
-    mp = {
-        k: (r["service"], r["service_id"])
-        for k, r in zip(last["_k"], last.to_dict("records"))
-    }
+    mp = {k: (r["service"], r["service_id"]) for k, r in zip(last["_k"], last.to_dict("records"))}
     return mp, counts
+
+
+def pick_business_type(bk_type_map: dict, owner: str, manager: str) -> str:
+    # 1) owner
+    if owner:
+        bt = bk_type_map.get(normalize_name_key(owner), "")
+        if bt:
+            return bt
+    # 2) manager
+    if manager:
+        bt = bk_type_map.get(normalize_name_key(manager), "")
+        if bt:
+            return bt
+    return ""
 
 
 def main():
@@ -189,7 +208,7 @@ def main():
     total_active = len(df_hosts)
 
     df_db = load_db(DB_FILE)
-    owner_map = load_sd_owner_map(SD_FILE)
+    sd_people_map = load_sd_people_map(SD_FILE)
     bk_type_map = load_bk_business_type_map(BK_FILE)
 
     map_both, dup_both = build_map(df_db, ["ip", "dns"])
@@ -233,22 +252,27 @@ def main():
         if amb:
             ambiguous += 1
 
-        per_service[(service, service_id)] = (
-            per_service.get((service, service_id), 0) + 1
-        )
+        per_service[(service, service_id)] = per_service.get((service, service_id), 0) + 1
 
     rows = []
     for (service, service_id), cnt in per_service.items():
         pct = (cnt / matched) * 100 if matched else 0
-        owner = owner_map.get(service_id, "")
-        business_type = bk_type_map.get(normalize_name_key(owner), "")
+
+        people = sd_people_map.get(service_id, {"owner": "", "manager": ""})
+        owner = people.get("owner", "")
+        manager = people.get("manager", "")
+
+        # если владельца нет — в отчёт подставляем менеджера
+        owner_for_report = owner or manager
+
+        business_type = pick_business_type(bk_type_map, owner=owner, manager=manager)
 
         rows.append(
             {
                 "business_type": business_type,
                 "service": service,
                 "service_id": service_id,
-                "owner": owner,
+                "owner": owner_for_report,
                 "hosts_found": cnt,
                 "percent": round(pct, 2),
             }
@@ -272,14 +296,7 @@ def main():
     }
     df_report = df_report.rename(columns=rename_map)
 
-    out_cols = [
-        "Тип бизнеса",
-        "Наименование сервиса",
-        "КОД",
-        "Владелец сервиса",
-        "Кол-во хостов",
-        "% потребления",
-    ]
+    out_cols = ["Тип бизнеса", "Наименование сервиса", "КОД", "Владелец сервиса", "Кол-во хостов", "% потребления"]
     df_report = df_report.reindex(columns=out_cols)
 
     logger.info(f"Активных хостов: {total_active}")
