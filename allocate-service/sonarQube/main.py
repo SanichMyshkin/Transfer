@@ -18,6 +18,7 @@ OUT_FILE = os.getenv("OUT_FILE", "sonarQube_report.xlsx")
 SD_FILE = os.getenv("SD_FILE")
 
 SKIP_IF_CODE_NOT_IN_SD = True
+SKIP_EMPTY_SERVICES = True
 
 if not SONAR_URL or not TOKEN:
     logger.error("Не заданы SONAR_URL/SONAR_TOKEN")
@@ -177,6 +178,7 @@ def write_xlsx(rows):
 def main():
     logger.info("==== START ====")
     logger.info("SKIP_IF_CODE_NOT_IN_SD=%s", SKIP_IF_CODE_NOT_IN_SD)
+    logger.info("SKIP_EMPTY_SERVICES=%s", SKIP_EMPTY_SERVICES)
 
     sd_map = load_sd_map(SD_FILE)
     projects = get_projects()
@@ -187,6 +189,7 @@ def main():
 
     skipped_no_code = 0
     skipped_no_sd_match = 0
+    skipped_empty_project = 0
 
     for idx, p in enumerate(projects, start=1):
         project_key = p.get("key")
@@ -198,7 +201,7 @@ def main():
 
         if not svc_code:
             skipped_no_code += 1
-            logger.info("SKIP project=%s (не выделен код из префикса '%s')", project_key, prefix)
+            logger.info("SKIP project=%s (не выделен код)", project_key)
             continue
 
         if SKIP_IF_CODE_NOT_IN_SD and svc_code not in sd_map:
@@ -240,12 +243,18 @@ def main():
 
         total_lines = branch_lines + pr_lines
 
+        if SKIP_EMPTY_SERVICES and tasks_total == 0 and total_lines == 0:
+            skipped_empty_project += 1
+            logger.info("SKIP project=%s (пусто: tasks=0 lines=0)", project_key)
+            continue
+
         logger.info(
-            "AGG project=%s -> service=%s code=%s cat=%s tasks=%d lines=%d (branch=%d pr=%d)",
-            project_key, svc_name, svc_code, category, tasks_total, total_lines, branch_lines, pr_lines
+            "AGG project=%s -> service=%s code=%s cat=%s tasks=%d lines=%d",
+            project_key, svc_name, svc_code, category, tasks_total, total_lines
         )
 
         svc_key = (svc_name.lower(), svc_code, category)
+
         if svc_key not in services:
             services[svc_key] = {
                 "service": svc_name,
@@ -259,15 +268,18 @@ def main():
         services[svc_key]["total_lines"] += total_lines
 
     rows = list(services.values())
+
+    if SKIP_EMPTY_SERVICES:
+        rows = [r for r in rows if not (r["tasks_total"] == 0 and r["total_lines"] == 0)]
+
     rows.sort(key=lambda x: x["total_lines"], reverse=True)
 
     logger.info(
-        "Итог: сервисов=%d | skipped(no_code)=%d | skipped(no_sd_match)=%d",
-        len(rows), skipped_no_code, skipped_no_sd_match
+        "Итог: сервисов=%d | skipped(no_code)=%d | skipped(no_sd_match)=%d | skipped(empty_project)=%d",
+        len(rows), skipped_no_code, skipped_no_sd_match, skipped_empty_project
     )
 
     write_xlsx(rows)
-
     logger.info("==== DONE ====")
 
 
