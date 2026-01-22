@@ -286,7 +286,7 @@ def main():
     logger.info(f"Сервисов в отчёте: {len(df_report)}")
 
     with pd.ExcelWriter(OUTPUT_XLSX, engine="openpyxl") as writer:
-        df_report.to_excel(writer, index=False, sheet_name="report")
+        df_report.to_excel(writer, index=False, sheet_name="Отчет Zabbix")
 
 
 if __name__ == "__main__":
