@@ -18,6 +18,7 @@ OUT_FILE = os.getenv("OUT_FILE", "sonarQube_report.xlsx")
 SD_FILE = os.getenv("SD_FILE")
 
 if not SONAR_URL or not TOKEN:
+    logger.error("Не заданы SONAR_URL/SONAR_TOKEN")
     raise SystemExit(1)
 
 session = requests.Session()
@@ -26,26 +27,36 @@ session.headers.update({"Accept": "application/json"})
 
 
 def sonar_get(path: str, params: dict):
-    r = session.get(f"{SONAR_URL}{path}", params=params, verify=False, timeout=60)
+    url = f"{SONAR_URL}{path}"
+    logger.info("API GET %s params=%s", path, params)
+    r = session.get(url, params=params, verify=False, timeout=60)
+    logger.info("API RESP %s -> %s", path, r.status_code)
+    if r.status_code >= 400:
+        logger.error("API ERROR %s -> %s body=%s", path, r.status_code, r.text)
     r.raise_for_status()
     return r.json()
 
 
 def get_projects():
+    logger.info("Получаем список проектов...")
     projects = []
     page = 1
     size = 500
     while True:
         data = sonar_get("/api/projects/search", {"p": page, "ps": size})
-        projects.extend(data.get("components", []))
+        batch = data.get("components", [])
+        projects.extend(batch)
         total = data.get("paging", {}).get("total", 0)
+        logger.info("Проекты: page=%d получили=%d всего=%d", page, len(batch), len(projects))
         if page * size >= total:
             break
         page += 1
+    logger.info("Итого проектов: %d", len(projects))
     return projects
 
 
 def get_ce_tasks(project_key: str):
+    logger.info("Получаем CE tasks для проекта: %s", project_key)
     tasks = []
     page = 1
     size = 100
@@ -59,8 +70,10 @@ def get_ce_tasks(project_key: str):
                 "ps": size,
             },
         )
-        tasks.extend(data.get("tasks", []))
+        batch = data.get("tasks", [])
+        tasks.extend(batch)
         total = data.get("paging", {}).get("total", 0)
+        logger.info("CE tasks %s: page=%d получили=%d всего=%d", project_key, page, len(batch), len(tasks))
         if page * size >= total:
             break
         page += 1
@@ -77,6 +90,7 @@ def measure_value(project_key: str, metric: str, branch=None, pull_request=None)
     data = sonar_get("/api/measures/component", params)
     measures = data.get("component", {}).get("measures", [])
     if not measures:
+        logger.info("MEASURE EMPTY project=%s metric=%s branch=%s pr=%s", project_key, metric, branch, pull_request)
         return 0
 
     m = measures[0]
@@ -86,11 +100,15 @@ def measure_value(project_key: str, metric: str, branch=None, pull_request=None)
         v = m.get("value")
 
     if v is None:
+        logger.info("MEASURE NO_VALUE project=%s metric=%s branch=%s pr=%s", project_key, metric, branch, pull_request)
         return 0
 
     try:
-        return int(float(v))
+        val = int(float(v))
+        logger.info("MEASURE OK project=%s metric=%s branch=%s pr=%s value=%s", project_key, metric, branch, pull_request, val)
+        return val
     except Exception:
+        logger.info("MEASURE BAD_VALUE project=%s metric=%s branch=%s pr=%s raw=%s", project_key, metric, branch, pull_request, v)
         return 0
 
 
@@ -125,22 +143,35 @@ def normalize_code(v):
 
 
 def load_sd_map(path: str):
-    if not path or not os.path.exists(path):
+    if not path:
+        logger.info("SD_FILE не задан, маппинг сервисов пропущен")
         return {}
+    if not os.path.exists(path):
+        logger.info("SD_FILE не найден: %s (маппинг сервисов пропущен)", path)
+        return {}
+
+    logger.info("Загружаем SD файл: %s", path)
     wb = load_workbook(path, data_only=True)
     ws = wb.active
     m = {}
+    loaded = 0
+    skipped = 0
     for row in ws.iter_rows(min_row=2, values_only=True):
         code = normalize_code(row[1] if len(row) > 1 else None)
         if not code:
+            skipped += 1
             continue
         category = (str(row[2]).strip() if len(row) > 2 and row[2] is not None else "")
         name = (str(row[3]).strip() if len(row) > 3 and row[3] is not None else "")
         m[code] = (category, name)
+        loaded += 1
+    logger.info("SD маппинг загружен: %d записей (пропущено строк без кода: %d)", loaded, skipped)
     return m
 
 
 def write_xlsx(rows):
+    logger.info("Пишем XLSX отчет: %s", OUT_FILE)
+
     wb = Workbook()
     ws = wb.active
     ws.title = "Отчет SonarQube (fix)"
@@ -149,7 +180,7 @@ def write_xlsx(rows):
         "Наименование сервиса",
         "КОД",
         "Категория",
-        "кол-во тасок",
+        "Кол-во тасок",
         "Обработано кол-во строк",
         "% потребления",
     ]
@@ -159,22 +190,28 @@ def write_xlsx(rows):
     for c in range(1, len(headers) + 1):
         ws.cell(row=1, column=c).font = bold
 
-    total_lines = sum(r["total_lines"] for r in rows) or 1
+    total_lines = sum(r["total_lines"] for r in rows)
+    if total_lines == 0:
+        total_lines = 1
 
     for r in rows:
+        pct = round((r["total_lines"] / total_lines) * 100, 2)
         ws.append([
             r["service"],
             r["code"],
             r["category"],
             r["tasks_total"],
             r["total_lines"],
-            r["total_lines"] / total_lines,
+            f"{pct}%",
         ])
 
     wb.save(OUT_FILE)
+    logger.info("Готово. Строк в отчете: %d", len(rows))
 
 
 def main():
+    logger.info("==== START ====")
+
     sd_map = load_sd_map(SD_FILE)
     projects = get_projects()
 
@@ -182,12 +219,15 @@ def main():
     newlines_cache = {}
     services = {}
 
-    for p in projects:
+    for i, p in enumerate(projects, start=1):
         project_key = p.get("key")
         if not project_key:
             continue
 
+        logger.info("Обработка проекта %d/%d: %s", i, len(projects), project_key)
+
         tasks = get_ce_tasks(project_key)
+        logger.info("Проект %s: tasks=%d", project_key, len(tasks))
 
         tasks_total = 0
         branch_lines = 0
@@ -213,14 +253,24 @@ def main():
                         ncloc_cache[ck] = measure_value(project_key, "ncloc", branch=b)
                 branch_lines += ncloc_cache[ck]
 
-        prefix = parse_service_prefix(project_key)
+        logger.info("Проект %s: tasks_total=%d branch_lines=%d pr_new_lines=%d", project_key, tasks_total, branch_lines, pr_lines)
+
+        prefix = project_key.split(":", 1)[0]
         svc_name, svc_code = split_service_name_code(prefix)
 
         category = ""
         if svc_code and svc_code in sd_map:
             category, mapped_name = sd_map[svc_code]
             if mapped_name:
+                logger.info("SD match code=%s: name '%s' -> '%s', category='%s'", svc_code, svc_name, mapped_name, category)
                 svc_name = mapped_name
+            else:
+                logger.info("SD match code=%s: category='%s', name not provided", svc_code, category)
+        else:
+            if svc_code:
+                logger.info("SD no match for code=%s (оставляем имя='%s', категория пустая)", svc_code, svc_name)
+            else:
+                logger.info("Код не выделен из префикса '%s' (оставляем имя='%s', категория пустая)", prefix, svc_name)
 
         svc_key = (svc_name.lower(), svc_code, category)
 
@@ -236,10 +286,22 @@ def main():
         services[svc_key]["tasks_total"] += tasks_total
         services[svc_key]["total_lines"] += branch_lines + pr_lines
 
+        logger.info(
+            "Агрегация сервис=%s code=%s category=%s -> tasks_total=%d total_lines=%d",
+            services[svc_key]["service"],
+            services[svc_key]["code"],
+            services[svc_key]["category"],
+            services[svc_key]["tasks_total"],
+            services[svc_key]["total_lines"],
+        )
+
     rows = list(services.values())
     rows.sort(key=lambda x: x["total_lines"], reverse=True)
 
+    logger.info("Сервисов в отчете: %d", len(rows))
     write_xlsx(rows)
+
+    logger.info("==== DONE ====")
 
 
 if __name__ == "__main__":
