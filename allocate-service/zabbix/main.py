@@ -1,6 +1,5 @@
 import os
 import logging
-
 import pandas as pd
 from dotenv import load_dotenv
 from zabbix_utils import ZabbixAPI
@@ -9,28 +8,25 @@ load_dotenv()
 
 ZABBIX_URL = os.getenv("ZABBIX_URL", "").rstrip("/")
 ZABBIX_TOKEN = os.getenv("ZABBIX_TOKEN", "")
+DB_XLSX = os.getenv("DB_XLSX", "")
+SD_XLSX = os.getenv("SD_XLSX", "")
+OUTPUT_XLSX = os.getenv("OUTPUT_XLSX", "report.xlsx")
+BAN_SERVICE_IDS = os.getenv("BAN_SERVICE_IDS", "")
 
-DB_XLSX = os.getenv("DB_XLSX", "db.xlsx").strip()
-OUTPUT_XLSX = os.getenv("OUTPUT_XLSX", "zabbix_report.xlsx")
-
-logger = logging.getLogger("zabbix_hosts_ownership")
+logger = logging.getLogger("zabbix_ownership")
 logger.setLevel(logging.INFO)
 handler = logging.StreamHandler()
 handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S"))
 logger.handlers.clear()
 logger.addHandler(handler)
 
-if not ZABBIX_URL or not ZABBIX_TOKEN:
-    logger.error("Не найден ZABBIX_URL или ZABBIX_TOKEN в .env")
+if not ZABBIX_URL or not ZABBIX_TOKEN or not DB_XLSX or not SD_XLSX:
     raise SystemExit(1)
 
-if not DB_XLSX:
-    logger.error("Не найден DB_XLSX в .env (путь к db.xlsx)")
+if not os.path.exists(DB_XLSX) or not os.path.exists(SD_XLSX):
     raise SystemExit(1)
 
-if not os.path.exists(DB_XLSX):
-    logger.error(f"DB_XLSX не существует: {DB_XLSX}")
-    raise SystemExit(1)
+ban_set = {x.strip() for x in BAN_SERVICE_IDS.split(",") if x.strip()}
 
 
 def pick_primary_interface(interfaces):
@@ -42,93 +38,87 @@ def pick_primary_interface(interfaces):
     return interfaces[0]
 
 
-def fetch_hosts_min(api):
+def fetch_hosts(api):
     raw = api.host.get(
         output=["hostid", "host", "name", "status"],
         selectInterfaces=["ip", "dns", "main"],
     )
-
     rows = []
     for h in raw or []:
+        status = int(h.get("status", 0))
+        if status != 0:
+            continue
         iface = pick_primary_interface(h.get("interfaces") or [])
-        ip = (iface.get("ip") or "").strip()
-        dns = (iface.get("dns") or "").strip()
-
-        status_raw = h.get("status", 0)
-        status_int = int(status_raw) if str(status_raw).isdigit() else 0
-        active = True if status_int == 0 else False  # 0=enabled, 1=disabled
-
-        name = (h.get("name") or h.get("host") or "").strip()
-
         rows.append(
             {
-                "name": name,
-                "ip": ip,
-                "dns": dns,
-                "active": active,
+                "ip": (iface.get("ip") or "").strip(),
+                "dns": (iface.get("dns") or "").strip().lower(),
             }
         )
-    return pd.DataFrame(rows, columns=["name", "ip", "dns", "active"])
+    return pd.DataFrame(rows)
 
 
-def norm_ip(s: str) -> str:
-    return (s or "").strip()
-
-
-def norm_dns(s: str) -> str:
-    return (s or "").strip().lower()
-
-
-def load_db(db_path: str) -> pd.DataFrame:
-    # Берём строго нужные колонки: A(service), B(service_id), N(dns), V(ip)
-    df = pd.read_excel(db_path, usecols="A,B,N,V", dtype=str, engine="openpyxl").copy()
+def load_db(path):
+    df = pd.read_excel(path, usecols="A,B,N,V", dtype=str, engine="openpyxl")
     df.columns = ["service", "service_id", "dns", "ip"]
-
-    df["service"] = df["service"].fillna("").astype(str).str.strip()
-    df["service_id"] = df["service_id"].fillna("").astype(str).str.strip()
-    df["ip"] = df["ip"].fillna("").astype(str).map(norm_ip)
-    df["dns"] = df["dns"].fillna("").astype(str).map(norm_dns)
-
-    # выкидываем совсем пустые строки, где нет ни ip ни dns и нет сервиса/айди
-    df = df[~((df["ip"] == "") & (df["dns"] == "") & (df["service"] == "") & (df["service_id"] == ""))].copy()
+    df = df.fillna("")
+    df["service"] = df["service"].astype(str).str.strip()
+    df["service_id"] = df["service_id"].astype(str).str.strip()
+    df["ip"] = df["ip"].astype(str).str.strip()
+    df["dns"] = df["dns"].astype(str).str.strip().str.lower()
     return df
 
 
-def build_last_map(df: pd.DataFrame, key_cols):
-    """
-    Возвращает:
-      - last_map: key -> (service, service_id)
-      - dup_count_map: key -> сколько строк в db на этот ключ (для "сомнительных")
-    """
+def clean_owner(s):
+    s = (s or "").strip()
+    s = s.replace(",", " ")
+    s = " ".join(s.split())
+    return s
+
+
+def load_sd_owner_map(path):
+    df = pd.read_excel(path, usecols="B,H", dtype=str, engine="openpyxl")
+    df.columns = ["service_id", "owner"]
+    df = df.fillna("")
+    df["service_id"] = df["service_id"].astype(str).str.strip()
+    df["owner"] = df["owner"].astype(str).map(clean_owner)
+    df = df[df["service_id"] != ""].copy()
+    last = df.drop_duplicates("service_id", keep="last")
+    return {k: v for k, v in zip(last["service_id"].tolist(), last["owner"].tolist())}
+
+
+def build_map(df, keys):
     tmp = df.copy()
-    tmp["_key"] = list(zip(*[tmp[c].tolist() for c in key_cols]))
-    counts = tmp["_key"].value_counts().to_dict()
-
-    # берём "последнюю" по порядку в файле
-    last_rows = tmp.drop_duplicates(subset=["_key"], keep="last")
-    last_map = {
-        k: (row["service"], row["service_id"])
-        for k, row in zip(last_rows["_key"].tolist(), last_rows.to_dict("records"))
-    }
-    return last_map, counts
+    tmp["_k"] = list(zip(*[tmp[k].tolist() for k in keys]))
+    counts = tmp["_k"].value_counts().to_dict()
+    last = tmp.drop_duplicates("_k", keep="last")
+    mp = {k: (r["service"], r["service_id"]) for k, r in zip(last["_k"], last.to_dict("records"))}
+    return mp, counts
 
 
-def match_ownership(active_hosts_df: pd.DataFrame, db_df: pd.DataFrame):
-    map_both, dup_both = build_last_map(db_df, ["ip", "dns"])
-    map_ip, dup_ip = build_last_map(db_df[db_df["ip"] != ""], ["ip"])
-    map_dns, dup_dns = build_last_map(db_df[db_df["dns"] != ""], ["dns"])
+def main():
+    api = ZabbixAPI(url=ZABBIX_URL)
+    api.login(token=ZABBIX_TOKEN)
+    df_hosts = fetch_hosts(api)
+    api.logout()
 
-    total_active = len(active_hosts_df)
-    determined_total = 0
-    ambiguous_matches = 0
+    total_active = len(df_hosts)
 
-    per_service = {}  # (service, service_id) -> count
+    df_db = load_db(DB_XLSX)
+    owner_map = load_sd_owner_map(SD_XLSX)
 
-    matched_rows = []
+    map_both, dup_both = build_map(df_db, ["ip", "dns"])
+    map_ip, dup_ip = build_map(df_db[df_db["ip"] != ""], ["ip"])
+    map_dns, dup_dns = build_map(df_db[df_db["dns"] != ""], ["dns"])
 
-    for _, h in active_hosts_df.iterrows():
-        ip = norm_ip(h["ip"])
-        dns = norm_dns(h["dns"])
+    per_service = {}
+    matched = 0
+    ambiguous = 0
+    banned_hits = 0
+
+    for _, h in df_hosts.iterrows():
+        ip = h["ip"]
+        dns = h["dns"]
 
         owner = None
         amb = False
@@ -147,87 +137,41 @@ def match_ownership(active_hosts_df: pd.DataFrame, db_df: pd.DataFrame):
             continue
 
         service, service_id = owner
-        determined_total += 1
+        if service_id in ban_set:
+            banned_hits += 1
+            continue
+
+        matched += 1
         if amb:
-            ambiguous_matches += 1
+            ambiguous += 1
 
-        key = (service, service_id)
-        per_service[key] = per_service.get(key, 0) + 1
+        per_service[(service, service_id)] = per_service.get((service, service_id), 0) + 1
 
-        matched_rows.append(
-            {
-                "name": h["name"],
-                "ip": ip,
-                "dns": dns,
-                "service": service,
-                "service_id": service_id,
-                "ambiguous": amb,
-            }
-        )
-
-    return per_service, determined_total, total_active, ambiguous_matches, pd.DataFrame(matched_rows)
-
-
-def main():
-    logger.info("Подключаюсь к Zabbix...")
-    api = ZabbixAPI(url=ZABBIX_URL)
-    api.login(token=ZABBIX_TOKEN)
-    logger.info("Ок")
-
-    logger.info("Получаю хосты (name/ip/dns/active)...")
-    df_hosts = fetch_hosts_min(api)
-    api.logout()
-    logger.info("Сессия закрыта")
-
-    total_hosts = len(df_hosts)
-    df_active = df_hosts[df_hosts["active"] == True].copy()
-    logger.info(f"Хостов всего: {total_hosts}, активных: {len(df_active)} (выключенные скипаем)")
-
-    logger.info(f"Читаю базу сопоставления: {DB_XLSX}")
-    df_db = load_db(DB_XLSX)
-    logger.info(f"Строк в db (A,B,N,V): {len(df_db)}")
-
-    logger.info("Матчу ownership (ip+dns -> ip -> dns)...")
-    per_service, determined_total, total_active, ambiguous_matches, df_matched = match_ownership(df_active, df_db)
-
-    if total_active == 0:
-        logger.info("В Zabbix нет активных хостов — нечего матчить")
-        determined_pct_all_active = 0.0
-    else:
-        determined_pct_all_active = (determined_total / total_active) * 100.0
-
-    logger.info(
-        f"Определено (matched) активных хостов: {determined_total}/{total_active} "
-        f"({determined_pct_all_active:.2f}%)"
-    )
-    logger.info(f"Сомнительных матчей (ключ в db встречался >1 раза, взяли последний): {ambiguous_matches}")
-
-    report_rows = []
+    rows = []
     for (service, service_id), cnt in per_service.items():
-        pct_of_determined = (cnt / determined_total) * 100.0 if determined_total else 0.0
-        report_rows.append(
+        pct = (cnt / matched) * 100 if matched else 0
+        rows.append(
             {
                 "service": service,
                 "service_id": service_id,
+                "owner": owner_map.get(service_id, ""),
                 "hosts_found": cnt,
-                "percent_of_determined": round(pct_of_determined, 2),
+                "percent": round(pct, 2),
             }
         )
 
-    df_report = pd.DataFrame(report_rows, columns=["service", "service_id", "hosts_found", "percent_of_determined"])
+    df_report = pd.DataFrame(rows, columns=["service", "service_id", "owner", "hosts_found", "percent"])
     if not df_report.empty:
-        df_report = df_report.sort_values(by=["hosts_found", "service", "service_id"], ascending=[False, True, True])
+        df_report = df_report.sort_values(["hosts_found", "service", "service_id"], ascending=[False, True, True])
 
-    logger.info(f"Пишу Excel: {OUTPUT_XLSX}")
+    logger.info(f"Активных хостов: {total_active}")
+    logger.info(f"Определено хостов: {matched} ({(matched / total_active * 100) if total_active else 0:.2f}%)")
+    logger.info(f"Сомнительных совпадений: {ambiguous}")
+    logger.info(f"Скип по бан-листу (service_id): {banned_hits}")
+
     with pd.ExcelWriter(OUTPUT_XLSX, engine="openpyxl") as writer:
-        df_active.to_excel(writer, index=False, sheet_name="active_hosts")
-        df_report.to_excel(writer, index=False, sheet_name="services_report")
-        df_matched.to_excel(writer, index=False, sheet_name="matched_details")
-
-    logger.info("Готово")
-    return df_report
+        df_report.to_excel(writer, index=False, sheet_name="report")
 
 
 if __name__ == "__main__":
-    df_report = main()
-    print(df_report)
+    main()
