@@ -1,5 +1,7 @@
 import os
 import logging
+
+import pandas as pd
 from dotenv import load_dotenv
 from zabbix_utils import ZabbixAPI
 
@@ -7,11 +9,13 @@ load_dotenv()
 
 ZABBIX_URL = os.getenv("ZABBIX_URL", "").rstrip("/")
 ZABBIX_TOKEN = os.getenv("ZABBIX_TOKEN", "")
+OUTPUT_XLSX = os.getenv("OUTPUT_XLSX", "zabbix_hosts.xlsx")
 
 logger = logging.getLogger("zabbix_hosts_dump")
 logger.setLevel(logging.INFO)
 handler = logging.StreamHandler()
 handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S"))
+logger.handlers.clear()
 logger.addHandler(handler)
 
 if not ZABBIX_URL or not ZABBIX_TOKEN:
@@ -28,92 +32,33 @@ def pick_primary_interface(interfaces):
     return interfaces[0]
 
 
-def normalize_macros(macros):
-    out = []
-    for m in macros or []:
-        macro = m.get("macro")
-        value = m.get("value")
-        if macro:
-            out.append({"macro": macro, "value": value})
-    return out
-
-
-def normalize_tags(tags):
-    out = []
-    for t in tags or []:
-        tag = t.get("tag")
-        val = t.get("value")
-        if tag:
-            out.append({"tag": tag, "value": val})
-    return out
-
-
-def normalize_host(h):
-    iface = pick_primary_interface(h.get("interfaces") or [])
-
-    groups = [g.get("name", "") for g in (h.get("groups") or []) if g.get("name")]
-    templates = [t.get("name", "") for t in (h.get("parentTemplates") or []) if t.get("name")]
-
-    inventory = h.get("inventory") or {}
-    inventory_mode = h.get("inventory_mode")
-
-    return {
-        "hostid": str(h.get("hostid", "")),
-        "host": h.get("host", ""),
-        "name": h.get("name", ""),
-        "status": int(h.get("status", 0)) if str(h.get("status", "")).isdigit() else h.get("status"),
-        "maintenance_status": h.get("maintenance_status"),
-        "proxy_hostid": h.get("proxy_hostid"),
-        "description": h.get("description", ""),
-
-        "available": h.get("available"),
-        "snmp_available": h.get("snmp_available"),
-        "ipmi_available": h.get("ipmi_available"),
-        "jmx_available": h.get("jmx_available"),
-
-        "ip": iface.get("ip") or "",
-        "dns": iface.get("dns") or "",
-        "port": iface.get("port") or "",
-        "useip": iface.get("useip"),
-        "interface_type": iface.get("type"),
-        "interface_available": iface.get("available"),
-        "interface_error": iface.get("error"),
-
-        "groups": groups,
-        "templates": templates,
-        "tags": normalize_tags(h.get("tags")),
-
-        "inventory_mode": inventory_mode,
-        "inventory": inventory,
-
-        "macros": normalize_macros(h.get("macros")),
-    }
-
-
-def fetch_hosts(api):
+def fetch_hosts_min(api):
     raw = api.host.get(
-        output=[
-            "hostid",
-            "host",
-            "name",
-            "status",
-            "description",
-            "proxy_hostid",
-            "maintenance_status",
-            "available",
-            "snmp_available",
-            "ipmi_available",
-            "jmx_available",
-            "inventory_mode",
-        ],
-        selectInterfaces=["ip", "dns", "port", "useip", "main", "type", "available", "error"],
-        selectGroups=["name"],
-        selectParentTemplates=["templateid", "name"],
-        selectTags="extend",
-        selectInventory="extend",
-        selectMacros=["macro", "value"],
+        output=["hostid", "host", "name", "status"],
+        selectInterfaces=["ip", "dns", "main"],
     )
-    return [normalize_host(h) for h in (raw or [])]
+
+    rows = []
+    for h in raw or []:
+        iface = pick_primary_interface(h.get("interfaces") or [])
+        ip = (iface.get("ip") or "").strip()
+        dns = (iface.get("dns") or "").strip()
+
+        status_raw = h.get("status", 0)
+        status_int = int(status_raw) if str(status_raw).isdigit() else 0
+        active = True if status_int == 0 else False  # 0=enabled, 1=disabled
+
+        name = (h.get("name") or h.get("host") or "").strip()
+
+        rows.append(
+            {
+                "name": name,
+                "ip": ip,
+                "dns": dns,
+                "active": active,
+            }
+        )
+    return rows
 
 
 def main():
@@ -122,21 +67,28 @@ def main():
     api.login(token=ZABBIX_TOKEN)
     logger.info("Ок")
 
-    logger.info("Получаю хосты + данные...")
-    hosts = fetch_hosts(api)
-    logger.info(f"Хостов: {len(hosts)}")
-
-    enabled = sum(1 for h in hosts if h.get("status") == 0)
-    disabled = sum(1 for h in hosts if h.get("status") == 1)
-    no_ip = sum(1 for h in hosts if not h.get("ip"))
-    inv_filled = sum(1 for h in hosts if (h.get("inventory") or {}).get("os") or (h.get("inventory") or {}).get("name"))
-    logger.info(f"Enabled: {enabled}, Disabled: {disabled}, Без IP: {no_ip}, Inventory хоть что-то: {inv_filled}")
+    logger.info("Получаю хосты (name/ip/dns/active)...")
+    rows = fetch_hosts_min(api)
+    logger.info(f"Хостов: {len(rows)}")
 
     api.logout()
     logger.info("Сессия закрыта")
 
-    return hosts
+    df = pd.DataFrame(rows, columns=["name", "ip", "dns", "active"])
+
+    enabled = int(df["active"].sum()) if not df.empty else 0
+    disabled = int((~df["active"]).sum()) if not df.empty else 0
+    no_ip = int((df["ip"].fillna("") == "").sum()) if not df.empty else 0
+    logger.info(f"Enabled: {enabled}, Disabled: {disabled}, Без IP: {no_ip}")
+
+    logger.info(f"Пишу Excel: {OUTPUT_XLSX}")
+    with pd.ExcelWriter(OUTPUT_XLSX, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="hosts")
+
+    logger.info("Готово")
+    return df
 
 
 if __name__ == "__main__":
-    hosts = main()
+    df = main()
+    print(df)  # чтобы прям увидеть в консоли
