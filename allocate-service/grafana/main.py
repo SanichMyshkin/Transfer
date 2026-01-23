@@ -27,7 +27,7 @@ SLEEP_BETWEEN_CALLS = 0.2
 
 EXCLUDE_ALL_ZERO_NUMBERS = True
 
-BAN_SERVICE_IDS = [15473]  # сюда дополняешь коды, которые не учитываем
+BAN_SERVICE_IDS = [15473]  # сюда добавляешь коды, которые не учитываем
 
 logger = logging.getLogger("grafana_usage_report")
 logger.setLevel(logging.INFO)
@@ -66,10 +66,22 @@ def validate_env_and_files():
 
     if not SD_FILE or not os.path.isfile(SD_FILE):
         die(f"SD_FILE не найден: {SD_FILE}")
+
     if not BK_FILE or not os.path.isfile(BK_FILE):
         die(f"BK_FILE не найден: {BK_FILE}")
 
     logger.info(f"Бан-лист (КОД): {sorted(ban_set) if ban_set else 'пусто'}")
+
+
+def clean_spaces(s: str) -> str:
+    s = (s or "").strip()
+    s = s.replace(",", " ")
+    s = " ".join(s.split())
+    return s
+
+
+def normalize_name_key(s: str) -> str:
+    return clean_spaces(s).lower()
 
 
 def login_cookie():
@@ -172,17 +184,6 @@ def normalize_number(x):
     return s
 
 
-def clean_spaces(s: str) -> str:
-    s = (s or "").strip()
-    s = s.replace(",", " ")
-    s = " ".join(s.split())
-    return s
-
-
-def normalize_name_key(s: str) -> str:
-    return clean_spaces(s).lower()
-
-
 def normalize_name(x):
     if pd.isna(x):
         return None
@@ -196,36 +197,7 @@ def is_all_zeros_number(num: str | None) -> bool:
     return bool(re.fullmatch(r"0+", s))
 
 
-def load_sd_mapping(path):
-    # SD: B=номер(код), D=имя сервиса, H=владелец, I=менеджер
-    df = pd.read_excel(path, dtype=str, engine="openpyxl").fillna("")
-
-    map_by_number = {}
-    map_by_name = {}
-
-    for _, row in df.iterrows():
-        num = normalize_number(row.iloc[1])           # B: номер/код
-        sd_name_raw = row.iloc[3]                     # D: имя в SD
-        owner_raw = row.iloc[7] if len(row) > 7 else ""   # H
-        manager_raw = row.iloc[8] if len(row) > 8 else "" # I
-
-        sd_name = clean_spaces(sd_name_raw)
-        owner = clean_spaces(owner_raw)
-        manager = clean_spaces(manager_raw)
-
-        key_name = normalize_name(sd_name_raw)
-
-        if num:
-            map_by_number[num] = {"service_name": sd_name, "owner": owner, "manager": manager}
-        if key_name:
-            map_by_name[key_name] = {"service_name": sd_name, "owner": owner, "manager": manager}
-
-    logger.info(f"Загружено записей из SD: по номеру={len(map_by_number)}, по имени={len(map_by_name)}")
-    return map_by_number, map_by_name
-
-
 def load_bk_business_type_map(path: str):
-    # BK: A,B,C=ФИО частями, AS=тип бизнеса
     df = pd.read_excel(path, usecols="A:C,AS", dtype=str, engine="openpyxl").fillna("")
     df.columns = ["c1", "c2", "c3", "business_type"]
 
@@ -256,20 +228,46 @@ def pick_business_type(bk_type_map: dict, owner: str, manager: str) -> str:
     return ""
 
 
+def load_sd_mapping_with_people(path):
+    df = pd.read_excel(path, dtype=str, engine="openpyxl").fillna("")
+    map_by_number = {}
+    map_by_name = {}
+
+    for _, row in df.iterrows():
+        num = normalize_number(row.iloc[1])       # B
+        sd_name_raw = row.iloc[3]                 # D
+        owner_raw = row.iloc[7] if len(row) > 7 else ""    # H
+        manager_raw = row.iloc[8] if len(row) > 8 else ""  # I
+
+        sd_name = clean_spaces(sd_name_raw)
+        owner = clean_spaces(owner_raw)
+        manager = clean_spaces(manager_raw)
+        key_name = normalize_name(sd_name_raw)
+
+        payload = {"sd_name": sd_name, "owner": owner, "manager": manager}
+
+        if num:
+            map_by_number[num] = payload
+        if key_name:
+            map_by_name[key_name] = payload
+
+    logger.info(f"SD: загружено записей: по номеру={len(map_by_number)}, по имени={len(map_by_name)}")
+    return map_by_number, map_by_name
+
+
 def main():
     validate_env_and_files()
 
     logger.info("Старт формирования отчёта по использованию Grafana")
     login_cookie()
 
-    map_by_number, map_by_name = load_sd_mapping(SD_FILE)
     bk_type_map = load_bk_business_type_map(BK_FILE)
+    map_by_number, map_by_name = load_sd_mapping_with_people(SD_FILE)
 
     org_ids = sorted(get_unique_org_ids())[:ORG_LIMIT]
     logger.info(f"Будет обработано организаций: {len(org_ids)} (лимит ORG_LIMIT={ORG_LIMIT})")
 
     rows_orgs = []
-
     skipped_all_zeros = 0
     skipped_banned = 0
     no_access = 0
@@ -295,34 +293,26 @@ def main():
         processed += 1
 
         sd = None
-        source = None
-
         if norm_number and norm_number in map_by_number:
             sd = map_by_number[norm_number]
-            source = "номер"
         elif norm_name and norm_name in map_by_name:
             sd = map_by_name[norm_name]
-            source = "имя"
 
-        service_name_sd = (sd or {}).get("service_name") or ""
+        sd_name = (sd or {}).get("sd_name") or ""
         owner = (sd or {}).get("owner") or ""
         manager = (sd or {}).get("manager") or ""
+
         owner_for_report = owner or manager
         business_type = pick_business_type(bk_type_map, owner=owner, manager=manager)
 
         if not switch_org(org_id):
             no_access += 1
-            logger.warning(
-                f'Нет доступа к организации {org_id}: "{raw_org_name}". '
-                f'SD имя="{service_name_sd or "не найдено"}" (по {source or "—"}), '
-                f'владелец="{owner_for_report or "—"}", тип бизнеса="{business_type or "—"}"'
-            )
             rows_orgs.append(
                 {
                     "Тип бизнеса": business_type,
+                    "Наименование сервиса": sd_name if sd_name else org_name,
+                    "КОД": "NO ACCESS",
                     "Владелец сервиса": owner_for_report,
-                    "Наименование сервиса": service_name_sd,
-                    "КОД": org_number,
                     "Кол-во панелей": "NO ACCESS",
                     "Потребление в %": None,
                 }
@@ -340,18 +330,12 @@ def main():
         for d in get_root_dashboards():
             panels_total += get_dashboard_panels(d["uid"])
 
-        logger.info(
-            f'Организация {org_id}: "{org_name}" ({org_number}) — панелей={panels_total}, '
-            f'SD имя="{service_name_sd or "—"}" (по {source or "—"}), '
-            f'владелец="{owner_for_report or "—"}", тип бизнеса="{business_type or "—"}"'
-        )
-
         rows_orgs.append(
             {
                 "Тип бизнеса": business_type,
-                "Владелец сервиса": owner_for_report,
-                "Наименование сервиса": service_name_sd,
+                "Наименование сервиса": sd_name if sd_name else org_name,
                 "КОД": org_number,
+                "Владелец сервиса": owner_for_report,
                 "Кол-во панелей": panels_total,
                 "Потребление в %": None,
             }
@@ -364,9 +348,10 @@ def main():
             total_panels += p
 
     logger.info(
-        f"Итоги: обработано={processed}, скип_нули={skipped_all_zeros}, скип_бан={skipped_banned}, no_access={no_access}"
+        f"Итоги: обработано={processed}, скип_нули={skipped_all_zeros}, "
+        f"скип_бан={skipped_banned}, no_access={no_access}"
     )
-    logger.info(f"Общее количество панелей (только учтённые): {total_panels}")
+    logger.info(f"Общее количество панелей по всем учтённым организациям: {total_panels}")
 
     for row in rows_orgs:
         p = row["Кол-во панелей"]
