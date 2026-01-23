@@ -12,131 +12,221 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 load_dotenv()
+
 SONAR_URL = os.getenv("SONAR_URL", "").rstrip("/")
-TOKEN = os.getenv("SONAR_TOKEN", "")
+SONAR2_URL = os.getenv("SONAR2_URL", "").rstrip("/")
+SONAR3_URL = os.getenv("SONAR3_URL", "").rstrip("/")
+
+SONAR_TOKEN = os.getenv("SONAR_TOKEN", "")
+SONAR2_TOKEN = os.getenv("SONAR2_TOKEN", "")
+SONAR3_TOKEN = os.getenv("SONAR3_TOKEN", "")
+
 OUT_FILE = os.getenv("OUT_FILE", "sonarQube_report.xlsx")
 SD_FILE = os.getenv("SD_FILE")
+BK_FILE = os.getenv("BK_FILE", "bk_all_users.xlsx")
 
 SKIP_IF_CODE_NOT_IN_SD = True
 SKIP_EMPTY_SERVICES = True
 
-if not SONAR_URL or not TOKEN:
-    logger.error("Не заданы SONAR_URL/SONAR_TOKEN")
-    raise SystemExit(1)
-
-session = requests.Session()
-session.auth = (TOKEN, "")
-session.headers.update({"Accept": "application/json"})
+BAN_SERVICE_IDS = [15473]
 
 
-def sonar_get(path: str, params: dict):
-    r = session.get(f"{SONAR_URL}{path}", params=params, verify=False, timeout=60)
-    r.raise_for_status()
-    return r.json()
+def die(msg: str):
+    logger.error(msg)
+    raise SystemExit(2)
 
 
-def get_projects():
-    projects = []
-    page = 1
-    size = 500
-    while True:
-        data = sonar_get("/api/projects/search", {"p": page, "ps": size})
-        projects.extend(data.get("components", []))
-        total = data.get("paging", {}).get("total", 0)
-        if page * size >= total:
-            break
-        page += 1
-    logger.info("Проектов получено: %d", len(projects))
-    return projects
+def build_ban_set(v):
+    if not isinstance(v, (list, tuple, set)):
+        die("BAN_SERVICE_IDS должен быть list/tuple/set")
+    return {str(x).strip() for x in v if str(x).strip()}
 
 
-def get_ce_tasks(project_key: str):
-    tasks = []
-    page = 1
-    size = 100
-    while True:
-        data = sonar_get(
-            "/api/ce/activity",
-            {
-                "component": project_key,
-                "status": "IN_PROGRESS,SUCCESS,FAILED,CANCELED",
-                "p": page,
-                "ps": size,
-            },
-        )
-        tasks.extend(data.get("tasks", []))
-        total = data.get("paging", {}).get("total", 0)
-        if page * size >= total:
-            break
-        page += 1
-    return tasks
+ban_set = build_ban_set(BAN_SERVICE_IDS)
 
 
-def measure_value(project_key: str, metric: str, branch=None, pull_request=None):
-    params = {"component": project_key, "metricKeys": metric}
-    if branch:
-        params["branch"] = branch
-    if pull_request:
-        params["pullRequest"] = str(pull_request)
+def clean(s):
+    return " ".join((s or "").replace(",", " ").split())
 
-    data = sonar_get("/api/measures/component", params)
-    measures = data.get("component", {}).get("measures", [])
-    if not measures:
-        return 0
 
-    m = measures[0]
-    v = (m.get("period") or {}).get("value") if pull_request else m.get("value")
+def norm_key(s):
+    return clean(s).lower()
+
+
+def normalize_code(v):
     if v is None:
-        return 0
+        return ""
+    if isinstance(v, (int, float)):
+        return str(int(v))
+    s = str(v).strip()
+    return s[:-2] if s.endswith(".0") and s[:-2].isdigit() else s
 
-    try:
-        return int(float(v))
-    except Exception:
-        return 0
 
-
-def split_service_name_code(prefix: str):
+def split_service_name_code(prefix):
     parts = [p for p in prefix.split("-") if p]
     if len(parts) >= 2 and parts[-1].isdigit():
         return "-".join(parts[:-1]), parts[-1]
     return prefix, ""
 
 
-def normalize_code(v):
-    if v is None:
-        return ""
-    if isinstance(v, int):
-        return str(v)
-    if isinstance(v, float) and v.is_integer():
-        return str(int(v))
-    s = str(v).strip()
-    if s.endswith(".0"):
-        s2 = s[:-2]
-        if s2.isdigit():
-            return s2
+def make_session(token):
+    s = requests.Session()
+    s.auth = (token, "")
+    s.headers.update({"Accept": "application/json"})
     return s
 
 
-def load_sd_map(path: str):
-    if not path:
-        logger.info("SD_FILE не задан, маппинг пустой")
-        return {}
-    if not os.path.exists(path):
-        logger.info("SD_FILE не найден: %s, маппинг пустой", path)
+def sonar_get(s, url, path, params):
+    r = s.get(f"{url}{path}", params=params, verify=False, timeout=60)
+    r.raise_for_status()
+    return r.json()
+
+
+def get_projects(s, url):
+    res, p = [], 1
+    while True:
+        d = sonar_get(s, url, "/api/projects/search", {"p": p, "ps": 500})
+        res += d.get("components", [])
+        if p * 500 >= d["paging"]["total"]:
+            break
+        p += 1
+    return res
+
+
+def get_tasks(s, url, key):
+    res, p = [], 1
+    while True:
+        d = sonar_get(
+            s, url, "/api/ce/activity",
+            {"component": key, "status": "IN_PROGRESS,SUCCESS,FAILED,CANCELED", "p": p, "ps": 100}
+        )
+        res += d.get("tasks", [])
+        if p * 100 >= d["paging"]["total"]:
+            break
+        p += 1
+    return res
+
+
+def measure(s, url, key, metric, branch=None, pr=None):
+    params = {"component": key, "metricKeys": metric}
+    if branch:
+        params["branch"] = branch
+    if pr:
+        params["pullRequest"] = str(pr)
+
+    d = sonar_get(s, url, "/api/measures/component", params)
+    m = (d.get("component", {}).get("measures") or [{}])[0]
+    v = (m.get("period") or {}).get("value") if pr else m.get("value")
+    try:
+        return int(float(v))
+    except Exception:
+        return 0
+
+
+def load_sd(path):
+    if not path or not os.path.exists(path):
         return {}
 
     wb = load_workbook(path, data_only=True)
     ws = wb.active
     m = {}
-    for row in ws.iter_rows(min_row=2, values_only=True):
-        code = normalize_code(row[1] if len(row) > 1 else None)
+
+    for r in ws.iter_rows(min_row=2, values_only=True):
+        code = normalize_code(r[1] if len(r) > 1 else None)
         if not code:
             continue
-        category = str(row[2]).strip() if len(row) > 2 and row[2] is not None else ""
-        name = str(row[3]).strip() if len(row) > 3 and row[3] is not None else ""
-        m[code] = (category, name)
-    logger.info("SD маппинг: %d кодов", len(m))
+        m[code] = {
+            "name": clean(r[3] if len(r) > 3 else ""),
+            "owner": clean(r[7] if len(r) > 7 else ""),
+            "manager": clean(r[8] if len(r) > 8 else ""),
+        }
     return m
+
+
+def load_bk(path):
+    if not path or not os.path.exists(path):
+        return {}
+
+    wb = load_workbook(path, data_only=True)
+    ws = wb.active
+    m = {}
+
+    for r in ws.iter_rows(min_row=2, values_only=True):
+        fio = clean(f"{r[1] or ''} {r[0] or ''} {r[2] or ''}")
+        bt = clean(r[44] if len(r) > 44 else "")
+        if fio:
+            m[norm_key(fio)] = bt
+    return m
+
+
+def pick_bt(bk, owner, manager):
+    return bk.get(norm_key(owner)) or bk.get(norm_key(manager)) or ""
+
+
+def process_sonar(url, token, sd, bk, acc):
+    if not url or not token:
+        return
+
+    label = url.replace("https://", "").replace("http://", "")
+    s = make_session(token)
+
+    projects = get_projects(s, url)
+    logger.info("[%s] проектов: %d", label, len(projects))
+
+    ncloc_cache, new_cache = {}, {}
+
+    for p in projects:
+        key = p.get("key")
+        if not key:
+            continue
+
+        svc, code = split_service_name_code(key.split(":", 1)[0])
+        if not code or code in ban_set:
+            continue
+        if SKIP_IF_CODE_NOT_IN_SD and code not in sd:
+            continue
+
+        sd_row = sd.get(code, {})
+        svc = sd_row.get("name") or svc
+        owner = sd_row.get("owner") or sd_row.get("manager")
+        bt = pick_bt(bk, sd_row.get("owner"), sd_row.get("manager"))
+
+        tasks = get_tasks(s, url, key)
+        tcnt, lines = 0, 0
+
+        for t in tasks:
+            tcnt += 1
+            pr, br = t.get("pullRequest"), t.get("branch")
+            if pr:
+                ck = (key, pr)
+                new_cache.setdefault(ck, measure(s, url, key, "new_lines", pr=pr))
+                lines += new_cache[ck]
+            else:
+                b = br or "__main__"
+                ck = (key, b)
+                if ck not in ncloc_cache:
+                    ncloc_cache[ck] = measure(s, url, key, "ncloc", branch=None if b == "__main__" else b)
+                lines += ncloc_cache[ck]
+
+        if SKIP_EMPTY_SERVICES and not tcnt and not lines:
+            continue
+
+        logger.info(
+            '[%s] %s (%s) owner="%s" type="%s" tasks=%d lines=%d',
+            label, svc, code, owner, bt, tcnt, lines
+        )
+
+        acc.setdefault(code, {
+            "business_type": bt,
+            "service": svc,
+            "code": code,
+            "owner": owner,
+            "tasks_total": 0,
+            "total_lines": 0,
+        })
+
+        acc[code]["tasks_total"] += tcnt
+        acc[code]["total_lines"] += lines
 
 
 def write_xlsx(rows):
@@ -145,142 +235,50 @@ def write_xlsx(rows):
     ws.title = "Отчет SonarQube"
 
     headers = [
+        "Тип бизнеса",
         "Наименование сервиса",
         "КОД",
-        "Категория",
+        "Владелец сервиса",
         "Кол-во тасок",
         "Обработано кол-во строк",
         "% потребления",
     ]
-
     ws.append(headers)
-    bold = Font(bold=True)
-    for c in range(1, len(headers) + 1):
-        ws.cell(row=1, column=c).font = bold
 
-    total_lines = sum(r["total_lines"] for r in rows) or 1
+    for c in ws[1]:
+        c.font = Font(bold=True)
 
+    total = sum(r["total_lines"] for r in rows) or 1
     for r in rows:
-        pct = round((r["total_lines"] / total_lines) * 100, 2)
         ws.append([
+            r["business_type"],
             r["service"],
             r["code"],
-            r["category"],
+            r["owner"],
             r["tasks_total"],
             r["total_lines"],
-            f"{pct}%",
+            round(r["total_lines"] / total * 100, 2),
         ])
 
     wb.save(OUT_FILE)
-    logger.info("Отчет сохранен: %s (строк: %d)", OUT_FILE, len(rows))
+    logger.info("Файл сохранён: %s", OUT_FILE)
 
 
 def main():
-    logger.info("==== START ====")
-    logger.info("SKIP_IF_CODE_NOT_IN_SD=%s", SKIP_IF_CODE_NOT_IN_SD)
-    logger.info("SKIP_EMPTY_SERVICES=%s", SKIP_EMPTY_SERVICES)
+    if not SONAR_URL or not SONAR_TOKEN:
+        die("SONAR_URL / SONAR_TOKEN не заданы")
 
-    sd_map = load_sd_map(SD_FILE)
-    projects = get_projects()
+    sd = load_sd(SD_FILE)
+    bk = load_bk(BK_FILE)
 
-    ncloc_cache = {}
-    newlines_cache = {}
     services = {}
 
-    skipped_no_code = 0
-    skipped_no_sd_match = 0
-    skipped_empty_project = 0
+    process_sonar(SONAR_URL, SONAR_TOKEN, sd, bk, services)
+    process_sonar(SONAR2_URL, SONAR2_TOKEN, sd, bk, services)
+    process_sonar(SONAR3_URL, SONAR3_TOKEN, sd, bk, services)
 
-    for idx, p in enumerate(projects, start=1):
-        project_key = p.get("key")
-        if not project_key:
-            continue
-
-        prefix = project_key.split(":", 1)[0]
-        svc_name, svc_code = split_service_name_code(prefix)
-
-        if not svc_code:
-            skipped_no_code += 1
-            logger.info("SKIP project=%s (не выделен код)", project_key)
-            continue
-
-        if SKIP_IF_CODE_NOT_IN_SD and svc_code not in sd_map:
-            skipped_no_sd_match += 1
-            logger.info("SKIP project=%s (код %s не найден в SD)", project_key, svc_code)
-            continue
-
-        category = ""
-        if svc_code in sd_map:
-            category, mapped_name = sd_map[svc_code]
-            if mapped_name:
-                svc_name = mapped_name
-
-        tasks = get_ce_tasks(project_key)
-
-        tasks_total = 0
-        branch_lines = 0
-        pr_lines = 0
-
-        for t in tasks:
-            tasks_total += 1
-            pr = t.get("pullRequest")
-            branch = t.get("branch")
-
-            if pr:
-                ck = (project_key, str(pr))
-                if ck not in newlines_cache:
-                    newlines_cache[ck] = measure_value(project_key, "new_lines", pull_request=str(pr))
-                pr_lines += newlines_cache[ck]
-            else:
-                b = branch if branch else "__main__"
-                ck = (project_key, b)
-                if ck not in ncloc_cache:
-                    if b == "__main__":
-                        ncloc_cache[ck] = measure_value(project_key, "ncloc")
-                    else:
-                        ncloc_cache[ck] = measure_value(project_key, "ncloc", branch=b)
-                branch_lines += ncloc_cache[ck]
-
-        total_lines = branch_lines + pr_lines
-
-        if SKIP_EMPTY_SERVICES and tasks_total == 0 and total_lines == 0:
-            skipped_empty_project += 1
-            logger.info("SKIP project=%s (пусто: tasks=0 lines=0)", project_key)
-            continue
-
-        logger.info(
-            "AGG project=%s -> service=%s code=%s cat=%s tasks=%d lines=%d",
-            project_key, svc_name, svc_code, category, tasks_total, total_lines
-        )
-
-        svc_key = (svc_name.lower(), svc_code, category)
-
-        if svc_key not in services:
-            services[svc_key] = {
-                "service": svc_name,
-                "code": svc_code,
-                "category": category,
-                "tasks_total": 0,
-                "total_lines": 0,
-            }
-
-        services[svc_key]["tasks_total"] += tasks_total
-        services[svc_key]["total_lines"] += total_lines
-
-    rows = list(services.values())
-
-    if SKIP_EMPTY_SERVICES:
-        rows = [r for r in rows if not (r["tasks_total"] == 0 and r["total_lines"] == 0)]
-
-    rows.sort(key=lambda x: x["total_lines"], reverse=True)
-
-    logger.info(
-        "Итог: сервисов=%d | skipped(no_code)=%d | skipped(no_sd_match)=%d | skipped(empty_project)=%d",
-        len(rows), skipped_no_code, skipped_no_sd_match, skipped_empty_project
-    )
-
+    rows = sorted(services.values(), key=lambda x: x["total_lines"], reverse=True)
     write_xlsx(rows)
-    logger.info("==== DONE ====")
 
 
 if __name__ == "__main__":
