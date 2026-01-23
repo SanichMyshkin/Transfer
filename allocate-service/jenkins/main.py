@@ -31,6 +31,8 @@ SD_FILE = os.getenv("SD_FILE", "sd.xlsx")
 BK_FILE = os.getenv("BK_FILE", "bk_all_users.xlsx")
 OUTPUT_XLSX = os.getenv("OUTPUT_XLSX", "jenkins_report.xlsx")
 
+BAN_SERVICE_IDS = [15473]
+
 SCRIPT_BUILDS = r"""
 import jenkins.model.Jenkins
 import groovy.json.JsonOutput
@@ -65,6 +67,15 @@ def die(msg: str, code: int = 2):
     raise SystemExit(code)
 
 
+def build_ban_set(ban_list):
+    if not isinstance(ban_list, (list, tuple, set)):
+        die("BAN_SERVICE_IDS должен быть list / tuple / set")
+    return {str(x).strip() for x in ban_list if str(x).strip()}
+
+
+ban_set = build_ban_set(BAN_SERVICE_IDS)
+
+
 def validate_env_and_files():
     logger.info("Проверяем ENV и входные файлы...")
 
@@ -85,6 +96,7 @@ def validate_env_and_files():
     if out_dir and not os.path.exists(out_dir):
         os.makedirs(out_dir, exist_ok=True)
 
+    logger.info(f"Бан-лист (КОД): {sorted(ban_set) if ban_set else 'пусто'}")
     logger.info("ENV/файлы ок.")
 
 
@@ -120,7 +132,6 @@ def split_project_and_team(project_raw: str):
 def load_sd_people_map(path: str):
     logger.info("Читаем SD (B=КОД, D=Наименование, H=Владелец, I=Менеджер)...")
 
-    # B = service_id, D = service_name, H = owner, I = manager
     df = pd.read_excel(path, usecols="B,D,H,I", dtype=str, engine="openpyxl")
     df.columns = ["service_id", "service_name", "owner", "manager"]
     df = df.fillna("")
@@ -155,7 +166,6 @@ def load_bk_business_type_map(path: str):
     df.columns = ["c1", "c2", "c3", "business_type"]
 
     def make_fio(r):
-        # порядок оставляю как у тебя: c2 c1 c3
         fio = " ".join([clean_spaces(r["c2"]), clean_spaces(r["c1"]), clean_spaces(r["c3"])])
         return clean_spaces(fio)
 
@@ -191,9 +201,11 @@ def aggregate_builds_by_service(data, sd_people_map, bk_type_map, exclude_withou
     skipped_empty_name = 0
     skipped_empty_root = 0
     skipped_no_team = 0
+    skipped_banned = 0
 
     total_jobs_seen = 0
     total_builds_seen = 0
+    total_builds_banned = 0
 
     for j in data.get("jobs", []) or []:
         total_jobs_seen += 1
@@ -212,7 +224,7 @@ def aggregate_builds_by_service(data, sd_people_map, bk_type_map, exclude_withou
             skipped_empty_root += 1
             continue
 
-        project_name, team_number = split_project_and_team(root)
+        _, team_number = split_project_and_team(root)
 
         if exclude_without_team and not team_number:
             skipped_no_team += 1
@@ -221,19 +233,27 @@ def aggregate_builds_by_service(data, sd_people_map, bk_type_map, exclude_withou
         builds = int(j.get("buildCount") or 0)
         total_builds_seen += builds
 
-        # ключим строго по КОДу (team_number)
+        if team_number in ban_set:
+            skipped_banned += 1
+            total_builds_banned += builds
+            continue
+
         acc[team_number] += builds
 
     total_builds = sum(acc.values())
+
     logger.info(
-        "Статистика джоб: всего=%d, папки=%d, пустое_имя=%d, пустой_root=%d, без_кода=%d",
+        "Статистика джоб: всего=%d, папки=%d, пустое_имя=%d, пустой_root=%d, без_кода=%d, бан=%d",
         total_jobs_seen,
         skipped_folder,
         skipped_empty_name,
         skipped_empty_root,
         skipped_no_team,
+        skipped_banned,
     )
-    logger.info(f"Билдов по учтённым сервисам: {total_builds} (buildCount sum), buildCount total seen: {total_builds_seen}")
+    logger.info(f"buildCount total seen: {total_builds_seen}")
+    logger.info(f"buildCount выкинули баном: {total_builds_banned}")
+    logger.info(f"Билдов по учтённым сервисам: {total_builds}")
     logger.info(f"Уникальных сервисов (по КОД) в отчёте: {len(acc)}")
 
     rows = []
@@ -246,21 +266,11 @@ def aggregate_builds_by_service(data, sd_people_map, bk_type_map, exclude_withou
         owner_for_report = owner or manager
         business_type = pick_business_type(bk_type_map, owner=owner, manager=manager)
 
-        # Наименование сервиса строго из SD.D, если нет — оставим пустым (как ты хотел)
         service_name = sd_service_name
 
         pct = (builds / total_builds * 100.0) if total_builds > 0 else 0.0
 
-        rows.append(
-            [
-                service_name,
-                team_number,
-                owner_for_report,
-                business_type,
-                builds,
-                round(pct, 2),
-            ]
-        )
+        rows.append([service_name, team_number, owner_for_report, business_type, builds, round(pct, 2)])
 
     return rows
 
@@ -289,7 +299,6 @@ def export_excel(rows, filename):
     for r in rows:
         ws.append(r)
 
-    # авто-ширина по фактическим значениям
     for col_idx in range(1, len(headers) + 1):
         max_len = 0
         for row in ws.iter_rows(min_col=col_idx, max_col=col_idx, values_only=True):
