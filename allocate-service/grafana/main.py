@@ -27,7 +27,7 @@ SLEEP_BETWEEN_CALLS = 0.2
 
 EXCLUDE_ALL_ZERO_NUMBERS = True
 
-BAN_SERVICE_IDS = [15473]  # сюда добавляешь коды, которые не учитываем
+BAN_SERVICE_IDS = [15473]  # коды, которые полностью исключаем
 
 logger = logging.getLogger("grafana_usage_report")
 logger.setLevel(logging.INFO)
@@ -193,8 +193,7 @@ def normalize_name(x):
 def is_all_zeros_number(num: str | None) -> bool:
     if not num:
         return False
-    s = str(num).strip()
-    return bool(re.fullmatch(r"0+", s))
+    return bool(re.fullmatch(r"0+", str(num).strip()))
 
 
 def load_bk_business_type_map(path: str):
@@ -208,27 +207,26 @@ def load_bk_business_type_map(path: str):
     df["fio_key"] = df.apply(make_fio, axis=1).map(normalize_name_key)
     df["business_type"] = df["business_type"].astype(str).map(clean_spaces)
 
-    df = df[df["fio_key"] != ""].copy()
-    last = df.drop_duplicates("fio_key", keep="last")
-
+    last = df[df["fio_key"] != ""].drop_duplicates("fio_key", keep="last")
     mp = dict(zip(last["fio_key"], last["business_type"]))
-    logger.info(f"BK: загружено ФИО->Тип бизнеса: {len(mp)}")
+
+    logger.info(f"BK: загружено ФИО → тип бизнеса: {len(mp)}")
     return mp
 
 
-def pick_business_type(bk_type_map: dict, owner: str, manager: str) -> str:
+def pick_business_type(bk_map, owner, manager):
     if owner:
-        bt = bk_type_map.get(normalize_name_key(owner), "")
+        bt = bk_map.get(normalize_name_key(owner))
         if bt:
             return bt
     if manager:
-        bt = bk_type_map.get(normalize_name_key(manager), "")
+        bt = bk_map.get(normalize_name_key(manager))
         if bt:
             return bt
     return ""
 
 
-def load_sd_mapping_with_people(path):
+def load_sd_mapping(path):
     df = pd.read_excel(path, dtype=str, engine="openpyxl").fillna("")
     map_by_number = {}
     map_by_name = {}
@@ -242,36 +240,32 @@ def load_sd_mapping_with_people(path):
         sd_name = clean_spaces(sd_name_raw)
         owner = clean_spaces(owner_raw)
         manager = clean_spaces(manager_raw)
-        key_name = normalize_name(sd_name_raw)
 
         payload = {"sd_name": sd_name, "owner": owner, "manager": manager}
 
         if num:
             map_by_number[num] = payload
-        if key_name:
-            map_by_name[key_name] = payload
+        if sd_name:
+            map_by_name[normalize_name(sd_name)] = payload
 
-    logger.info(f"SD: загружено записей: по номеру={len(map_by_number)}, по имени={len(map_by_name)}")
+    logger.info(f"SD: загружено сервисов по номеру={len(map_by_number)}, по имени={len(map_by_name)}")
     return map_by_number, map_by_name
 
 
 def main():
     validate_env_and_files()
+    logger.info("Старт отчёта Grafana")
 
-    logger.info("Старт формирования отчёта по использованию Grafana")
     login_cookie()
 
     bk_type_map = load_bk_business_type_map(BK_FILE)
-    map_by_number, map_by_name = load_sd_mapping_with_people(SD_FILE)
+    map_by_number, map_by_name = load_sd_mapping(SD_FILE)
 
     org_ids = sorted(get_unique_org_ids())[:ORG_LIMIT]
-    logger.info(f"Будет обработано организаций: {len(org_ids)} (лимит ORG_LIMIT={ORG_LIMIT})")
+    logger.info(f"Организаций к обработке: {len(org_ids)}")
 
     rows_orgs = []
-    skipped_all_zeros = 0
-    skipped_banned = 0
-    no_access = 0
-    processed = 0
+    skipped_zero = skipped_ban = no_access = 0
 
     for org_id in org_ids:
         raw_org_name = get_org_name(org_id)
@@ -281,16 +275,14 @@ def main():
         norm_name = normalize_name(org_name)
 
         if EXCLUDE_ALL_ZERO_NUMBERS and is_all_zeros_number(norm_number):
-            skipped_all_zeros += 1
-            logger.info(f'Организация {org_id}: "{org_name}" ({org_number}) — пропуск (номер из нулей)')
+            skipped_zero += 1
+            logger.info(f'ORG {org_id}: "{org_name}" ({org_number}) — skip (нули)')
             continue
 
         if norm_number and norm_number in ban_set:
-            skipped_banned += 1
-            logger.info(f'Организация {org_id}: "{org_name}" ({org_number}) — пропуск (в бан-листе)')
+            skipped_ban += 1
+            logger.info(f'ORG {org_id}: "{org_name}" ({org_number}) — skip (бан)')
             continue
-
-        processed += 1
 
         sd = None
         if norm_number and norm_number in map_by_number:
@@ -303,32 +295,32 @@ def main():
         manager = (sd or {}).get("manager") or ""
 
         owner_for_report = owner or manager
-        business_type = pick_business_type(bk_type_map, owner=owner, manager=manager)
+        business_type = pick_business_type(bk_type_map, owner, manager)
 
         if not switch_org(org_id):
             no_access += 1
-            rows_orgs.append(
-                {
-                    "Тип бизнеса": business_type,
-                    "Наименование сервиса": sd_name if sd_name else org_name,
-                    "КОД": "NO ACCESS",
-                    "Владелец сервиса": owner_for_report,
-                    "Кол-во панелей": "NO ACCESS",
-                    "Потребление в %": None,
-                }
+            logger.warning(
+                f'ORG {org_id}: "{org_name}" — NO ACCESS | '
+                f'сервис="{sd_name or org_name}" | '
+                f'владелец="{owner_for_report or "—"}" | '
+                f'тип="{business_type or "—"}"'
             )
             continue
 
-        folders = get_folders()
         panels_total = 0
-
-        for f in folders:
-            dashboards = get_dashboards_in_folder(f["id"])
-            for d in dashboards:
+        for f in get_folders():
+            for d in get_dashboards_in_folder(f["id"]):
                 panels_total += get_dashboard_panels(d["uid"])
-
         for d in get_root_dashboards():
             panels_total += get_dashboard_panels(d["uid"])
+
+        logger.info(
+            f'ORG {org_id}: "{org_name}" ({org_number}) | '
+            f'сервис="{sd_name if sd_name else org_name}" | '
+            f'владелец="{owner_for_report or "—"}" | '
+            f'тип="{business_type or "—"}" | '
+            f'панелей={panels_total}'
+        )
 
         rows_orgs.append(
             {
@@ -341,24 +333,18 @@ def main():
             }
         )
 
-    total_panels = 0
-    for row in rows_orgs:
-        p = row["Кол-во панелей"]
-        if isinstance(p, int):
-            total_panels += p
+    total_panels = sum(
+        r["Кол-во панелей"] for r in rows_orgs if isinstance(r["Кол-во панелей"], int)
+    )
 
     logger.info(
-        f"Итоги: обработано={processed}, скип_нули={skipped_all_zeros}, "
-        f"скип_бан={skipped_banned}, no_access={no_access}"
+        f"Итог: панелей={total_panels}, skip_zero={skipped_zero}, "
+        f"skip_ban={skipped_ban}, no_access={no_access}"
     )
-    logger.info(f"Общее количество панелей по всем учтённым организациям: {total_panels}")
 
-    for row in rows_orgs:
-        p = row["Кол-во панелей"]
-        if isinstance(p, int) and total_panels > 0:
-            row["Потребление в %"] = round(p / total_panels * 100, 2)
-        else:
-            row["Потребление в %"] = None
+    for r in rows_orgs:
+        if isinstance(r["Кол-во панелей"], int) and total_panels > 0:
+            r["Потребление в %"] = round(r["Кол-во панелей"] / total_panels * 100, 2)
 
     df = pd.DataFrame(rows_orgs)
 
