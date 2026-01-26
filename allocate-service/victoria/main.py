@@ -20,6 +20,8 @@ log = logging.getLogger(__name__)
 OUTPUT_FILE = "victoriametrics_repot.xlsx"
 HTTP_TIMEOUT_SEC = 60
 
+MISSING = "<missing>"
+
 
 def safe_query(prom, q):
     log.info(f"QUERY: {q}")
@@ -42,39 +44,67 @@ def safe_query(prom, q):
         return None
 
 
-def get_teams(prom):
-    try:
-        teams = prom.get_label_values("team")
-        teams = [t for t in teams if t is not None and str(t).strip() != ""]
-        teams = sorted(set(teams))
-        log.info(f"Найдено team: {len(teams)}")
-        return teams
-    except Exception as e:
-        log.error(f"Ошибка получения team: {e}")
-        return []
+def _label(metric: dict, key: str) -> str:
+    v = metric.get(key)
+    if v is None or str(v).strip() == "":
+        return MISSING
+    return str(v).strip()
 
 
-def get_service_ids_for_team(prom, team):
-    q = f'count by (service_id) ({{team="{team}", service_id!=""}})'
-    rows = safe_query(prom, q)
-    if not rows:
-        return []
-    sids = set()
-    for r in rows:
-        sid = r.get("metric", {}).get("service_id")
-        if sid:
-            sids.add(sid)
-    return sorted(sids)
+def discover_groups(prom):
+    """
+    Собираем все комбинации (team, service_id), включая отсутствующие лейблы.
+    Отдельно считаем 'unlabled' (оба лейбла отсутствуют).
+    """
+    groups = set()
+
+    queries = [
+        # есть и team и service_id
+        ('count by (team, service_id) ({team=~".+", service_id=~".+"})', "both_present"),
+        # team отсутствует, service_id есть
+        ('count by (team, service_id) ({team!~".+", service_id=~".+"})', "missing_team"),
+        # team есть, service_id отсутствует
+        ('count by (team, service_id) ({team=~".+", service_id!~".+"})', "missing_service"),
+        # оба отсутствуют (unlabled)
+        ('count by (team, service_id) ({team!~".+", service_id!~".+"})', "both_missing"),
+    ]
+
+    for q, tag in queries:
+        rows = safe_query(prom, q) or []
+        log.info(f"Найдено групп ({tag}): {len(rows)}")
+        for r in rows:
+            metric = r.get("metric", {}) or {}
+            team = _label(metric, "team")
+            service_id = _label(metric, "service_id")
+            groups.add((team, service_id))
+
+    # Группы без обоих лейблов будут как (MISSING, MISSING)
+    return sorted(groups)
 
 
-def get_group_metrics(prom, team, service_id):
-    match = f'team="{team}", service_id="{service_id}"'
+def build_matchers(team: str, service_id: str) -> str:
+    parts = []
+    if team == MISSING:
+        parts.append('team!~".+"')  # отсутствует или пустой
+    else:
+        parts.append(f'team="{team}"')
 
-    q_series = f'count({{{match}}})'
+    if service_id == MISSING:
+        parts.append('service_id!~".+"')  # отсутствует или пустой
+    else:
+        parts.append(f'service_id="{service_id}"')
+
+    return ", ".join(parts)
+
+
+def get_group_metrics(prom, team: str, service_id: str):
+    matchers = build_matchers(team, service_id)
+
+    q_series = f'count({{{matchers}}})'
     res_series = safe_query(prom, q_series)
     time_series_count = int(res_series[0]["value"][1]) if res_series else 0
 
-    q_instances = f'count by (instance) ({{{match}}})'
+    q_instances = f'count by (instance) ({{{matchers}}})'
     inst_rows = safe_query(prom, q_instances)
     instances = (
         {r.get("metric", {}).get("instance", "<none>") for r in inst_rows}
@@ -82,7 +112,7 @@ def get_group_metrics(prom, team, service_id):
         else set()
     )
 
-    q_metrics = f'count by (__name__) ({{{match}}})'
+    q_metrics = f'count by (__name__) ({{{matchers}}})'
     mn_rows = safe_query(prom, q_metrics)
     metric_names = (
         {r.get("metric", {}).get("__name__", "<noname>") for r in mn_rows}
@@ -93,27 +123,47 @@ def get_group_metrics(prom, team, service_id):
     return time_series_count, instances, metric_names
 
 
-def write_report(groups, out_file):
+def write_report(groups_map, unlabled_row, out_file):
     wb = Workbook()
-    ws = wb.active
-    ws.title = "team_service_metrics"
 
-    headers = ["team_service", "metric_names", "time_series", "instances_count", "instances_list"]
     bold = Font(bold=True)
 
+    ws = wb.active
+    ws.title = "team_service_metrics"
+    headers = ["team", "service_id", "metric_names", "time_series", "instances_count", "instances_list"]
     ws.append(headers)
     for cell in ws[1]:
         cell.font = bold
 
-    for group_name in sorted(groups.keys()):
-        data = groups[group_name]
+    for (team, service_id) in sorted(groups_map.keys()):
+        data = groups_map[(team, service_id)]
         ws.append(
             [
-                group_name,
+                team,
+                service_id,
                 len(data["metric_names"]),
                 data["time_series"],
                 len(data["instances"]),
                 ", ".join(sorted(data["instances"])),
+            ]
+        )
+
+    ws2 = wb.create_sheet("unlabled")
+    headers2 = ["bucket", "metric_names", "time_series", "instances_count", "instances_list"]
+    ws2.append(headers2)
+    for cell in ws2[1]:
+        cell.font = bold
+
+    if unlabled_row is None:
+        ws2.append(["unlabled", 0, 0, 0, ""])
+    else:
+        ws2.append(
+            [
+                "unlabled",
+                len(unlabled_row["metric_names"]),
+                unlabled_row["time_series"],
+                len(unlabled_row["instances"]),
+                ", ".join(sorted(unlabled_row["instances"])),
             ]
         )
 
@@ -136,31 +186,33 @@ def main():
         log.error(f"Не удалось подключиться к VM: {e}")
         sys.exit(1)
 
-    teams = get_teams(prom)
+    log.info("Поиск групп (team/service_id), включая отсутствующие лейблы...")
+    discovered = discover_groups(prom)
+    log.info(f"Всего уникальных групп: {len(discovered)}")
 
-    groups = defaultdict(lambda: {"metric_names": set(), "instances": set(), "time_series": 0})
+    groups_map = defaultdict(lambda: {"metric_names": set(), "instances": set(), "time_series": 0})
+    unlabled_row = None
 
-    log.info("Обработка team/service_id...")
-    for team in teams:
-        log.info(f"[TEAM] {team}")
-        service_ids = get_service_ids_for_team(prom, team)
-        if not service_ids:
-            log.info(f"[TEAM] {team}: service_id не найден(ы), пропуск")
+    log.info("Сбор метрик по группам...")
+    for team, service_id in discovered:
+        if team == MISSING and service_id == MISSING:
+            log.info("[UNLABLED] (нет team и service_id)")
+        else:
+            log.info(f"[GROUP] team={team} service_id={service_id}")
+
+        ts, instances, metric_names = get_group_metrics(prom, team, service_id)
+
+        if team == MISSING and service_id == MISSING:
+            unlabled_row = {"metric_names": metric_names, "instances": instances, "time_series": ts}
             continue
 
-        for service_id in service_ids:
-            log.info(f"[TEAM-SVC] {team}/{service_id}")
-
-            ts, instances, metric_names = get_group_metrics(prom, team, service_id)
-
-            key = f"{team}-{service_id}"
-            g = groups[key]
-            g["time_series"] += ts
-            g["instances"].update(instances)
-            g["metric_names"].update(metric_names)
+        g = groups_map[(team, service_id)]
+        g["time_series"] += ts
+        g["instances"].update(instances)
+        g["metric_names"].update(metric_names)
 
     log.info(f"Сохранение файла {OUTPUT_FILE}...")
-    write_report(groups, OUTPUT_FILE)
+    write_report(groups_map, unlabled_row, OUTPUT_FILE)
     log.info(f"✔ Готово. Файл {OUTPUT_FILE} создан.")
 
 
