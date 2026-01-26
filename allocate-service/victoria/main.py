@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import logging
+from collections import defaultdict
 
 import requests
 import urllib3
@@ -24,21 +25,21 @@ log = logging.getLogger(__name__)
 OUTPUT_FILE = "victoriametrics_repot.xlsx"
 HTTP_TIMEOUT_SEC = 60
 
-# Безопасность: равномерная нагрузка
+# Равномерная нагрузка
 SLEEP_BETWEEN_QUERIES_SEC = 0.10
 
-# Батчи: автоматически
-BATCH_SIZE = 5          # сколько групп обрабатывать за один прогон
-BATCH_SLEEP_SEC = 2.0   # пауза между батчами
+# Батчи (авто)
+BATCH_SIZE = 5
+BATCH_SLEEP_SEC = 2.0
 
-# Скипаем жирную кучу без лейблов
+# Скип жирной кучи без лейблов
 SKIP_UNLABELED = True
 
-# Живость/series (без 422): через /api/v1/series
+# Alive series за 24h (без 422): через /api/v1/series
 ALIVE_LOOKBACK_SEC = 24 * 3600
-SERIES_API_LIMIT = 200_000  # защита от гигантских ответов
+SERIES_API_LIMIT = 200_000  # если больше — скипаем группу
 
-# Интервал
+# Интервал по короткому окну
 INTERVAL_WINDOW = "2m"
 INTERVAL_WINDOW_SEC = 120.0
 FALLBACK_INTERVAL_SEC = 60.0
@@ -48,7 +49,9 @@ def safe_query(prom, q):
     log.info(f"QUERY: {q}")
     try:
         url = prom.url.rstrip("/") + "/api/v1/query"
-        r = requests.get(url, params={"query": q}, verify=False, timeout=HTTP_TIMEOUT_SEC)
+        r = requests.get(
+            url, params={"query": q}, verify=False, timeout=HTTP_TIMEOUT_SEC
+        )
         r.raise_for_status()
         data = r.json()
         if data.get("status") != "success":
@@ -60,6 +63,43 @@ def safe_query(prom, q):
         return None
     finally:
         time.sleep(SLEEP_BETWEEN_QUERIES_SEC)
+
+
+def label(metric: dict, key: str) -> str:
+    v = metric.get(key)
+    return "" if v is None or str(v).strip() == "" else str(v).strip()
+
+
+def discover_groups(prom):
+    """
+    4 запроса — как было изначально.
+    Это нормально: они лёгкие и быстро дают все комбинации отсутствующих лейблов.
+    """
+    groups = set()
+    queries = [
+        'count by (team, service_id) ({team=~".+", service_id=~".+"})',
+        'count by (team, service_id) ({team!~".+", service_id=~".+"})',
+        'count by (team, service_id) ({team=~".+", service_id!~".+"})',
+        'count by (team, service_id) ({team!~".+", service_id!~".+"})',
+    ]
+
+    for i, q in enumerate(queries, start=1):
+        log.info(f"DISCOVER[{i}/4]")
+        rows = safe_query(prom, q) or []
+        for r in rows:
+            m = r.get("metric", {}) or {}
+            groups.add((label(m, "team"), label(m, "service_id")))
+
+    return sorted(groups)
+
+
+def build_matchers(team: str, service_id: str) -> str:
+    return ", ".join(
+        [
+            'team!~".+"' if team == "" else f'team="{team}"',
+            'service_id!~".+"' if service_id == "" else f'service_id="{service_id}"',
+        ]
+    )
 
 
 def get_scalar_value(rows) -> float:
@@ -78,6 +118,9 @@ def estimate_interval_sec(avg_cnt_window: float) -> float:
 
 
 def alive_series_via_series_api(prom: PrometheusConnect, matchers: str, lookback_sec: int) -> int:
+    """
+    Замена count(count_over_time(...[24h])) без чтения миллиардов сэмплов.
+    """
     end = int(time.time())
     start = end - lookback_sec
 
@@ -103,6 +146,11 @@ def alive_series_via_series_api(prom: PrometheusConnect, matchers: str, lookback
         return 0
 
     return cnt
+
+
+def iter_batches(items, batch_size: int):
+    for i in range(0, len(items), batch_size):
+        yield i // batch_size + 1, items[i : i + batch_size]
 
 
 def autosize_columns(ws):
@@ -134,36 +182,6 @@ def write_report(rows, out_file):
     wb.save(out_file)
 
 
-def build_matchers(team: str, service_id: str) -> str:
-    parts = []
-    parts.append('team!~".+"' if team == "" else f'team="{team}"')
-    parts.append('service_id!~".+"' if service_id == "" else f'service_id="{service_id}"')
-    return ", ".join(parts)
-
-
-def discover_groups_single_query(prom: PrometheusConnect):
-    """
-    Один запрос вместо 4:
-    - Берём все пары (team, service_id) как они есть (и пустые/отсутствующие тоже).
-    """
-    q = "count by (team, service_id) ({})"
-    rows = safe_query(prom, q) or []
-
-    groups = set()
-    for r in rows:
-        m = r.get("metric", {}) or {}
-        team = (m.get("team") or "").strip()
-        service_id = (m.get("service_id") or "").strip()
-        groups.add((team, service_id))
-
-    return sorted(groups)
-
-
-def iter_batches(items, batch_size: int):
-    for i in range(0, len(items), batch_size):
-        yield i // batch_size + 1, items[i : i + batch_size]
-
-
 def main():
     load_dotenv()
     vm_url = os.getenv("VM_URL")
@@ -179,9 +197,13 @@ def main():
         log.error(f"Не удалось подключиться к VM: {e}")
         sys.exit(1)
 
-    log.info("Поиск групп (team/service_id) одним запросом...")
-    groups = discover_groups_single_query(prom)
+    log.info("Поиск групп (team/service_id) 4 запросами...")
+    groups = discover_groups(prom)
     log.info(f"Всего уникальных групп: {len(groups)}")
+
+    if not groups:
+        log.warning("Группы не найдены.")
+        sys.exit(0)
 
     out_rows = []
     total_batches = (len(groups) + BATCH_SIZE - 1) // BATCH_SIZE
@@ -199,6 +221,7 @@ def main():
 
             matchers = build_matchers(team, service_id)
 
+            # 1) alive series за 24h (без 422)
             try:
                 alive_series = alive_series_via_series_api(prom, matchers, ALIVE_LOOKBACK_SEC)
             except Exception as e:
@@ -209,6 +232,7 @@ def main():
                 log.info("  alive_series=0 -> пропуск")
                 continue
 
+            # 2) интервал по 2m (лёгкий запрос)
             q_avg = f'avg(count_over_time({{{matchers}}}[{INTERVAL_WINDOW}]))'
             avg_cnt_2m = get_scalar_value(safe_query(prom, q_avg) or [])
 
