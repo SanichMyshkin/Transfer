@@ -78,15 +78,12 @@ def get_group_metrics(prom, team: str, service_id: str):
     m = build_matchers(team, service_id)
 
     r = safe_query(prom, f"count({{{m}}})")
-    ts = int(r[0]["value"][1]) if r else 0
-
-    ir = safe_query(prom, f"count by (instance) ({{{m}}})") or []
-    instances = {x.get("metric", {}).get("instance", "<none>") for x in ir}
+    time_series = int(r[0]["value"][1]) if r else 0
 
     mr = safe_query(prom, f"count by (__name__) ({{{m}}})") or []
-    names = {x.get("metric", {}).get("__name__", "<noname>") for x in mr}
+    metric_names = {x.get("metric", {}).get("__name__", "<noname>") for x in mr}
 
-    return ts, instances, names
+    return time_series, metric_names
 
 
 def write_report(groups, out_file):
@@ -97,10 +94,8 @@ def write_report(groups, out_file):
     headers = [
         "team",
         "service_id",
-        "metric_names",
+        "metric_names_count",
         "time_series",
-        "instances_count",
-        "instances_list",
     ]
     bold = Font(bold=True)
 
@@ -115,8 +110,6 @@ def write_report(groups, out_file):
                 service_id,
                 len(d["metric_names"]),
                 d["time_series"],
-                len(d["instances"]),
-                ", ".join(sorted(d["instances"])),
             ]
         )
 
@@ -144,7 +137,7 @@ def main():
     log.info(f"Всего уникальных групп: {len(discovered)}")
 
     groups = defaultdict(
-        lambda: {"metric_names": set(), "instances": set(), "time_series": 0}
+        lambda: {"metric_names": set(), "time_series": 0}
     )
 
     log.info("Сбор метрик по группам...")
@@ -155,10 +148,9 @@ def main():
             else f"[GROUP] team={team} service_id={service_id}"
         )
 
-        ts, inst, names = get_group_metrics(prom, team, service_id)
+        ts, names = get_group_metrics(prom, team, service_id)
         g = groups[(team, service_id)]
         g["time_series"] += ts
-        g["instances"].update(inst)
         g["metric_names"].update(names)
 
     log.info(f"Сохранение файла {OUTPUT_FILE}...")
