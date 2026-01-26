@@ -50,15 +50,14 @@ def label(metric: dict, key: str) -> str:
 def discover_groups(prom):
     groups = set()
     queries = [
-        ('count by (team, service_id) ({team=~".+", service_id=~".+"})', "both_present"),
-        ('count by (team, service_id) ({team!~".+", service_id=~".+"})', "missing_team"),
-        ('count by (team, service_id) ({team=~".+", service_id!~".+"})', "missing_service"),
-        ('count by (team, service_id) ({team!~".+", service_id!~".+"})', "both_missing"),
+        'count by (team, service_id) ({team=~".+", service_id=~".+"})',
+        'count by (team, service_id) ({team!~".+", service_id=~".+"})',
+        'count by (team, service_id) ({team=~".+", service_id!~".+"})',
+        'count by (team, service_id) ({team!~".+", service_id!~".+"})',
     ]
 
-    for q, tag in queries:
+    for q in queries:
         rows = safe_query(prom, q) or []
-        log.info(f"Найдено групп ({tag}): {len(rows)}")
         for r in rows:
             m = r.get("metric", {}) or {}
             groups.add((label(m, "team"), label(m, "service_id")))
@@ -67,22 +66,24 @@ def discover_groups(prom):
 
 
 def build_matchers(team: str, service_id: str) -> str:
-    parts = []
-    parts.append('team!~".+"' if team == "" else f'team="{team}"')
-    parts.append('service_id!~".+"' if service_id == "" else f'service_id="{service_id}"')
-    return ", ".join(parts)
+    return ", ".join(
+        [
+            'team!~".+"' if team == "" else f'team="{team}"',
+            'service_id!~".+"' if service_id == "" else f'service_id="{service_id}"',
+        ]
+    )
 
 
 def get_group_metrics(prom, team: str, service_id: str):
-    matchers = build_matchers(team, service_id)
+    m = build_matchers(team, service_id)
 
-    r = safe_query(prom, f'count({{{matchers}}})')
+    r = safe_query(prom, f'count({{{m}}})')
     ts = int(r[0]["value"][1]) if r else 0
 
-    ir = safe_query(prom, f'count by (instance) ({{{matchers}}})') or []
+    ir = safe_query(prom, f'count by (instance) ({{{m}}})') or []
     instances = {x.get("metric", {}).get("instance", "<none>") for x in ir}
 
-    mr = safe_query(prom, f'count by (__name__) ({{{matchers}}})') or []
+    mr = safe_query(prom, f'count by (__name__) ({{{m}}})') or []
     names = {x.get("metric", {}).get("__name__", "<noname>") for x in mr}
 
     return ts, instances, names
@@ -94,7 +95,6 @@ def write_report(groups, out_file):
     ws.title = "team_service_metrics"
 
     headers = [
-        "bucket",
         "team",
         "service_id",
         "metric_names",
@@ -111,8 +111,7 @@ def write_report(groups, out_file):
     for (team, service_id), d in sorted(groups.items()):
         ws.append(
             [
-                "unlabled" if team == "" and service_id == "" else "",
-                team,
+                "unlabled" if team == "" and service_id == "" else team,
                 service_id,
                 len(d["metric_names"]),
                 d["time_series"],
