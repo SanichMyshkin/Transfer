@@ -2,7 +2,6 @@ import os
 import sys
 import time
 import logging
-from collections import defaultdict
 
 import requests
 import urllib3
@@ -32,10 +31,9 @@ SLEEP_BETWEEN_QUERIES_SEC = 0.10
 BATCH_SIZE = 5
 BATCH_SLEEP_SEC = 2.0
 
-# Скип жирной кучи без лейблов
 SKIP_UNLABELED = True
 
-# Alive series за 24h (без 422): через /api/v1/series
+# Alive series за 24h: через /api/v1/series (индекс)
 ALIVE_LOOKBACK_SEC = 24 * 3600
 SERIES_API_LIMIT = 200_000  # если больше — скипаем группу
 
@@ -49,9 +47,7 @@ def safe_query(prom, q):
     log.info(f"QUERY: {q}")
     try:
         url = prom.url.rstrip("/") + "/api/v1/query"
-        r = requests.get(
-            url, params={"query": q}, verify=False, timeout=HTTP_TIMEOUT_SEC
-        )
+        r = requests.get(url, params={"query": q}, verify=False, timeout=HTTP_TIMEOUT_SEC)
         r.raise_for_status()
         data = r.json()
         if data.get("status") != "success":
@@ -71,10 +67,6 @@ def label(metric: dict, key: str) -> str:
 
 
 def discover_groups(prom):
-    """
-    4 запроса — как было изначально.
-    Это нормально: они лёгкие и быстро дают все комбинации отсутствующих лейблов.
-    """
     groups = set()
     queries = [
         'count by (team, service_id) ({team=~".+", service_id=~".+"})',
@@ -94,12 +86,22 @@ def discover_groups(prom):
 
 
 def build_matchers(team: str, service_id: str) -> str:
+    # Для /api/v1/query: можно !~ и прочие matchers
     return ", ".join(
         [
             'team!~".+"' if team == "" else f'team="{team}"',
             'service_id!~".+"' if service_id == "" else f'service_id="{service_id}"',
         ]
     )
+
+
+def build_series_api_matchers(team: str, service_id: str):
+    # Для /api/v1/series: ТОЛЬКО точные '=' matchers, без regex/отрицаний
+    if team == "" or service_id == "":
+        return None
+    team_v = team.replace("\\", "\\\\").replace('"', '\\"')
+    sid_v = service_id.replace("\\", "\\\\").replace('"', '\\"')
+    return f'team="{team_v}", service_id="{sid_v}"'
 
 
 def get_scalar_value(rows) -> float:
@@ -118,9 +120,6 @@ def estimate_interval_sec(avg_cnt_window: float) -> float:
 
 
 def alive_series_via_series_api(prom: PrometheusConnect, matchers: str, lookback_sec: int) -> int:
-    """
-    Замена count(count_over_time(...[24h])) без чтения миллиардов сэмплов.
-    """
     end = int(time.time())
     start = end - lookback_sec
 
@@ -219,11 +218,18 @@ def main():
             tag = "[UNLABELED]" if team == "" and service_id == "" else f"team={team} service_id={service_id}"
             log.info(f"[GROUP] {tag}")
 
-            matchers = build_matchers(team, service_id)
+            # Для query API (можно !~)
+            query_matchers = build_matchers(team, service_id)
+
+            # Для series API (только =, иначе 422)
+            series_matchers = build_series_api_matchers(team, service_id)
+            if series_matchers is None:
+                log.info("  series_api: empty team/service_id -> skip")
+                continue
 
             # 1) alive series за 24h (без 422)
             try:
-                alive_series = alive_series_via_series_api(prom, matchers, ALIVE_LOOKBACK_SEC)
+                alive_series = alive_series_via_series_api(prom, series_matchers, ALIVE_LOOKBACK_SEC)
             except Exception as e:
                 log.error(f"SERIES_API ошибка: {e} -> skip group")
                 continue
@@ -233,7 +239,7 @@ def main():
                 continue
 
             # 2) интервал по 2m (лёгкий запрос)
-            q_avg = f'avg(count_over_time({{{matchers}}}[{INTERVAL_WINDOW}]))'
+            q_avg = f'avg(count_over_time({{{query_matchers}}}[{INTERVAL_WINDOW}]))'
             avg_cnt_2m = get_scalar_value(safe_query(prom, q_avg) or [])
 
             interval_sec = estimate_interval_sec(avg_cnt_2m)
