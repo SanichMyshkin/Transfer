@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import logging
+from typing import List, Tuple, Optional
 
 import requests
 import urllib3
@@ -24,28 +25,32 @@ log = logging.getLogger(__name__)
 OUTPUT_FILE = "victoriametrics_repot.xlsx"
 HTTP_TIMEOUT_SEC = 60
 
-SLEEP_BETWEEN_QUERIES_SEC = 0.10
-BATCH_SIZE = 5
-BATCH_SLEEP_SEC = 2.0
-SKIP_UNLABELED = True
-
-ALIVE_LOOKBACK_SEC = 24 * 3600
-SERIES_API_LIMIT = 200_000
-
-INTERVAL_WINDOW = "2m"
-INTERVAL_WINDOW_SEC = 120.0
-FALLBACK_INTERVAL_SEC = 60.0
-
-# Разбиение по метрикам, если группа слишком жирная
-METRIC_SPLIT_LIMIT = 50       # сколько метрик брать из группы при разбиении
-METRIC_SPLIT_SLEEP_SEC = 0.05 # пауза между series-api вызовами по метрикам
+# Паузы строго как ты сказал
+SLEEP_BETWEEN_QUERIES_SEC = 2.0
+SLEEP_BETWEEN_GROUPS_SEC = 10.0  # можно 5.0, но ты сказал “или даже 10”
 
 
-def safe_query(prom, q):
+# Окна поиска "двух первых точек"
+WINDOWS: List[Tuple[str, int]] = [
+    ("2m", 120),
+    ("30m", 1800),
+    ("1h", 3600),
+    ("6h", 21600),
+    ("12h", 43200),
+    ("24h", 86400),
+]
+
+
+def safe_query(prom: PrometheusConnect, q: str):
     log.info(f"QUERY: {q}")
     try:
         url = prom.url.rstrip("/") + "/api/v1/query"
-        r = requests.get(url, params={"query": q}, verify=False, timeout=HTTP_TIMEOUT_SEC)
+        r = requests.get(
+            url,
+            params={"query": q},
+            verify=False,
+            timeout=HTTP_TIMEOUT_SEC,
+        )
         r.raise_for_status()
         data = r.json()
         if data.get("status") != "success":
@@ -64,7 +69,7 @@ def label(metric: dict, key: str) -> str:
     return "" if v is None or str(v).strip() == "" else str(v).strip()
 
 
-def discover_groups(prom):
+def discover_groups(prom: PrometheusConnect):
     groups = set()
     queries = [
         'count by (team, service_id) ({team=~".+", service_id=~".+"})',
@@ -81,8 +86,8 @@ def discover_groups(prom):
     return sorted(groups)
 
 
-def build_matchers(team: str, service_id: str) -> str:
-    # Для /api/v1/query: можно !~
+def build_group_matchers(team: str, service_id: str) -> str:
+    # Query API: можно !~
     return ", ".join(
         [
             'team!~".+"' if team == "" else f'team="{team}"',
@@ -91,18 +96,20 @@ def build_matchers(team: str, service_id: str) -> str:
     )
 
 
-def build_series_api_matchers(team: str, service_id: str, metric_name: str | None = None):
-    # Для /api/v1/series: только '=' без regex/отрицаний
-    if team == "" or service_id == "":
-        return None
+def esc_label_value(s: str) -> str:
+    return s.replace("\\", "\\\\").replace('"', '\\"')
 
-    def esc(s: str) -> str:
-        return s.replace("\\", "\\\\").replace('"', '\\"')
 
-    parts = [f'team="{esc(team)}"', f'service_id="{esc(service_id)}"']
-    if metric_name:
-        parts.append(f'__name__="{esc(metric_name)}"')
-    return ", ".join(parts)
+def metric_names_in_group(prom: PrometheusConnect, group_matchers: str) -> List[str]:
+    q = f'count by (__name__) ({{{group_matchers}}})'
+    rows = safe_query(prom, q) or []
+    names = []
+    for r in rows:
+        m = r.get("metric", {}) or {}
+        n = m.get("__name__")
+        if n:
+            names.append(n)
+    return sorted(set(names))
 
 
 def get_scalar_value(rows) -> float:
@@ -114,88 +121,47 @@ def get_scalar_value(rows) -> float:
         return 0.0
 
 
-def estimate_interval_sec(avg_cnt_window: float) -> float:
-    if avg_cnt_window >= 2.0:
-        return INTERVAL_WINDOW_SEC / (avg_cnt_window - 1.0)
-    return FALLBACK_INTERVAL_SEC
-
-
-def alive_series_via_series_api(prom: PrometheusConnect, series_matchers: str, lookback_sec: int) -> int:
-    end = int(time.time())
-    start = end - lookback_sec
-
-    url = prom.url.rstrip("/") + "/api/v1/series"
-    params = {"match[]": "{" + series_matchers + "}", "start": str(start), "end": str(end)}
-
-    log.info(f"SERIES_API match={params['match[]']}")
-    r = requests.get(url, params=params, verify=False, timeout=HTTP_TIMEOUT_SEC)
-    r.raise_for_status()
-    data = r.json()
-    if data.get("status") != "success":
-        raise RuntimeError(f"series api bad response: {data}")
-
-    series_list = data.get("data") or []
-    cnt = len(series_list)
-
-    if SERIES_API_LIMIT and cnt > SERIES_API_LIMIT:
-        log.warning(f"SERIES_API_LIMIT exceeded: got {cnt} series -> treat as failure")
-        raise RuntimeError(f"too many series: {cnt}")
-
-    return cnt
-
-
-def alive_series_fallback_small_window(prom: PrometheusConnect, query_matchers: str, window: str = "5m") -> int:
-    q = f'count(count_over_time({{{query_matchers}}}[{window}]))'
+def series_count_for_metric(prom: PrometheusConnect, group_matchers: str, metric_name: str) -> int:
+    mn = esc_label_value(metric_name)
+    q = f'count({{{group_matchers}, __name__="{mn}"}})'
     rows = safe_query(prom, q) or []
     return int(get_scalar_value(rows))
 
 
-def metric_names_in_group(prom: PrometheusConnect, query_matchers: str) -> list[str]:
-    # Дёшево: список метрик (имён) внутри группы
-    q = f'count by (__name__) ({{{query_matchers}}})'
-    rows = safe_query(prom, q) or []
-    names = []
-    for r in rows:
-        m = r.get("metric", {}) or {}
-        n = m.get("__name__")
-        if n:
-            names.append(n)
-    return sorted(set(names))
-
-
-def alive_series_by_metric_split(prom: PrometheusConnect, team: str, service_id: str, query_matchers: str) -> int:
+def pick_interval_sec_for_metric(prom: PrometheusConnect, group_matchers: str, metric_name: str) -> int:
     """
-    Если группа слишком жирная и /series падает — берём N метрик и суммируем series по каждой метрике.
-    Это обход 422 “по группе”.
+    РОВНО твой алгоритм:
+    - пробуем 2m -> 30m -> 1h -> 6h -> 12h -> 24h
+    - смотрим count_over_time на ЛЮБОЙ ряд (любая серия)
+    - если >=2 точки: interval = window/(points-1)
+    - если за 24h 1 точка: interval = 86400
     """
-    names = metric_names_in_group(prom, query_matchers)
-    if not names:
-        return 0
+    mn = esc_label_value(metric_name)
 
-    if len(names) > METRIC_SPLIT_LIMIT:
-        log.info(f"  split: metrics={len(names)} -> take first {METRIC_SPLIT_LIMIT}")
-        names = names[:METRIC_SPLIT_LIMIT]
-    else:
-        log.info(f"  split: metrics={len(names)}")
-
-    total = 0
-    for n in names:
-        sm = build_series_api_matchers(team, service_id, n)
-        if not sm:
+    for w, wsec in WINDOWS:
+        q = f'count_over_time({{{group_matchers}, __name__="{mn}"}}[{w}])'
+        rows = safe_query(prom, q) or []
+        if not rows:
+            # нет рядов/нет данных в окне
             continue
+
+        # "любой ряд" -> берём первый элемент instant-vector
+        v = 0.0
         try:
-            c = alive_series_via_series_api(prom, sm, ALIVE_LOOKBACK_SEC)
-            total += c
-        except Exception as e:
-            log.warning(f"  split metric={n}: series_api failed ({e}) -> skip metric")
-        time.sleep(METRIC_SPLIT_SLEEP_SEC)
+            v = float(rows[0].get("value", [None, "0"])[1])
+        except Exception:
+            v = 0.0
 
-    return total
+        if v >= 2.0:
+            interval = int(round(wsec / (v - 1.0)))
+            return max(1, interval)
 
+        # на 24h и всё равно 1 точка -> считаем 1 точка/сутки
+        if w == "24h" and v >= 1.0:
+            return 86400
 
-def iter_batches(items, batch_size: int):
-    for i in range(0, len(items), batch_size):
-        yield i // batch_size + 1, items[i : i + batch_size]
+    # вообще ничего не нашли — считаем “раз в сутки” как самый безопасный fallback
+    return 86400
 
 
 def autosize_columns(ws):
@@ -205,10 +171,10 @@ def autosize_columns(ws):
         for cell in col:
             v = "" if cell.value is None else str(cell.value)
             max_len = max(max_len, len(v))
-        ws.column_dimensions[col_letter].width = min(max(10, max_len + 2), 60)
+        ws.column_dimensions[col_letter].width = min(max(10, max_len + 2), 70)
 
 
-def write_report(rows, out_file):
+def write_report(rows, out_file: str):
     wb = Workbook()
     ws = wb.active
     ws.title = "points_per_day"
@@ -242,78 +208,61 @@ def main():
         log.error(f"Не удалось подключиться к VM: {e}")
         sys.exit(1)
 
-    log.info("Поиск групп (team/service_id) 4 запросами...")
+    log.info("Поиск групп (team/service_id)...")
     groups = discover_groups(prom)
     log.info(f"Всего уникальных групп: {len(groups)}")
-    if not groups:
-        log.warning("Группы не найдены.")
-        sys.exit(0)
 
+    # итог по team
+    team_points = {}
+
+    for team, service_id in groups:
+        # пропускаем "вообще ничего"
+        if team == "" and service_id == "":
+            log.info("[GROUP] empty team & service_id -> skip")
+            continue
+
+        group_tag = f"team={team or '<empty>'} service_id={service_id or '<empty>'}"
+        log.info(f"[GROUP] {group_tag}")
+
+        group_matchers = build_group_matchers(team, service_id)
+
+        metrics = metric_names_in_group(prom, group_matchers)
+        if not metrics:
+            log.info("  no metrics -> skip group")
+            time.sleep(SLEEP_BETWEEN_GROUPS_SEC)
+            continue
+
+        log.info(f"  metrics={len(metrics)}")
+
+        group_points_day = 0.0
+
+        for mn in metrics:
+            interval_sec = pick_interval_sec_for_metric(prom, group_matchers, mn)
+            scount = series_count_for_metric(prom, group_matchers, mn)
+
+            if scount <= 0:
+                continue
+
+            points_day = scount * (86400.0 / float(interval_sec))
+            group_points_day += points_day
+
+        # агрегация по team
+        team_key = team if team != "" else "<empty_team>"
+        team_points[team_key] = team_points.get(team_key, 0.0) + group_points_day
+
+        log.info(f"  group points/day ~= {int(group_points_day)}")
+
+        # большая пауза между группами
+        time.sleep(SLEEP_BETWEEN_GROUPS_SEC)
+
+    # в Excel: по командам (как ты просил “групируем точки по командам”)
     out_rows = []
-    total_batches = (len(groups) + BATCH_SIZE - 1) // BATCH_SIZE
-
-    for batch_no, batch in iter_batches(groups, BATCH_SIZE):
-        log.info(f"=== BATCH {batch_no}/{total_batches}: groups={len(batch)} ===")
-
-        for team, service_id in batch:
-            if SKIP_UNLABELED and team == "" and service_id == "":
-                log.info("[GROUP] UNLABELED -> skip")
-                continue
-
-            log.info(f"[GROUP] team={team} service_id={service_id}")
-
-            query_matchers = build_matchers(team, service_id)
-
-            # 1) alive series: пробуем по группе через series api
-            alive_series = 0
-            try:
-                series_matchers = build_series_api_matchers(team, service_id)
-                if not series_matchers:
-                    log.info("  series_api: empty team/service_id -> skip")
-                    continue
-                alive_series = alive_series_via_series_api(prom, series_matchers, ALIVE_LOOKBACK_SEC)
-                alive_source = "series_api"
-            except Exception as e:
-                log.warning(f"  series_api failed ({e}) -> try split-by-metric")
-                alive_series = alive_series_by_metric_split(prom, team, service_id, query_matchers)
-                alive_source = "split_metrics" if alive_series > 0 else "fallback_5m"
-
-                # 2) если разбиение не помогло — fallback на 5m
-                if alive_series <= 0:
-                    alive_series = alive_series_fallback_small_window(prom, query_matchers, "5m")
-
-            if alive_series <= 0:
-                log.info("  alive_series=0 -> skip")
-                continue
-
-            # Интервал (лёгкий запрос)
-            q_avg = f'avg(count_over_time({{{query_matchers}}}[{INTERVAL_WINDOW}]))'
-            avg_cnt_2m = get_scalar_value(safe_query(prom, q_avg) or [])
-            interval_sec = estimate_interval_sec(avg_cnt_2m)
-            points_per_day = alive_series * (86400.0 / interval_sec)
-
-            out_rows.append(
-                [
-                    "unlabeled" if team == "" and service_id == "" else team,
-                    service_id,
-                    int(points_per_day),
-                ]
-            )
-
-            log.info(
-                f"  alive_series({alive_source})={int(alive_series)} "
-                f"interval~{interval_sec:.3f}s points/day~{int(points_per_day)}"
-            )
-
-        if batch_no < total_batches:
-            log.info(f"Batch done -> sleep {BATCH_SLEEP_SEC}s")
-            time.sleep(BATCH_SLEEP_SEC)
+    for team, pts in sorted(team_points.items(), key=lambda x: x[1], reverse=True):
+        out_rows.append([team, "", int(pts)])
 
     if not out_rows:
         log.warning("Нет данных для отчёта.")
         sys.exit(0)
-
-    out_rows.sort(key=lambda x: x[2], reverse=True)
 
     log.info(f"Сохранение файла {OUTPUT_FILE}...")
     write_report(out_rows, OUTPUT_FILE)
