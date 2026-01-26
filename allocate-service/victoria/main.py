@@ -2,7 +2,6 @@ import os
 import sys
 import time
 import logging
-from collections import defaultdict
 
 import requests
 import urllib3
@@ -24,17 +23,23 @@ log = logging.getLogger(__name__)
 
 OUTPUT_FILE = "victoriametrics_repot.xlsx"
 HTTP_TIMEOUT_SEC = 60
-
-# Равномерность/безопасность
 SLEEP_BETWEEN_QUERIES_SEC = float(os.getenv("SLEEP_BETWEEN_QUERIES_SEC", "0.08"))
-MAX_GROUPS = int(os.getenv("MAX_GROUPS", "0"))  # 0 = без лимита
 
-# Окна (фиксированные, чтобы не множить запросы)
-ALIVE_WINDOW = "24h"
+# Крохотный прогон
+MAX_GROUPS = int(os.getenv("MAX_GROUPS", "10"))          # 0 = все
+START_FROM = int(os.getenv("START_FROM", "0"))
+STOP_AFTER_SECONDS = int(os.getenv("STOP_AFTER_SECONDS", "60"))  # 0 = без
+
+# Скип жирной кучи без лейблов
+SKIP_UNLABELED = os.getenv("SKIP_UNLABELED", "true").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+# Живость: через /api/v1/series (индекс, не читает миллиарды сэмплов)
+ALIVE_LOOKBACK_SEC = int(os.getenv("ALIVE_LOOKBACK_SEC", str(24 * 3600)))  # 24h
+SERIES_API_LIMIT = int(os.getenv("SERIES_API_LIMIT", "200000"))            # защита от гигантских ответов
+
+# Интервал
 INTERVAL_WINDOW = "2m"
 INTERVAL_WINDOW_SEC = 120.0
-
-# Фолбэк, если по 2m не получается оценить интервал (avg<2)
 FALLBACK_INTERVAL_SEC = float(os.getenv("FALLBACK_INTERVAL_SEC", "60"))
 
 
@@ -42,12 +47,7 @@ def safe_query(prom, q):
     log.info(f"QUERY: {q}")
     try:
         url = prom.url.rstrip("/") + "/api/v1/query"
-        r = requests.get(
-            url,
-            params={"query": q},
-            verify=False,
-            timeout=HTTP_TIMEOUT_SEC,
-        )
+        r = requests.get(url, params={"query": q}, verify=False, timeout=HTTP_TIMEOUT_SEC)
         r.raise_for_status()
         data = r.json()
         if data.get("status") != "success":
@@ -69,19 +69,25 @@ def label(metric: dict, key: str) -> str:
 
 def discover_groups(prom):
     groups = set()
+
+    # ВАЖНО: тут у тебя был дубль — исправлено
     queries = [
         'count by (team, service_id) ({team=~".+", service_id=~".+"})',
         'count by (team, service_id) ({team!~".+", service_id=~".+"})',
         'count by (team, service_id) ({team=~".+", service_id!~".+"})',
         'count by (team, service_id) ({team!~".+", service_id!~".+"})',
     ]
-    for q in queries:
+
+    for i, q in enumerate(queries, start=1):
+        log.info(f"DISCOVER[{i}/4]")
         rows = safe_query(prom, q) or []
         for r in rows:
             m = r.get("metric", {}) or {}
             groups.add((label(m, "team"), label(m, "service_id")))
 
     groups = sorted(groups)
+    if START_FROM > 0:
+        groups = groups[START_FROM:]
     if MAX_GROUPS and len(groups) > MAX_GROUPS:
         log.warning(f"MAX_GROUPS={MAX_GROUPS}: урезаем группы {len(groups)} -> {MAX_GROUPS}")
         groups = groups[:MAX_GROUPS]
@@ -98,7 +104,6 @@ def build_matchers(team: str, service_id: str) -> str:
 
 
 def get_scalar_value(rows) -> float:
-    # результат instant vector вида: [{"value":[ts,"123"]}]
     if not rows:
         return 0.0
     try:
@@ -108,11 +113,44 @@ def get_scalar_value(rows) -> float:
 
 
 def estimate_interval_sec(avg_cnt_window: float) -> float:
-    # avg_cnt_window = среднее число точек в окне на ряд
     if avg_cnt_window >= 2.0:
-        # число интервалов = avg_cnt - 1
         return INTERVAL_WINDOW_SEC / (avg_cnt_window - 1.0)
     return FALLBACK_INTERVAL_SEC
+
+
+def alive_series_via_series_api(prom: PrometheusConnect, matchers: str, lookback_sec: int) -> int:
+    """
+    Считает кол-во series, у которых были точки в окне [now-lookback, now],
+    через /api/v1/series (индекс). Это как раз замена count(count_over_time(..[24h])),
+    чтобы НЕ ловить 422 maxSamplesPerQuery.
+    """
+    end = int(time.time())
+    start = end - lookback_sec
+
+    url = prom.url.rstrip("/") + "/api/v1/series"
+    params = {
+        "match[]": "{" + matchers + "}",
+        "start": str(start),
+        "end": str(end),
+    }
+
+    log.info(f"SERIES_API: {url} match={params['match[]']} start={start} end={end}")
+
+    r = requests.get(url, params=params, verify=False, timeout=HTTP_TIMEOUT_SEC)
+    r.raise_for_status()
+    data = r.json()
+    if data.get("status") != "success":
+        raise RuntimeError(f"series api bad response: {data}")
+
+    series_list = data.get("data") or []
+    cnt = len(series_list)
+
+    # Защита: если группа супер-жирная, не тащим всё дальше
+    if SERIES_API_LIMIT and cnt > SERIES_API_LIMIT:
+        log.warning(f"SERIES_API_LIMIT={SERIES_API_LIMIT} exceeded: got {cnt} series -> скипаем группу")
+        return 0
+
+    return cnt
 
 
 def autosize_columns(ws):
@@ -121,8 +159,7 @@ def autosize_columns(ws):
         col_letter = get_column_letter(col[0].column)
         for cell in col:
             v = "" if cell.value is None else str(cell.value)
-            if len(v) > max_len:
-                max_len = len(v)
+            max_len = max(max_len, len(v))
         ws.column_dimensions[col_letter].width = min(max(10, max_len + 2), 60)
 
 
@@ -160,26 +197,43 @@ def main():
         log.error(f"Не удалось подключиться к VM: {e}")
         sys.exit(1)
 
-    log.info("Поиск групп (team/service_id), включая отсутствующие лейблы...")
-    groups = discover_groups(prom)
-    log.info(f"Всего уникальных групп: {len(groups)}")
+    log.info(
+        f"MAX_GROUPS={MAX_GROUPS} START_FROM={START_FROM} STOP_AFTER_SECONDS={STOP_AFTER_SECONDS} "
+        f"SKIP_UNLABELED={SKIP_UNLABELED} ALIVE_LOOKBACK_SEC={ALIVE_LOOKBACK_SEC}"
+    )
 
+    groups = discover_groups(prom)
+    log.info(f"Групп к обработке: {len(groups)}")
+
+    started = time.time()
     out_rows = []
 
-    for team, service_id in groups:
+    for idx, (team, service_id) in enumerate(groups, start=1):
+        if STOP_AFTER_SECONDS and (time.time() - started) > STOP_AFTER_SECONDS:
+            log.warning("STOP_AFTER_SECONDS сработал -> останавливаемся")
+            break
+
+        if SKIP_UNLABELED and team == "" and service_id == "":
+            log.info("[GROUP] UNLABELED -> skip")
+            continue
+
         tag = "[UNLABELED]" if team == "" and service_id == "" else f"team={team} service_id={service_id}"
-        log.info(f"[GROUP] {tag}")
+        log.info(f"[{idx}/{len(groups)}] [GROUP] {tag}")
 
         m = build_matchers(team, service_id)
 
-        # 1) “живые” series в 24h (если 0 — сразу пропускаем группу)
-        q_alive = f'count(count_over_time({{{m}}}[{ALIVE_WINDOW}]))'
-        alive_series = get_scalar_value(safe_query(prom, q_alive) or [])
-        if alive_series <= 0:
-            log.info("  alive_series_24h=0 -> пропуск")
+        # 1) alive series за 24h (без 422)
+        try:
+            alive_series = alive_series_via_series_api(prom, m, ALIVE_LOOKBACK_SEC)
+        except Exception as e:
+            log.error(f"SERIES_API ошибка: {e} -> пропуск группы")
             continue
 
-        # 2) оценка интервала по 2m (одним запросом)
+        if alive_series <= 0:
+            log.info("  alive_series=0 -> пропуск")
+            continue
+
+        # 2) интервал по 2m (лёгкий запрос)
         q_avg = f'avg(count_over_time({{{m}}}[{INTERVAL_WINDOW}]))'
         avg_cnt_2m = get_scalar_value(safe_query(prom, q_avg) or [])
 
@@ -195,12 +249,12 @@ def main():
         )
 
         log.info(
-            f"  alive_series_24h={int(alive_series)} avg_cnt_2m={avg_cnt_2m:.3f} "
+            f"  alive_series_24h~{int(alive_series)} avg_cnt_2m={avg_cnt_2m:.3f} "
             f"interval~{interval_sec:.3f}s points/day~{int(points_per_day)}"
         )
 
     if not out_rows:
-        log.warning("Нет данных для отчёта (все группы пустые/мёртвые).")
+        log.warning("Нет данных для отчёта.")
         sys.exit(0)
 
     out_rows.sort(key=lambda x: x[2], reverse=True)
