@@ -24,23 +24,21 @@ log = logging.getLogger(__name__)
 OUTPUT_FILE = "victoriametrics_repot.xlsx"
 HTTP_TIMEOUT_SEC = 60
 
-# Равномерная нагрузка
 SLEEP_BETWEEN_QUERIES_SEC = 0.10
-
-# Батчи (авто)
 BATCH_SIZE = 5
 BATCH_SLEEP_SEC = 2.0
-
 SKIP_UNLABELED = True
 
-# Alive series за 24h: через /api/v1/series (индекс)
 ALIVE_LOOKBACK_SEC = 24 * 3600
-SERIES_API_LIMIT = 200_000  # если больше — скипаем группу
+SERIES_API_LIMIT = 200_000
 
-# Интервал по короткому окну
 INTERVAL_WINDOW = "2m"
 INTERVAL_WINDOW_SEC = 120.0
 FALLBACK_INTERVAL_SEC = 60.0
+
+# Разбиение по метрикам, если группа слишком жирная
+METRIC_SPLIT_LIMIT = 50       # сколько метрик брать из группы при разбиении
+METRIC_SPLIT_SLEEP_SEC = 0.05 # пауза между series-api вызовами по метрикам
 
 
 def safe_query(prom, q):
@@ -74,19 +72,17 @@ def discover_groups(prom):
         'count by (team, service_id) ({team=~".+", service_id!~".+"})',
         'count by (team, service_id) ({team!~".+", service_id!~".+"})',
     ]
-
     for i, q in enumerate(queries, start=1):
         log.info(f"DISCOVER[{i}/4]")
         rows = safe_query(prom, q) or []
         for r in rows:
             m = r.get("metric", {}) or {}
             groups.add((label(m, "team"), label(m, "service_id")))
-
     return sorted(groups)
 
 
 def build_matchers(team: str, service_id: str) -> str:
-    # Для /api/v1/query: можно !~ и прочие matchers
+    # Для /api/v1/query: можно !~
     return ", ".join(
         [
             'team!~".+"' if team == "" else f'team="{team}"',
@@ -95,13 +91,18 @@ def build_matchers(team: str, service_id: str) -> str:
     )
 
 
-def build_series_api_matchers(team: str, service_id: str):
-    # Для /api/v1/series: ТОЛЬКО точные '=' matchers, без regex/отрицаний
+def build_series_api_matchers(team: str, service_id: str, metric_name: str | None = None):
+    # Для /api/v1/series: только '=' без regex/отрицаний
     if team == "" or service_id == "":
         return None
-    team_v = team.replace("\\", "\\\\").replace('"', '\\"')
-    sid_v = service_id.replace("\\", "\\\\").replace('"', '\\"')
-    return f'team="{team_v}", service_id="{sid_v}"'
+
+    def esc(s: str) -> str:
+        return s.replace("\\", "\\\\").replace('"', '\\"')
+
+    parts = [f'team="{esc(team)}"', f'service_id="{esc(service_id)}"']
+    if metric_name:
+        parts.append(f'__name__="{esc(metric_name)}"')
+    return ", ".join(parts)
 
 
 def get_scalar_value(rows) -> float:
@@ -119,16 +120,12 @@ def estimate_interval_sec(avg_cnt_window: float) -> float:
     return FALLBACK_INTERVAL_SEC
 
 
-def alive_series_via_series_api(prom: PrometheusConnect, matchers: str, lookback_sec: int) -> int:
+def alive_series_via_series_api(prom: PrometheusConnect, series_matchers: str, lookback_sec: int) -> int:
     end = int(time.time())
     start = end - lookback_sec
 
     url = prom.url.rstrip("/") + "/api/v1/series"
-    params = {
-        "match[]": "{" + matchers + "}",
-        "start": str(start),
-        "end": str(end),
-    }
+    params = {"match[]": "{" + series_matchers + "}", "start": str(start), "end": str(end)}
 
     log.info(f"SERIES_API match={params['match[]']}")
     r = requests.get(url, params=params, verify=False, timeout=HTTP_TIMEOUT_SEC)
@@ -141,10 +138,59 @@ def alive_series_via_series_api(prom: PrometheusConnect, matchers: str, lookback
     cnt = len(series_list)
 
     if SERIES_API_LIMIT and cnt > SERIES_API_LIMIT:
-        log.warning(f"SERIES_API_LIMIT exceeded: got {cnt} series -> skip group")
-        return 0
+        log.warning(f"SERIES_API_LIMIT exceeded: got {cnt} series -> treat as failure")
+        raise RuntimeError(f"too many series: {cnt}")
 
     return cnt
+
+
+def alive_series_fallback_small_window(prom: PrometheusConnect, query_matchers: str, window: str = "5m") -> int:
+    q = f'count(count_over_time({{{query_matchers}}}[{window}]))'
+    rows = safe_query(prom, q) or []
+    return int(get_scalar_value(rows))
+
+
+def metric_names_in_group(prom: PrometheusConnect, query_matchers: str) -> list[str]:
+    # Дёшево: список метрик (имён) внутри группы
+    q = f'count by (__name__) ({{{query_matchers}}})'
+    rows = safe_query(prom, q) or []
+    names = []
+    for r in rows:
+        m = r.get("metric", {}) or {}
+        n = m.get("__name__")
+        if n:
+            names.append(n)
+    return sorted(set(names))
+
+
+def alive_series_by_metric_split(prom: PrometheusConnect, team: str, service_id: str, query_matchers: str) -> int:
+    """
+    Если группа слишком жирная и /series падает — берём N метрик и суммируем series по каждой метрике.
+    Это обход 422 “по группе”.
+    """
+    names = metric_names_in_group(prom, query_matchers)
+    if not names:
+        return 0
+
+    if len(names) > METRIC_SPLIT_LIMIT:
+        log.info(f"  split: metrics={len(names)} -> take first {METRIC_SPLIT_LIMIT}")
+        names = names[:METRIC_SPLIT_LIMIT]
+    else:
+        log.info(f"  split: metrics={len(names)}")
+
+    total = 0
+    for n in names:
+        sm = build_series_api_matchers(team, service_id, n)
+        if not sm:
+            continue
+        try:
+            c = alive_series_via_series_api(prom, sm, ALIVE_LOOKBACK_SEC)
+            total += c
+        except Exception as e:
+            log.warning(f"  split metric={n}: series_api failed ({e}) -> skip metric")
+        time.sleep(METRIC_SPLIT_SLEEP_SEC)
+
+    return total
 
 
 def iter_batches(items, batch_size: int):
@@ -199,7 +245,6 @@ def main():
     log.info("Поиск групп (team/service_id) 4 запросами...")
     groups = discover_groups(prom)
     log.info(f"Всего уникальных групп: {len(groups)}")
-
     if not groups:
         log.warning("Группы не найдены.")
         sys.exit(0)
@@ -215,33 +260,35 @@ def main():
                 log.info("[GROUP] UNLABELED -> skip")
                 continue
 
-            tag = "[UNLABELED]" if team == "" and service_id == "" else f"team={team} service_id={service_id}"
-            log.info(f"[GROUP] {tag}")
+            log.info(f"[GROUP] team={team} service_id={service_id}")
 
-            # Для query API (можно !~)
             query_matchers = build_matchers(team, service_id)
 
-            # Для series API (только =, иначе 422)
-            series_matchers = build_series_api_matchers(team, service_id)
-            if series_matchers is None:
-                log.info("  series_api: empty team/service_id -> skip")
-                continue
-
-            # 1) alive series за 24h (без 422)
+            # 1) alive series: пробуем по группе через series api
+            alive_series = 0
             try:
+                series_matchers = build_series_api_matchers(team, service_id)
+                if not series_matchers:
+                    log.info("  series_api: empty team/service_id -> skip")
+                    continue
                 alive_series = alive_series_via_series_api(prom, series_matchers, ALIVE_LOOKBACK_SEC)
+                alive_source = "series_api"
             except Exception as e:
-                log.error(f"SERIES_API ошибка: {e} -> skip group")
-                continue
+                log.warning(f"  series_api failed ({e}) -> try split-by-metric")
+                alive_series = alive_series_by_metric_split(prom, team, service_id, query_matchers)
+                alive_source = "split_metrics" if alive_series > 0 else "fallback_5m"
+
+                # 2) если разбиение не помогло — fallback на 5m
+                if alive_series <= 0:
+                    alive_series = alive_series_fallback_small_window(prom, query_matchers, "5m")
 
             if alive_series <= 0:
-                log.info("  alive_series=0 -> пропуск")
+                log.info("  alive_series=0 -> skip")
                 continue
 
-            # 2) интервал по 2m (лёгкий запрос)
+            # Интервал (лёгкий запрос)
             q_avg = f'avg(count_over_time({{{query_matchers}}}[{INTERVAL_WINDOW}]))'
             avg_cnt_2m = get_scalar_value(safe_query(prom, q_avg) or [])
-
             interval_sec = estimate_interval_sec(avg_cnt_2m)
             points_per_day = alive_series * (86400.0 / interval_sec)
 
@@ -254,7 +301,7 @@ def main():
             )
 
             log.info(
-                f"  alive_series_24h~{int(alive_series)} avg_cnt_2m={avg_cnt_2m:.3f} "
+                f"  alive_series({alive_source})={int(alive_series)} "
                 f"interval~{interval_sec:.3f}s points/day~{int(points_per_day)}"
             )
 
