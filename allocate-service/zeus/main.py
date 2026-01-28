@@ -6,6 +6,7 @@ import re
 
 import gitlab
 import yaml
+import pandas as pd
 from dotenv import load_dotenv
 
 from openpyxl import Workbook
@@ -22,8 +23,91 @@ GITLAB_URL = os.getenv("GITLAB_URL", "").rstrip("/")
 TOKEN = os.getenv("TOKEN", "")
 GROUP_ID = os.getenv("GROUP_ID", "").strip()
 
+SD_FILE = os.getenv("SD_FILE", "sd.xlsx")
+BK_FILE = os.getenv("BK_FILE", "bk_all_users.xlsx")
+
 OUTPUT_XLSX = "deploy_limits_report.xlsx"
 GIT_REF = "main"
+
+# BAN-LIST: сервисы (именно service, без "-код"), которые нужно полностью пропустить
+BAN_SERVICES = [
+]
+
+
+def clean_spaces(s: str) -> str:
+    s = (s or "").strip()
+    s = s.replace(",", " ")
+    s = " ".join(s.split())
+    return s
+
+
+def normalize_name_key(s: str) -> str:
+    return clean_spaces(s).lower()
+
+
+def load_sd_people_map(path: str):
+    # SD: B=КОД, D=Наименование, H=Владелец, I=Менеджер
+    log.info("Читаем SD (B=КОД, D=Наименование, H=Владелец, I=Менеджер)...")
+
+    df = pd.read_excel(path, usecols="B,D,H,I", dtype=str, engine="openpyxl")
+    df.columns = ["service_id", "service_name", "owner", "manager"]
+    df = df.fillna("")
+
+    df["service_id"] = df["service_id"].astype(str).str.strip()
+    df["service_name"] = df["service_name"].astype(str).map(clean_spaces)
+    df["owner"] = df["owner"].astype(str).map(clean_spaces)
+    df["manager"] = df["manager"].astype(str).map(clean_spaces)
+
+    df = df[df["service_id"] != ""].copy()
+    last = df.drop_duplicates("service_id", keep="last")
+
+    mp = {
+        sid: {"service_name": sn, "owner": o, "manager": m}
+        for sid, sn, o, m in zip(
+            last["service_id"].tolist(),
+            last["service_name"].tolist(),
+            last["owner"].tolist(),
+            last["manager"].tolist(),
+        )
+    }
+
+    log.info(f"SD: загружено сервисов по КОД: {len(mp)}")
+    return mp
+
+
+def load_bk_business_type_map(path: str):
+    # BK: A:B:C=ФИО, AS=Тип бизнеса
+    log.info("Читаем BK (A:B:C=ФИО, AS=Тип бизнеса)...")
+
+    df = pd.read_excel(path, usecols="A:C,AS", dtype=str, engine="openpyxl")
+    df = df.fillna("")
+    df.columns = ["c1", "c2", "c3", "business_type"]
+
+    def make_fio(r):
+        fio = " ".join([clean_spaces(r["c2"]), clean_spaces(r["c1"]), clean_spaces(r["c3"])])
+        return clean_spaces(fio)
+
+    df["fio_key"] = df.apply(make_fio, axis=1).map(normalize_name_key)
+    df["business_type"] = df["business_type"].astype(str).map(clean_spaces)
+
+    df = df[df["fio_key"] != ""].copy()
+    last = df.drop_duplicates("fio_key", keep="last")
+
+    mp = dict(zip(last["fio_key"], last["business_type"]))
+    log.info(f"BK: загружено ФИО->Тип бизнеса: {len(mp)}")
+    return mp
+
+
+def pick_business_type(bk_type_map: dict, owner: str, manager: str) -> str:
+    if owner:
+        bt = bk_type_map.get(normalize_name_key(owner), "")
+        if bt:
+            return bt
+    if manager:
+        bt = bk_type_map.get(normalize_name_key(manager), "")
+        if bt:
+            return bt
+    return ""
 
 
 def gl_connect():
@@ -178,10 +262,6 @@ def parse_deployment_limits(text: str, project_name: str, file_path: str):
 
 
 def split_service_and_code(project_name: str):
-    """
-    CREDITFLOW-8602 -> ("CREDITFLOW", "8602")
-    Если не совпало — ("<project_name>", "")
-    """
     name = (project_name or "").strip()
     m = re.match(r"^(.*?)-(\d+)$", name)
     if not m:
@@ -189,7 +269,7 @@ def split_service_and_code(project_name: str):
     return m.group(1), m.group(2)
 
 
-def collect_service_totals(gl, projects):
+def collect_service_totals(gl, projects, sd_people_map, bk_type_map):
     totals = {}  # (service, code) -> {"cpu": float, "mem": int}
 
     for p in projects:
@@ -201,8 +281,12 @@ def collect_service_totals(gl, projects):
 
         service, code = split_service_and_code(p.name)
 
+        if service in BAN_SERVICES:
+            log.info(f"[{p.name}] SKIP (ban service): service='{service}'")
+            continue
+
         files = find_deployment_files(proj)
-        log.info(f"[{p.name}] service='{service}' code='{code}' deployment_files={len(files)}")
+        log.info(f"[p={p.name}] service='{service}' code='{code}' deployment_files={len(files)}")
 
         cpu_total = 0.0
         mem_total = 0
@@ -218,22 +302,28 @@ def collect_service_totals(gl, projects):
             cpu_total += cpu
             mem_total += mem
 
-        if cpu_total > 0 or mem_total > 0:
-            key = (service, code)
-            if key not in totals:
-                totals[key] = {"cpu": 0.0, "mem": 0}
-            totals[key]["cpu"] += cpu_total
-            totals[key]["mem"] += mem_total
+        if cpu_total <= 0 and mem_total <= 0:
+            continue
 
-    return totals
+        key = (service, code)
+        if key not in totals:
+            totals[key] = {"cpu": 0.0, "mem": 0}
+        totals[key]["cpu"] += cpu_total
+        totals[key]["mem"] += mem_total
 
-
-def write_excel(service_totals, out_file: str):
-    total_cpu = sum(v["cpu"] for v in service_totals.values())
-    total_mem = sum(v["mem"] for v in service_totals.values())
-
+    # превращаем totals -> rows с владельцем и типом бизнеса
     rows = []
-    for (service, code), v in service_totals.items():
+    total_cpu = sum(v["cpu"] for v in totals.values())
+    total_mem = sum(v["mem"] for v in totals.values())
+
+    for (service, code), v in totals.items():
+        people = sd_people_map.get(code, {"service_name": "", "owner": "", "manager": ""})
+        owner = people.get("owner", "")
+        manager = people.get("manager", "")
+
+        owner_for_report = owner or manager
+        business_type = pick_business_type(bk_type_map, owner=owner, manager=manager)
+
         cpu = v["cpu"]
         mem = v["mem"]
 
@@ -245,6 +335,8 @@ def write_excel(service_totals, out_file: str):
             {
                 "service": service,
                 "code": code,
+                "owner": owner_for_report,
+                "business_type": business_type,
                 "cpu_cores": cpu,
                 "mem_mib": bytes_to_mib(mem),
                 "pct": pct,
@@ -252,12 +344,24 @@ def write_excel(service_totals, out_file: str):
         )
 
     rows.sort(key=lambda r: r["pct"], reverse=True)
+    return rows
 
+
+def write_excel(rows, out_file: str):
     wb = Workbook()
     ws = wb.active
     ws.title = "Report"
 
-    headers = ["Наименование сервиса", "код", "CPU (cores)", "MEM (MiB)", "% потребления"]
+    headers = [
+        "Наименование сервиса",
+        "код",
+        "Владелец сервиса",
+        "Тип бизнеса",
+        "CPU (cores)",
+        "MEM (MiB)",
+        "% потребления",
+    ]
+
     bold = Font(bold=True)
     for col, h in enumerate(headers, start=1):
         c = ws.cell(row=1, column=col, value=h)
@@ -266,9 +370,11 @@ def write_excel(service_totals, out_file: str):
     for i, r in enumerate(rows, start=2):
         ws.cell(i, 1, r["service"])
         ws.cell(i, 2, r["code"])
-        ws.cell(i, 3, round(r["cpu_cores"], 6))
-        ws.cell(i, 4, round(r["mem_mib"], 2))
-        ws.cell(i, 5, round(r["pct"], 2))
+        ws.cell(i, 3, r["owner"])
+        ws.cell(i, 4, r["business_type"])
+        ws.cell(i, 5, round(r["cpu_cores"], 6))
+        ws.cell(i, 6, round(r["mem_mib"], 2))
+        ws.cell(i, 7, round(r["pct"], 2))
 
     wb.save(out_file)
     log.info(f"Excel отчет создан: {out_file}")
@@ -276,11 +382,26 @@ def write_excel(service_totals, out_file: str):
 
 def main():
     log.info("=== START: Deployment limits report ===")
+
+    if not GITLAB_URL or not TOKEN or not GROUP_ID:
+        raise SystemExit("Нужны ENV: GITLAB_URL, TOKEN, GROUP_ID")
+
+    if not SD_FILE or not os.path.isfile(SD_FILE):
+        raise SystemExit(f"SD_FILE не найден: {SD_FILE}")
+    if not BK_FILE or not os.path.isfile(BK_FILE):
+        raise SystemExit(f"BK_FILE не найден: {BK_FILE}")
+
+    sd_people_map = load_sd_people_map(SD_FILE)
+    bk_type_map = load_bk_business_type_map(BK_FILE)
+
     gl = gl_connect()
     projects = get_group_projects(gl)
-    totals = collect_service_totals(gl, projects)
-    log.info(f"Сервисов в отчете: {len(totals)}")
-    write_excel(totals, OUTPUT_XLSX)
+
+    rows = collect_service_totals(gl, projects, sd_people_map=sd_people_map, bk_type_map=bk_type_map)
+
+    log.info(f"Строк в отчете: {len(rows)}")
+    write_excel(rows, OUTPUT_XLSX)
+
     log.info("=== DONE ===")
 
 
