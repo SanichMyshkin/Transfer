@@ -3,10 +3,12 @@ import os
 import json
 import logging
 import urllib3
+from io import StringIO
 
 import gitlab
-import yaml
 from dotenv import load_dotenv
+
+from ruamel.yaml import YAML
 
 from openpyxl import Workbook
 from openpyxl.styles import Font
@@ -14,9 +16,7 @@ from openpyxl.utils import get_column_letter
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("gitlab_metrics_report")
 
 load_dotenv()
@@ -25,8 +25,11 @@ GITLAB_URL = os.getenv("GITLAB_URL", "").rstrip("/")
 TOKEN = os.getenv("TOKEN", "")
 GROUP_ID = os.getenv("GROUP_ID", "")
 
-OUTPUT_XLSX = "zeus_report.xlsx"
-GIT_REF = os.getenv("GIT_REF", "main")
+OUTPUT_XLSX = os.getenv("OUTPUT_XLSX", "gitlab_metrics_report.xlsx")
+GIT_REF = os.getenv("GIT_REF", "main")  # если у вас master — поменяй
+
+# Важно: YAML не допускает табы в отступах. Мы их нормализуем.
+TAB_REPLACEMENT = os.getenv("TAB_REPLACEMENT", "  ")  # по умолчанию 2 пробела
 
 
 def must_env(name: str) -> str:
@@ -68,26 +71,20 @@ def get_file_text(proj, file_path: str, ref: str) -> str:
 
 
 def get_team_name_from_gitlab_json(proj, ref: str) -> str | None:
+    # gitlab/mapping/gitlab.json -> group.name
     try:
         root = repo_tree(proj)
-        gitlab_dir = next(
-            (i for i in root if i["type"] == "tree" and i["name"] == "gitlab"), None
-        )
+        gitlab_dir = next((i for i in root if i["type"] == "tree" and i["name"] == "gitlab"), None)
         if not gitlab_dir:
             return None
 
         lvl2 = repo_tree(proj, gitlab_dir["path"])
-        mapping = next(
-            (i for i in lvl2 if i["type"] == "tree" and i["name"] == "mapping"), None
-        )
+        mapping = next((i for i in lvl2 if i["type"] == "tree" and i["name"] == "mapping"), None)
         if not mapping:
             return None
 
         items = repo_tree(proj, mapping["path"])
-        jf = next(
-            (i for i in items if i["type"] == "blob" and i["name"] == "gitlab.json"),
-            None,
-        )
+        jf = next((i for i in items if i["type"] == "blob" and i["name"] == "gitlab.json"), None)
         if not jf:
             return None
 
@@ -97,11 +94,12 @@ def get_team_name_from_gitlab_json(proj, ref: str) -> str | None:
         name = (name or "").strip()
         return name or None
     except Exception as e:
-        log.warning(f"[{proj.path_with_namespace}] Не смог прочитать gitlab.json: {e}")
+        log.warning(f"[{proj.path_with_namespace}] gitlab.json не прочитан: {e}")
         return None
 
 
 def find_monitoring_files(proj):
+    # ищем в zeus-* подпапках файлы *-monitors.yml(yaml)
     try:
         root = repo_tree(proj)
     except Exception as e:
@@ -120,9 +118,7 @@ def find_monitoring_files(proj):
         zeus_items = repo_tree(proj, zeus_dir["path"])
         subfolders = [i for i in zeus_items if i["type"] == "tree"]
     except Exception as e:
-        log.warning(
-            f"[{proj.path_with_namespace}] Не смог прочитать zeus-* дерево: {e}"
-        )
+        log.warning(f"[{proj.path_with_namespace}] zeus-* tree error: {e}")
         return []
 
     for sub in subfolders:
@@ -142,27 +138,39 @@ def find_monitoring_files(proj):
     return files
 
 
-def parse_monitors_yaml(text: str, project_name: str, file_path: str):
-    def _sanitize(src: str) -> str:
-        out = []
-        for line in src.splitlines():
-            # убираем табы
-            line = line.replace("\t", "  ")
-            # выкидываем комментарии целиком
-            stripped = line.lstrip()
-            if stripped.startswith("#"):
-                continue
-            out.append(line)
-        return "\n".join(out)
+def _ruamel_yaml():
+    y = YAML(typ="rt")  # round-trip: комментарии/порядок сохраняются
+    y.preserve_quotes = True
+    # если захочешь реально форматировать обратно в YAML — эти отступы пригодятся:
+    y.indent(mapping=2, sequence=4, offset=2)
+    y.width = 4096
+    return y
+
+
+def normalize_yaml_text(raw: str) -> str:
+    # Минимальная нормализация: только табы -> пробелы.
+    # Комментарии ruamel.yaml понимает, проблема у тебя именно в табах.
+    if "\t" in raw:
+        return raw.replace("\t", TAB_REPLACEMENT)
+    return raw
+
+
+def parse_monitors_with_ruamel(raw: str, project: str, file_path: str):
+    y = _ruamel_yaml()
+    text = normalize_yaml_text(raw)
 
     try:
-        clean = _sanitize(text)
-        data = yaml.safe_load(clean) or {}
+        data = y.load(text)
     except Exception as e:
-        log.warning(f"[{project_name}] YAML пропущен (битый): {file_path} ({e})")
+        log.warning(f"[{project}] YAML пропущен (не парсится даже после tab-fix): {file_path} ({e})")
         return []
 
-    listing = (((data.get("zeus") or {}).get("monitors") or {}).get("listing")) or []
+    if not isinstance(data, dict):
+        return []
+
+    zeus = data.get("zeus") or {}
+    monitors = zeus.get("monitors") or {}
+    listing = monitors.get("listing") or []
     if not isinstance(listing, list):
         return []
 
@@ -186,11 +194,11 @@ def parse_monitors_yaml(text: str, project_name: str, file_path: str):
     return out
 
 
-
 def build_report_rows(gl, projects, ref: str):
-    stats = {}
+    stats = {}  # team -> counters
     processed = 0
     with_mon_files = 0
+    skipped_yaml_files = 0
 
     for p in projects:
         processed += 1
@@ -215,17 +223,18 @@ def build_report_rows(gl, projects, ref: str):
                 "total": 0,
             }
 
-        log.info(f"[{p.name}] team='{team}' files={len(mon_files)}")
+        log.info(f"[{p.name}] service='{team}' files={len(mon_files)}")
 
         for path in mon_files:
             try:
-                txt = get_file_text(proj, path, ref)
+                raw = get_file_text(proj, path, ref)
             except Exception as e:
                 log.warning(f"[{p.name}] Не смог прочитать {path} ({ref}): {e}")
                 continue
 
-            monitors = parse_monitors_yaml(txt, p.name, path)
+            monitors = parse_monitors_with_ruamel(raw, p.name, path)
             if not monitors:
+                skipped_yaml_files += 1
                 continue
 
             for m in monitors:
@@ -241,9 +250,7 @@ def build_report_rows(gl, projects, ref: str):
 
     rows = []
     for team, v in stats.items():
-        pct = 0.0
-        if total_metrics > 0:
-            pct = (v["total"] / total_metrics) * 100.0
+        pct = (v["total"] / total_metrics * 100.0) if total_metrics > 0 else 0.0
         rows.append(
             {
                 "service": team,
@@ -257,10 +264,9 @@ def build_report_rows(gl, projects, ref: str):
 
     rows.sort(key=lambda r: r["total"], reverse=True)
 
-    log.info(
-        f"Проектов обработано: {processed}, с monitoring файлами: {with_mon_files}"
-    )
-    log.info(f"Команд/сервисов в отчете: {len(rows)}, всего метрик: {total_metrics}")
+    log.info(f"Проектов обработано: {processed}, с monitoring файлами: {with_mon_files}")
+    log.info(f"Файлов YAML пропущено (не распарсились/пустые listing): {skipped_yaml_files}")
+    log.info(f"Сервисов в отчете: {len(rows)}, всего метрик: {total_metrics}")
     return rows, total_metrics
 
 
@@ -294,14 +300,15 @@ def write_excel(rows, total_metrics: int, out_file: str):
     ws.freeze_panes = "A2"
     ws.auto_filter.ref = f"A1:{get_column_letter(len(headers))}{max(1, len(rows) + 1)}"
 
-    # чуть ширины колонок
-    widths = [40, 22, 24, 14, 18, 30]
+    widths = [44, 24, 26, 16, 20, 34]
     for idx, w in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(idx)].width = w
 
-    # итоговая строка
     last = len(rows) + 2
     ws.cell(last, 1, "ИТОГО").font = bold
+    ws.cell(last, 2, sum(r["active"] for r in rows)).font = bold
+    ws.cell(last, 3, sum(r["disabled"] for r in rows)).font = bold
+    ws.cell(last, 4, sum(r["notifications"] for r in rows)).font = bold
     ws.cell(last, 5, total_metrics).font = bold
     ws.cell(last, 6, 100.0 if total_metrics > 0 else 0.0).font = bold
 
@@ -310,7 +317,7 @@ def write_excel(rows, total_metrics: int, out_file: str):
 
 
 def main():
-    log.info("=== START: GitLab metrics report (без LDAP) ===")
+    log.info("=== START: GitLab metrics report (ruamel.yaml + openpyxl, без LDAP) ===")
     gl = gl_connect()
     projects = get_group_projects(gl)
     rows, total = build_report_rows(gl, projects, ref=GIT_REF)
