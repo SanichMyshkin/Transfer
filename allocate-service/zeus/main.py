@@ -17,7 +17,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
 )
-log = logging.getLogger("deploy_limits_report")
+log = logging.getLogger("zeus_report")
 
 load_dotenv()
 
@@ -25,19 +25,18 @@ GITLAB_URL = os.getenv("GITLAB_URL", "").rstrip("/")
 TOKEN = os.getenv("TOKEN", "")
 GROUP_ID = os.getenv("GROUP_ID", "").strip()
 
-SD_FILE = os.getenv("SD_FILE", "sd.xlsx")
-BK_FILE = os.getenv("BK_FILE", "bk_all_users.xlsx")
+SD_FILE = os.getenv("SD_FILE")
+BK_FILE = os.getenv("BK_FILE")
 
-OUTPUT_XLSX = "deploy_limits_report.xlsx"
+OUTPUT_XLSX = "zeus_report.xlsx"
 GIT_REF = "main"
 
 # BAN-LIST: сервисы (именно service, без "-код"), которые нужно полностью пропустить
 BAN_SERVICES = [
-    # "CREDITFLOW",
-    # "EXPRESS",
+    "TEST",
+    "UNAITP",
 ]
 
-# Глобальный флаг: исключать ли проекты, у которых код = только нули (0000, 00, 0, ...)
 EXCLUDE_ZERO_CODES = True
 
 
@@ -294,19 +293,24 @@ def collect_rows(gl, projects, sd_people_map, bk_type_map):
             log.warning(f"[{p.name}] Не смог получить project объект: {e}")
             continue
 
-        service, code = split_service_and_code(p.name)
+        service_from_git, code = split_service_and_code(p.name)
 
         if EXCLUDE_ZERO_CODES and is_zero_code(code):
             log.info(f"[{p.name}] SKIP (code is all zeros)")
             continue
+        sd = sd_people_map.get(code, {}) if code else {}
+        service_from_sd = (
+            clean_spaces(sd.get("service_name", "")) if isinstance(sd, dict) else ""
+        )
+        service_for_report = service_from_sd or service_from_git
 
-        if service in BAN_SERVICES:
-            log.info(f"[{p.name}] SKIP (ban service): service='{service}'")
+        if service_for_report in BAN_SERVICES:
+            log.info(f"[{p.name}] SKIP (ban service): service='{service_for_report}'")
             continue
 
         files = find_deployment_files(proj)
         log.info(
-            f"[p={p.name}] service='{service}' code='{code}' deployment_files={len(files)}"
+            f"[p={p.name}] service='{service_for_report}' code='{code}' deployment_files={len(files)}"
         )
 
         cpu_total = 0.0
@@ -326,24 +330,37 @@ def collect_rows(gl, projects, sd_people_map, bk_type_map):
         if cpu_total <= 0 and mem_total <= 0:
             continue
 
-        key = (service, code)
+        owner = ""
+        manager = ""
+        if code and isinstance(sd, dict):
+            owner = sd.get("owner", "")
+            manager = sd.get("manager", "")
+
+        owner_for_report = clean_spaces(owner or manager)
+        business_type = pick_business_type(bk_type_map, owner=owner, manager=manager)
+
+        key = (service_for_report, code)
         if key not in totals:
-            totals[key] = {"cpu": 0.0, "mem": 0}
+            totals[key] = {
+                "cpu": 0.0,
+                "mem": 0,
+                "owner": owner_for_report,
+                "business_type": business_type,
+            }
+
         totals[key]["cpu"] += cpu_total
         totals[key]["mem"] += mem_total
+
+        if not totals[key]["owner"] and owner_for_report:
+            totals[key]["owner"] = owner_for_report
+        if not totals[key]["business_type"] and business_type:
+            totals[key]["business_type"] = business_type
 
     total_cpu = sum(v["cpu"] for v in totals.values())
     total_mem = sum(v["mem"] for v in totals.values())
 
     rows = []
-    for (service, code), v in totals.items():
-        people = sd_people_map.get(code, {"owner": "", "manager": ""})
-        owner = people.get("owner", "")
-        manager = people.get("manager", "")
-
-        owner_for_report = owner or manager
-        business_type = pick_business_type(bk_type_map, owner=owner, manager=manager)
-
+    for (service_name, code), v in totals.items():
         cpu = v["cpu"]
         mem = v["mem"]
 
@@ -353,10 +370,10 @@ def collect_rows(gl, projects, sd_people_map, bk_type_map):
 
         rows.append(
             {
-                "business_type": business_type,
-                "service": service,
+                "business_type": v.get("business_type", ""),
+                "service": service_name,
                 "code": code,
-                "owner": owner_for_report,
+                "owner": v.get("owner", ""),
                 "cpu_cores": cpu,
                 "mem_mib": bytes_to_mib(mem),
                 "pct": pct,
@@ -370,7 +387,7 @@ def collect_rows(gl, projects, sd_people_map, bk_type_map):
 def write_excel(rows, out_file: str):
     wb = Workbook()
     ws = wb.active
-    ws.title = "Отчет Zeus"
+    ws.title = "Report"
 
     headers = [
         "Тип бизнеса",
@@ -401,8 +418,6 @@ def write_excel(rows, out_file: str):
 
 
 def main():
-    log.info("=== START: Deployment limits report ===")
-
     if not GITLAB_URL or not TOKEN or not GROUP_ID:
         raise SystemExit("Нужны ENV: GITLAB_URL, TOKEN, GROUP_ID")
 
@@ -421,10 +436,7 @@ def main():
         gl, projects, sd_people_map=sd_people_map, bk_type_map=bk_type_map
     )
 
-    log.info(f"Строк в отчете: {len(rows)}")
     write_excel(rows, OUTPUT_XLSX)
-
-    log.info("=== DONE ===")
 
 
 if __name__ == "__main__":
