@@ -1,3 +1,4 @@
+# ldap_part.py
 import os
 import logging
 from ldap3 import Server, Connection, SUBTREE
