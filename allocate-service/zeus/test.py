@@ -1,6 +1,4 @@
-# test_parse_one.py
 import os
-import json
 import re
 import logging
 import urllib3
@@ -200,12 +198,10 @@ def main():
 
     text = normalize_yaml_text(raw)
 
-    # 1) пробуем обычный PyYAML
     try:
         data = yaml.safe_load(text) or {}
         listing = (((data.get("zeus") or {}).get("monitors") or {}).get("listing")) or []
         log.info(f"PyYAML OK. listing элементов: {len(listing) if isinstance(listing, list) else 'not-a-list'}")
-        # покажем 1 элемент, если есть
         if isinstance(listing, list) and listing:
             first = listing[0]
             enabled = first.get("enabled") if isinstance(first, dict) else None
@@ -214,7 +210,6 @@ def main():
     except Exception as e:
         log.warning(f"PyYAML FAIL: {e}")
 
-    # 2) fallback по listing (если YAML битый)
     monitors = fallback_parse_listing(text)
     log.info(f"FALLBACK: элементов listing найдено: {len(monitors)}")
     if monitors:
