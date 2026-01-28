@@ -2,6 +2,7 @@
 import os
 import logging
 import urllib3
+import re
 
 import gitlab
 import yaml
@@ -53,7 +54,6 @@ def get_file_text(proj, file_path: str, ref: str) -> str:
 
 
 def find_deployment_files(proj):
-    # как было с monitors, только -deployment.yml/.yaml
     try:
         root = repo_tree(proj)
     except Exception as e:
@@ -93,16 +93,14 @@ def find_deployment_files(proj):
 
 
 def parse_cpu_to_cores(v):
-    # "1300m" -> 1.3 ; "1" -> 1.0
     if v is None:
         return 0.0
     s = str(v).strip()
     if not s:
         return 0.0
     if s.endswith("m"):
-        num = s[:-1].strip()
         try:
-            return float(num) / 1000.0
+            return float(s[:-1].strip()) / 1000.0
         except Exception:
             return 0.0
     try:
@@ -112,7 +110,6 @@ def parse_cpu_to_cores(v):
 
 
 def parse_mem_to_bytes(v):
-    # "600Mi" / "1Gi" / "500M" etc.
     if v is None:
         return 0
     s = str(v).strip()
@@ -124,16 +121,11 @@ def parse_mem_to_bytes(v):
         "Mi": 1024**2,
         "Gi": 1024**3,
         "Ti": 1024**4,
-        "Pi": 1024**5,
-        "Ei": 1024**6,
         "K": 1000,
         "M": 1000**2,
         "G": 1000**3,
         "T": 1000**4,
-        "P": 1000**5,
-        "E": 1000**6,
     }
-
     for u, mul in units.items():
         if s.endswith(u):
             num = s[: -len(u)].strip()
@@ -141,7 +133,6 @@ def parse_mem_to_bytes(v):
                 return int(float(num) * mul)
             except Exception:
                 return 0
-
     try:
         return int(float(s))
     except Exception:
@@ -153,7 +144,6 @@ def bytes_to_mib(b: int) -> float:
 
 
 def parse_deployment_limits(text: str, project_name: str, file_path: str):
-    # возвращаем сумму лимитов по файлу: (cpu_cores, mem_bytes)
     try:
         docs = list(yaml.safe_load_all(text))
     except Exception as e:
@@ -187,8 +177,20 @@ def parse_deployment_limits(text: str, project_name: str, file_path: str):
     return cpu_sum, mem_sum
 
 
-def collect_project_totals(gl, projects):
-    totals = {}  # project_name -> {"cpu": float cores, "mem": int bytes}
+def split_service_and_code(project_name: str):
+    """
+    CREDITFLOW-8602 -> ("CREDITFLOW", "8602")
+    Если не совпало — ("<project_name>", "")
+    """
+    name = (project_name or "").strip()
+    m = re.match(r"^(.*?)-(\d+)$", name)
+    if not m:
+        return name, ""
+    return m.group(1), m.group(2)
+
+
+def collect_service_totals(gl, projects):
+    totals = {}  # (service, code) -> {"cpu": float, "mem": int}
 
     for p in projects:
         try:
@@ -197,8 +199,10 @@ def collect_project_totals(gl, projects):
             log.warning(f"[{p.name}] Не смог получить project объект: {e}")
             continue
 
+        service, code = split_service_and_code(p.name)
+
         files = find_deployment_files(proj)
-        log.info(f"[{p.name}] deployment_files={len(files)}")
+        log.info(f"[{p.name}] service='{service}' code='{code}' deployment_files={len(files)}")
 
         cpu_total = 0.0
         mem_total = 0
@@ -215,30 +219,32 @@ def collect_project_totals(gl, projects):
             mem_total += mem
 
         if cpu_total > 0 or mem_total > 0:
-            totals[p.name] = {"cpu": cpu_total, "mem": mem_total}
+            key = (service, code)
+            if key not in totals:
+                totals[key] = {"cpu": 0.0, "mem": 0}
+            totals[key]["cpu"] += cpu_total
+            totals[key]["mem"] += mem_total
 
     return totals
 
 
-def write_excel(project_totals, out_file: str):
-    # общий total для процентов
-    total_cpu = sum(v["cpu"] for v in project_totals.values())
-    total_mem = sum(v["mem"] for v in project_totals.values())
+def write_excel(service_totals, out_file: str):
+    total_cpu = sum(v["cpu"] for v in service_totals.values())
+    total_mem = sum(v["mem"] for v in service_totals.values())
 
     rows = []
-    for project, v in project_totals.items():
+    for (service, code), v in service_totals.items():
         cpu = v["cpu"]
         mem = v["mem"]
 
         cpu_pct = (cpu / total_cpu * 100.0) if total_cpu > 0 else 0.0
         mem_pct = (mem / total_mem * 100.0) if total_mem > 0 else 0.0
-
-        # как ты описал: (cpu% + mem%) / 2
         pct = (cpu_pct + mem_pct) / 2.0
 
         rows.append(
             {
-                "project": project,
+                "service": service,
+                "code": code,
                 "cpu_cores": cpu,
                 "mem_mib": bytes_to_mib(mem),
                 "pct": pct,
@@ -251,17 +257,18 @@ def write_excel(project_totals, out_file: str):
     ws = wb.active
     ws.title = "Report"
 
-    headers = ["ПРОЕКТ", "CPU (cores)", "MEM (MiB)", "% потребления"]
+    headers = ["Наименование сервиса", "код", "CPU (cores)", "MEM (MiB)", "% потребления"]
     bold = Font(bold=True)
     for col, h in enumerate(headers, start=1):
         c = ws.cell(row=1, column=col, value=h)
         c.font = bold
 
     for i, r in enumerate(rows, start=2):
-        ws.cell(i, 1, r["project"])
-        ws.cell(i, 2, round(r["cpu_cores"], 6))
-        ws.cell(i, 3, round(r["mem_mib"], 2))
-        ws.cell(i, 4, round(r["pct"], 2))
+        ws.cell(i, 1, r["service"])
+        ws.cell(i, 2, r["code"])
+        ws.cell(i, 3, round(r["cpu_cores"], 6))
+        ws.cell(i, 4, round(r["mem_mib"], 2))
+        ws.cell(i, 5, round(r["pct"], 2))
 
     wb.save(out_file)
     log.info(f"Excel отчет создан: {out_file}")
@@ -271,8 +278,8 @@ def main():
     log.info("=== START: Deployment limits report ===")
     gl = gl_connect()
     projects = get_group_projects(gl)
-    totals = collect_project_totals(gl, projects)
-    log.info(f"Проектов с найденными лимитами: {len(totals)}")
+    totals = collect_service_totals(gl, projects)
+    log.info(f"Сервисов в отчете: {len(totals)}")
     write_excel(totals, OUTPUT_XLSX)
     log.info("=== DONE ===")
 
