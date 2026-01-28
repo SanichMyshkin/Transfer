@@ -285,7 +285,7 @@ def is_zero_code(code: str) -> bool:
 
 
 def collect_rows(gl, projects, sd_people_map, bk_type_map):
-    totals = {}  # (service, code) -> {"cpu": float, "mem": int}
+    totals = {}
 
     for p in projects:
         try:
@@ -370,7 +370,7 @@ def collect_rows(gl, projects, sd_people_map, bk_type_map):
 def write_excel(rows, out_file: str):
     wb = Workbook()
     ws = wb.active
-    ws.title = "Report"
+    ws.title = "Отчет Zeus"
 
     headers = [
         "Тип бизнеса",
@@ -378,7 +378,7 @@ def write_excel(rows, out_file: str):
         "КОД",
         "Владелец сервиса",
         "CPU (cores)",
-        "MEM (MiB)",
+        "RAM (MiB)",
         "% потребления",
     ]
 
