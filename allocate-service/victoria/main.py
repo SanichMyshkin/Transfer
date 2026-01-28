@@ -1,8 +1,9 @@
 import os
 import sys
 import time
+import json
 import logging
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Dict, Optional
 
 import requests
 import urllib3
@@ -25,12 +26,17 @@ log = logging.getLogger(__name__)
 OUTPUT_FILE = "victoriametrics_repot.xlsx"
 HTTP_TIMEOUT_SEC = 60
 
-# Паузы строго как ты сказал
+# Паузы
 SLEEP_BETWEEN_QUERIES_SEC = 2.0
-SLEEP_BETWEEN_GROUPS_SEC = 10.0  # можно 5.0, но ты сказал “или даже 10”
+SLEEP_BETWEEN_GROUPS_SEC = 10.0
 
+# BAN-лист команд (лейбл team). Совпадение по точному значению.
+BAN_TEAMS: List[str] = [
+    # "team_a",
+    # "team_b",
+]
 
-# Окна поиска "двух первых точек"
+# Окна поиска "двух первых точек" (для интервала)
 WINDOWS: List[Tuple[str, int]] = [
     ("2m", 120),
     ("30m", 1800),
@@ -39,6 +45,20 @@ WINDOWS: List[Tuple[str, int]] = [
     ("12h", 43200),
     ("24h", 86400),
 ]
+
+# Lookback для оценки длины ряда.
+# Чем больше — тем тяжелее запросы, но тем меньше “обрезаний”.
+SERIES_LENGTH_LOOKBACK = "365d"
+
+# Писать длину КАЖДОГО ряда построчно в отдельный лист.
+# ВНИМАНИЕ: это может разнести Excel/VM, поэтому есть лимиты ниже.
+EXPORT_PER_SERIES_LENGTHS = True
+
+# Защита: выгружаем построчно длины рядов только если рядов у метрики <= этого значения
+EXPORT_PER_SERIES_MAX_SERIES_PER_METRIC = 200
+
+# И общий лимит строк в листе с рядами (чтобы не получить файл на сотни МБ)
+EXPORT_PER_SERIES_MAX_ROWS_TOTAL = 50_000
 
 
 def safe_query(prom: PrometheusConnect, q: str):
@@ -87,11 +107,10 @@ def discover_groups(prom: PrometheusConnect):
 
 
 def build_group_matchers(team: str, service_id: str) -> str:
-    # Query API: можно !~
     return ", ".join(
         [
-            'team!~".+"' if team == "" else f'team="{team}"',
-            'service_id!~".+"' if service_id == "" else f'service_id="{service_id}"',
+            'team!~".+"' if team == "" else f'team="{esc_label_value(team)}"',
+            'service_id!~".+"' if service_id == "" else f'service_id="{esc_label_value(service_id)}"',
         ]
     )
 
@@ -129,24 +148,14 @@ def series_count_for_metric(prom: PrometheusConnect, group_matchers: str, metric
 
 
 def pick_interval_sec_for_metric(prom: PrometheusConnect, group_matchers: str, metric_name: str) -> int:
-    """
-    РОВНО твой алгоритм:
-    - пробуем 2m -> 30m -> 1h -> 6h -> 12h -> 24h
-    - смотрим count_over_time на ЛЮБОЙ ряд (любая серия)
-    - если >=2 точки: interval = window/(points-1)
-    - если за 24h 1 точка: interval = 86400
-    """
     mn = esc_label_value(metric_name)
 
     for w, wsec in WINDOWS:
         q = f'count_over_time({{{group_matchers}, __name__="{mn}"}}[{w}])'
         rows = safe_query(prom, q) or []
         if not rows:
-            # нет рядов/нет данных в окне
             continue
 
-        # "любой ряд" -> берём первый элемент instant-vector
-        v = 0.0
         try:
             v = float(rows[0].get("value", [None, "0"])[1])
         except Exception:
@@ -156,12 +165,56 @@ def pick_interval_sec_for_metric(prom: PrometheusConnect, group_matchers: str, m
             interval = int(round(wsec / (v - 1.0)))
             return max(1, interval)
 
-        # на 24h и всё равно 1 точка -> считаем 1 точка/сутки
         if w == "24h" and v >= 1.0:
             return 86400
 
-    # вообще ничего не нашли — считаем “раз в сутки” как самый безопасный fallback
     return 86400
+
+
+def series_length_stats_for_metric(
+    prom: PrometheusConnect,
+    group_matchers: str,
+    metric_name: str,
+    lookback: str,
+) -> Dict[str, float]:
+    """
+    Возвращает агрегаты по длинам рядов:
+      avg_len_sec, min_len_sec, max_len_sec
+    где len_sec = max_over_time(timestamp(sel[lb])) - min_over_time(timestamp(sel[lb]))
+    """
+    mn = esc_label_value(metric_name)
+    sel = f'{{{group_matchers}, __name__="{mn}"}}'
+    core = f'(max_over_time(timestamp({sel})[{lookback}]) - min_over_time(timestamp({sel})[{lookback}]))'
+
+    q_avg = f'avg({core})'
+    q_min = f'min({core})'
+    q_max = f'max({core})'
+
+    avg_rows = safe_query(prom, q_avg) or []
+    min_rows = safe_query(prom, q_min) or []
+    max_rows = safe_query(prom, q_max) or []
+
+    return {
+        "avg_len_sec": get_scalar_value(avg_rows),
+        "min_len_sec": get_scalar_value(min_rows),
+        "max_len_sec": get_scalar_value(max_rows),
+    }
+
+
+def series_lengths_per_series(
+    prom: PrometheusConnect,
+    group_matchers: str,
+    metric_name: str,
+    lookback: str,
+):
+    """
+    Возвращает instant-vector: по каждой серии отдельная строка с её labelset и length_sec.
+    ОСТОРОЖНО: может быть много рядов.
+    """
+    mn = esc_label_value(metric_name)
+    sel = f'{{{group_matchers}, __name__="{mn}"}}'
+    q = f'(max_over_time(timestamp({sel})[{lookback}]) - min_over_time(timestamp({sel})[{lookback}]))'
+    return safe_query(prom, q) or []
 
 
 def autosize_columns(ws):
@@ -174,22 +227,62 @@ def autosize_columns(ws):
         ws.column_dimensions[col_letter].width = min(max(10, max_len + 2), 70)
 
 
-def write_report(rows, out_file: str):
+def write_report(
+    team_rows,
+    metric_rows,
+    per_series_rows,
+    out_file: str,
+):
     wb = Workbook()
-    ws = wb.active
-    ws.title = "points_per_day"
 
-    headers = ["team", "service_id", "points_per_day_est"]
-    ws.append(headers)
+    # 1) По командам
+    ws1 = wb.active
+    ws1.title = "by_team"
+    headers1 = ["team", "points_per_day_est"]
+    ws1.append(headers1)
     bold = Font(bold=True)
-    for c in ws[1]:
+    for c in ws1[1]:
         c.font = bold
-    ws.freeze_panes = "A2"
+    ws1.freeze_panes = "A2"
+    for r in team_rows:
+        ws1.append(r)
+    autosize_columns(ws1)
 
-    for r in rows:
-        ws.append(r)
+    # 2) По метрикам (с длинами)
+    ws2 = wb.create_sheet("by_metric")
+    headers2 = [
+        "team", "service_id", "__name__",
+        "series_count",
+        "interval_sec_est",
+        "points_per_day_est",
+        f"avg_series_len_sec@{SERIES_LENGTH_LOOKBACK}",
+        f"min_series_len_sec@{SERIES_LENGTH_LOOKBACK}",
+        f"max_series_len_sec@{SERIES_LENGTH_LOOKBACK}",
+    ]
+    ws2.append(headers2)
+    for c in ws2[1]:
+        c.font = bold
+    ws2.freeze_panes = "A2"
+    for r in metric_rows:
+        ws2.append(r)
+    autosize_columns(ws2)
 
-    autosize_columns(ws)
+    # 3) По сериям (опционально и ограниченно)
+    if per_series_rows:
+        ws3 = wb.create_sheet("per_series_len")
+        headers3 = [
+            "team", "service_id", "__name__",
+            f"series_len_sec@{SERIES_LENGTH_LOOKBACK}",
+            "labels_json",
+        ]
+        ws3.append(headers3)
+        for c in ws3[1]:
+            c.font = bold
+        ws3.freeze_panes = "A2"
+        for r in per_series_rows:
+            ws3.append(r)
+        autosize_columns(ws3)
+
     wb.save(out_file)
 
 
@@ -212,13 +305,19 @@ def main():
     groups = discover_groups(prom)
     log.info(f"Всего уникальных групп: {len(groups)}")
 
-    # итог по team
-    team_points = {}
+    team_points: Dict[str, float] = {}
+    metric_rows = []
+    per_series_rows = []
+    per_series_total = 0
 
     for team, service_id in groups:
-        # пропускаем "вообще ничего"
         if team == "" and service_id == "":
             log.info("[GROUP] empty team & service_id -> skip")
+            continue
+
+        # BAN-лист по team
+        if team in BAN_TEAMS:
+            log.info(f"[GROUP] team={team} is banned -> skip")
             continue
 
         group_tag = f"team={team or '<empty>'} service_id={service_id or '<empty>'}"
@@ -237,36 +336,92 @@ def main():
         group_points_day = 0.0
 
         for mn in metrics:
-            interval_sec = pick_interval_sec_for_metric(prom, group_matchers, mn)
             scount = series_count_for_metric(prom, group_matchers, mn)
-
             if scount <= 0:
                 continue
 
+            interval_sec = pick_interval_sec_for_metric(prom, group_matchers, mn)
             points_day = scount * (86400.0 / float(interval_sec))
             group_points_day += points_day
 
-        # агрегация по team
+            # Длины рядов (агрегаты)
+            lens = series_length_stats_for_metric(
+                prom=prom,
+                group_matchers=group_matchers,
+                metric_name=mn,
+                lookback=SERIES_LENGTH_LOOKBACK,
+            )
+
+            metric_rows.append([
+                team or "<empty_team>",
+                service_id or "<empty_service_id>",
+                mn,
+                int(scount),
+                int(interval_sec),
+                int(points_day),
+                int(lens["avg_len_sec"]),
+                int(lens["min_len_sec"]),
+                int(lens["max_len_sec"]),
+            ])
+
+            # Длины каждого ряда (опционально и ограниченно)
+            if (
+                EXPORT_PER_SERIES_LENGTHS
+                and scount <= EXPORT_PER_SERIES_MAX_SERIES_PER_METRIC
+                and per_series_total < EXPORT_PER_SERIES_MAX_ROWS_TOTAL
+            ):
+                vec = series_lengths_per_series(
+                    prom=prom,
+                    group_matchers=group_matchers,
+                    metric_name=mn,
+                    lookback=SERIES_LENGTH_LOOKBACK,
+                )
+
+                # vec: list of {metric: {labels...}, value: [ts, "len_sec"]}
+                for item in vec:
+                    if per_series_total >= EXPORT_PER_SERIES_MAX_ROWS_TOTAL:
+                        break
+
+                    m = item.get("metric", {}) or {}
+                    # Не тащим __name__ в labels_json
+                    m2 = {k: v for k, v in m.items() if k != "__name__"}
+
+                    try:
+                        len_sec = float(item.get("value", [None, "0"])[1])
+                    except Exception:
+                        len_sec = 0.0
+
+                    per_series_rows.append([
+                        team or "<empty_team>",
+                        service_id or "<empty_service_id>",
+                        mn,
+                        int(len_sec),
+                        json.dumps(m2, ensure_ascii=False, sort_keys=True),
+                    ])
+                    per_series_total += 1
+
         team_key = team if team != "" else "<empty_team>"
         team_points[team_key] = team_points.get(team_key, 0.0) + group_points_day
 
         log.info(f"  group points/day ~= {int(group_points_day)}")
-
-        # большая пауза между группами
         time.sleep(SLEEP_BETWEEN_GROUPS_SEC)
 
-    # в Excel: по командам (как ты просил “групируем точки по командам”)
-    out_rows = []
+    team_rows = []
     for team, pts in sorted(team_points.items(), key=lambda x: x[1], reverse=True):
-        out_rows.append([team, "", int(pts)])
+        team_rows.append([team, int(pts)])
 
-    if not out_rows:
+    if not team_rows and not metric_rows:
         log.warning("Нет данных для отчёта.")
         sys.exit(0)
 
     log.info(f"Сохранение файла {OUTPUT_FILE}...")
-    write_report(out_rows, OUTPUT_FILE)
+    write_report(team_rows, metric_rows, per_series_rows, OUTPUT_FILE)
     log.info(f"✔ Готово. Файл {OUTPUT_FILE} создан.")
+    if EXPORT_PER_SERIES_LENGTHS:
+        log.info(
+            f"per_series_len rows: {len(per_series_rows)} "
+            f"(limit {EXPORT_PER_SERIES_MAX_ROWS_TOTAL}, per-metric limit {EXPORT_PER_SERIES_MAX_SERIES_PER_METRIC})"
+        )
 
 
 if __name__ == "__main__":
