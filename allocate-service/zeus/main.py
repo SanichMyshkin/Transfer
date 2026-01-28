@@ -186,20 +186,6 @@ def parse_monitors_yaml(text: str, project_name: str, file_path: str):
     return out
 
 
-    out = []
-    for m in listing:
-        if not isinstance(m, dict):
-            continue
-        enabled = m.get("enabled")
-        notify = (m.get("notifications") or {}).get("sendersStatus") or {}
-        telegram = notify.get("telegram") is True
-        mail = notify.get("mail") is True
-        out.append(
-            {"enabled": enabled, "has_notifications": telegram or mail}
-        )
-    return out
-
-
 
 def build_report_rows(gl, projects, ref: str):
     stats = {}
