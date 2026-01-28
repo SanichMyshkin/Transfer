@@ -10,22 +10,19 @@ from dotenv import load_dotenv
 
 from openpyxl import Workbook
 from openpyxl.styles import Font
-from openpyxl.utils import get_column_letter
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
-)
-log = logging.getLogger("zeus_report")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("zeus_deploy_resources")
 
 load_dotenv()
 
 GITLAB_URL = os.getenv("GITLAB_URL", "").rstrip("/")
 TOKEN = os.getenv("TOKEN", "")
-GROUP_ID = os.getenv("GROUP_ID", "")
+GROUP_ID = os.getenv("GROUP_ID", "").strip()
 
-OUTPUT_XLSX = "zeus_report.xlsx"
+OUTPUT_XLSX = "zeus_deploy_resources.xlsx"
 GIT_REF = "main"
 
 
@@ -90,7 +87,12 @@ def get_team_name_from_gitlab_json(proj, ref: str) -> str | None:
         return None
 
 
-def find_monitoring_files(proj):
+def find_deployment_files(proj):
+    """
+    Аналогично monitors:
+    - ищем zeus-* папку
+    - внутри подпапок ищем файлы *-deployment.yml / *-deployment.yaml
+    """
     try:
         root = repo_tree(proj)
     except Exception as e:
@@ -109,9 +111,7 @@ def find_monitoring_files(proj):
         zeus_items = repo_tree(proj, zeus_dir["path"])
         subfolders = [i for i in zeus_items if i["type"] == "tree"]
     except Exception as e:
-        log.warning(
-            f"[{proj.path_with_namespace}] Не смог прочитать zeus-* дерево: {e}"
-        )
+        log.warning(f"[{proj.path_with_namespace}] Не смог прочитать zeus-* дерево: {e}")
         return []
 
     for sub in subfolders:
@@ -125,61 +125,68 @@ def find_monitoring_files(proj):
             if f["type"] != "blob":
                 continue
             n = (f.get("name") or "").lower()
-            if n.endswith("-monitors.yaml") or n.endswith("-monitors.yml"):
+            if n.endswith("-deployment.yaml") or n.endswith("-deployment.yml"):
                 files.append(f["path"])
 
     return files
 
 
-def parse_monitors_yaml(text: str, project_name: str, file_path: str):
-    def _sanitize(src: str) -> str:
-        out = []
-        for line in src.splitlines():
-            # убираем табы
-            line = line.replace("\t", "  ")
-            # выкидываем комментарии целиком
-            stripped = line.lstrip()
-            if stripped.startswith("#"):
-                continue
-            out.append(line)
-        return "\n".join(out)
-
+def parse_deployment_yaml(text: str, project_name: str, file_path: str):
+    """
+    Эталонные YAML, без табов/мусора.
+    Поддерживаем multi-doc (---) и выбираем kind: Deployment.
+    Возвращаем список контейнеров с resources.
+    """
     try:
-        clean = _sanitize(text)
-        data = yaml.safe_load(clean) or {}
+        docs = list(yaml.safe_load_all(text))
     except Exception as e:
-        log.warning(f"[{project_name}] YAML пропущен (битый): {file_path} ({e})")
-        return []
-
-    listing = (((data.get("zeus") or {}).get("monitors") or {}).get("listing")) or []
-    if not isinstance(listing, list):
+        log.warning(f"[{project_name}] YAML не распарсился: {file_path} ({e})")
         return []
 
     out = []
-    for m in listing:
-        if not isinstance(m, dict):
+    for doc in docs:
+        if not isinstance(doc, dict):
+            continue
+        if (doc.get("kind") or "").strip() != "Deployment":
             continue
 
-        enabled = m.get("enabled")
-        notify = (m.get("notifications") or {}).get("sendersStatus") or {}
-        telegram = notify.get("telegram") is True
-        mail = notify.get("mail") is True
+        meta = doc.get("metadata") or {}
+        dep_name = (meta.get("name") or "").strip()
+        namespace = (meta.get("namespace") or "").strip()
 
-        out.append(
-            {
-                "enabled": enabled,
-                "has_notifications": telegram or mail,
-            }
-        )
+        spec = doc.get("spec") or {}
+        tmpl = (spec.get("template") or {}).get("spec") or {}
+        containers = tmpl.get("containers") or []
+        if not isinstance(containers, list):
+            continue
+
+        for c in containers:
+            if not isinstance(c, dict):
+                continue
+
+            cname = (c.get("name") or "").strip()
+            res = c.get("resources") or {}
+            req = res.get("requests") or {}
+            lim = res.get("limits") or {}
+
+            out.append(
+                {
+                    "deployment": dep_name,
+                    "namespace": namespace,
+                    "container": cname,
+                    "cpu_request": req.get("cpu"),
+                    "memory_request": req.get("memory"),
+                    "cpu_limit": lim.get("cpu"),
+                    "memory_limit": lim.get("memory"),
+                }
+            )
 
     return out
 
 
-
-def build_report_rows(gl, projects, ref: str):
-    stats = {}
+def collect_rows(gl, projects, ref: str):
+    rows = []
     processed = 0
-    with_mon_files = 0
 
     for p in projects:
         processed += 1
@@ -189,82 +196,58 @@ def build_report_rows(gl, projects, ref: str):
             log.warning(f"[{p.name}] Не смог получить project объект: {e}")
             continue
 
-        mon_files = find_monitoring_files(proj)
-        if not mon_files:
-            continue
+        service = get_team_name_from_gitlab_json(proj, ref) or p.name
 
-        with_mon_files += 1
+        files = find_deployment_files(proj)
+        log.info(f"[{p.name}] service='{service}' deployment_files={len(files)}")
 
-        team = get_team_name_from_gitlab_json(proj, ref) or p.name
-        if team not in stats:
-            stats[team] = {
-                "active": 0,
-                "disabled": 0,
-                "notifications": 0,
-                "total": 0,
-            }
-
-        log.info(f"[{p.name}] team='{team}' files={len(mon_files)}")
-
-        for path in mon_files:
+        for path in files:
             try:
-                txt = get_file_text(proj, path, ref)
+                raw = get_file_text(proj, path, ref)
             except Exception as e:
                 log.warning(f"[{p.name}] Не смог прочитать {path} ({ref}): {e}")
                 continue
 
-            monitors = parse_monitors_yaml(txt, p.name, path)
-            if not monitors:
+            entries = parse_deployment_yaml(raw, p.name, path)
+            if not entries:
                 continue
 
-            for m in monitors:
-                stats[team]["total"] += 1
-                if m["enabled"] is True:
-                    stats[team]["active"] += 1
-                elif m["enabled"] is False:
-                    stats[team]["disabled"] += 1
-                if m["has_notifications"]:
-                    stats[team]["notifications"] += 1
+            for e in entries:
+                rows.append(
+                    {
+                        "service": service,
+                        "project": p.name,
+                        "file_path": path,
+                        "deployment": e["deployment"],
+                        "namespace": e["namespace"],
+                        "container": e["container"],
+                        "cpu_request": e["cpu_request"],
+                        "memory_request": e["memory_request"],
+                        "cpu_limit": e["cpu_limit"],
+                        "memory_limit": e["memory_limit"],
+                    }
+                )
 
-    total_metrics = sum(v["total"] for v in stats.values())
-
-    rows = []
-    for team, v in stats.items():
-        pct = 0.0
-        if total_metrics > 0:
-            pct = (v["total"] / total_metrics) * 100.0
-        rows.append(
-            {
-                "service": team,
-                "active": v["active"],
-                "disabled": v["disabled"],
-                "notifications": v["notifications"],
-                "total": v["total"],
-                "pct": pct,
-            }
-        )
-
-    rows.sort(key=lambda r: r["total"], reverse=True)
-
-    log.info(
-        f"Проектов обработано: {processed}, с monitoring файлами: {with_mon_files}"
-    )
-    log.info(f"Команд/сервисов в отчете: {len(rows)}, всего метрик: {total_metrics}")
-    return rows, total_metrics
+    log.info(f"Проектов обработано: {processed}, строк в отчете: {len(rows)}")
+    return rows
 
 
-def write_excel(rows, total_metrics: int, out_file: str):
+def write_excel(rows, out_file: str):
     wb = Workbook()
     ws = wb.active
-    ws.title = "Report"
+    ws.title = "DeployResources"
 
     headers = [
         "Наименование сервиса",
-        "кол-во метрик активных",
-        "кол-во метрик выключеных",
-        "уведомления",
-        "Сумма метрик всего",
-        "% потребления от общего числа метрик",
+        "project",
+        "file_path",
+        "deployment",
+        "namespace",
+        "container",
+        "cpu_request",
+        "memory_request",
+        "cpu_limit",
+        "memory_limit",
     ]
 
     bold = Font(bold=True)
@@ -274,30 +257,26 @@ def write_excel(rows, total_metrics: int, out_file: str):
 
     for i, r in enumerate(rows, start=2):
         ws.cell(i, 1, r["service"])
-        ws.cell(i, 2, r["active"])
-        ws.cell(i, 3, r["disabled"])
-        ws.cell(i, 4, r["notifications"])
-        ws.cell(i, 5, r["total"])
-        ws.cell(i, 6, round(r["pct"], 2))
-
-    ws.freeze_panes = "A2"
-    ws.auto_filter.ref = f"A1:{get_column_letter(len(headers))}{max(1, len(rows) + 1)}"
-
-    last = len(rows) + 2
-    ws.cell(last, 1, "ИТОГО").font = bold
-    ws.cell(last, 5, total_metrics).font = bold
-    ws.cell(last, 6, 100.0 if total_metrics > 0 else 0.0).font = bold
+        ws.cell(i, 2, r["project"])
+        ws.cell(i, 3, r["file_path"])
+        ws.cell(i, 4, r["deployment"])
+        ws.cell(i, 5, r["namespace"])
+        ws.cell(i, 6, r["container"])
+        ws.cell(i, 7, r["cpu_request"])
+        ws.cell(i, 8, r["memory_request"])
+        ws.cell(i, 9, r["cpu_limit"])
+        ws.cell(i, 10, r["memory_limit"])
 
     wb.save(out_file)
     log.info(f"Excel отчет создан: {out_file}")
 
 
 def main():
-    log.info("=== START: GitLab metrics report===")
+    log.info("=== START: GitLab deployment resources report ===")
     gl = gl_connect()
     projects = get_group_projects(gl)
-    rows, total = build_report_rows(gl, projects, ref=GIT_REF)
-    write_excel(rows, total, OUTPUT_XLSX)
+    rows = collect_rows(gl, projects, ref=GIT_REF)
+    write_excel(rows, OUTPUT_XLSX)
     log.info("=== DONE ===")
 
 
