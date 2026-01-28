@@ -14,8 +14,10 @@ from openpyxl.styles import Font
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger("deploy_limits_report")
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
+)
+log = logging.getLogger("zeus_report")
 
 load_dotenv()
 
@@ -23,14 +25,16 @@ GITLAB_URL = os.getenv("GITLAB_URL", "").rstrip("/")
 TOKEN = os.getenv("TOKEN", "")
 GROUP_ID = os.getenv("GROUP_ID", "").strip()
 
-SD_FILE = os.getenv("SD_FILE", "sd.xlsx")
-BK_FILE = os.getenv("BK_FILE", "bk_all_users.xlsx")
+SD_FILE = os.getenv("SD_FILE")
+BK_FILE = os.getenv("BK_FILE")
 
-OUTPUT_XLSX = "deploy_limits_report.xlsx"
+OUTPUT_XLSX = "zeus_report.xlsx"
 GIT_REF = "main"
 
-# BAN-LIST: сервисы (именно service, без "-код"), которые нужно полностью пропустить
+
 BAN_SERVICES = [
+    "UNAITP",
+    "TEST",
 ]
 
 
@@ -46,7 +50,6 @@ def normalize_name_key(s: str) -> str:
 
 
 def load_sd_people_map(path: str):
-    # SD: B=КОД, D=Наименование, H=Владелец, I=Менеджер
     log.info("Читаем SD (B=КОД, D=Наименование, H=Владелец, I=Менеджер)...")
 
     df = pd.read_excel(path, usecols="B,D,H,I", dtype=str, engine="openpyxl")
@@ -76,7 +79,6 @@ def load_sd_people_map(path: str):
 
 
 def load_bk_business_type_map(path: str):
-    # BK: A:B:C=ФИО, AS=Тип бизнеса
     log.info("Читаем BK (A:B:C=ФИО, AS=Тип бизнеса)...")
 
     df = pd.read_excel(path, usecols="A:C,AS", dtype=str, engine="openpyxl")
@@ -84,7 +86,9 @@ def load_bk_business_type_map(path: str):
     df.columns = ["c1", "c2", "c3", "business_type"]
 
     def make_fio(r):
-        fio = " ".join([clean_spaces(r["c2"]), clean_spaces(r["c1"]), clean_spaces(r["c3"])])
+        fio = " ".join(
+            [clean_spaces(r["c2"]), clean_spaces(r["c1"]), clean_spaces(r["c3"])]
+        )
         return clean_spaces(fio)
 
     df["fio_key"] = df.apply(make_fio, axis=1).map(normalize_name_key)
@@ -155,7 +159,9 @@ def find_deployment_files(proj):
         zeus_items = repo_tree(proj, zeus_dir["path"])
         subfolders = [i for i in zeus_items if i["type"] == "tree"]
     except Exception as e:
-        log.warning(f"[{proj.path_with_namespace}] Не смог прочитать zeus-* дерево: {e}")
+        log.warning(
+            f"[{proj.path_with_namespace}] Не смог прочитать zeus-* дерево: {e}"
+        )
         return []
 
     files = []
@@ -269,6 +275,12 @@ def split_service_and_code(project_name: str):
     return m.group(1), m.group(2)
 
 
+def is_zero_code(code: str) -> bool:
+    if not code:
+        return False
+    return set(code) == {"0"}
+
+
 def collect_service_totals(gl, projects, sd_people_map, bk_type_map):
     totals = {}  # (service, code) -> {"cpu": float, "mem": int}
 
@@ -281,12 +293,18 @@ def collect_service_totals(gl, projects, sd_people_map, bk_type_map):
 
         service, code = split_service_and_code(p.name)
 
+        if is_zero_code(code):
+            log.info(f"[{p.name}] SKIP (code is all zeros)")
+            continue
+
         if service in BAN_SERVICES:
             log.info(f"[{p.name}] SKIP (ban service): service='{service}'")
             continue
 
         files = find_deployment_files(proj)
-        log.info(f"[p={p.name}] service='{service}' code='{code}' deployment_files={len(files)}")
+        log.info(
+            f"[p={p.name}] service='{service}' code='{code}' deployment_files={len(files)}"
+        )
 
         cpu_total = 0.0
         mem_total = 0
@@ -311,13 +329,14 @@ def collect_service_totals(gl, projects, sd_people_map, bk_type_map):
         totals[key]["cpu"] += cpu_total
         totals[key]["mem"] += mem_total
 
-    # превращаем totals -> rows с владельцем и типом бизнеса
     rows = []
     total_cpu = sum(v["cpu"] for v in totals.values())
     total_mem = sum(v["mem"] for v in totals.values())
 
     for (service, code), v in totals.items():
-        people = sd_people_map.get(code, {"service_name": "", "owner": "", "manager": ""})
+        people = sd_people_map.get(
+            code, {"service_name": "", "owner": "", "manager": ""}
+        )
         owner = people.get("owner", "")
         manager = people.get("manager", "")
 
@@ -333,10 +352,10 @@ def collect_service_totals(gl, projects, sd_people_map, bk_type_map):
 
         rows.append(
             {
+                "business_type": business_type,
                 "service": service,
                 "code": code,
                 "owner": owner_for_report,
-                "business_type": business_type,
                 "cpu_cores": cpu,
                 "mem_mib": bytes_to_mib(mem),
                 "pct": pct,
@@ -353,10 +372,10 @@ def write_excel(rows, out_file: str):
     ws.title = "Report"
 
     headers = [
+        "Тип бизнеса",
         "Наименование сервиса",
         "код",
         "Владелец сервиса",
-        "Тип бизнеса",
         "CPU (cores)",
         "MEM (MiB)",
         "% потребления",
@@ -381,8 +400,6 @@ def write_excel(rows, out_file: str):
 
 
 def main():
-    log.info("=== START: Deployment limits report ===")
-
     if not GITLAB_URL or not TOKEN or not GROUP_ID:
         raise SystemExit("Нужны ENV: GITLAB_URL, TOKEN, GROUP_ID")
 
@@ -397,12 +414,12 @@ def main():
     gl = gl_connect()
     projects = get_group_projects(gl)
 
-    rows = collect_service_totals(gl, projects, sd_people_map=sd_people_map, bk_type_map=bk_type_map)
+    rows = collect_service_totals(
+        gl, projects, sd_people_map=sd_people_map, bk_type_map=bk_type_map
+    )
 
     log.info(f"Строк в отчете: {len(rows)}")
     write_excel(rows, OUTPUT_XLSX)
-
-    log.info("=== DONE ===")
 
 
 if __name__ == "__main__":
