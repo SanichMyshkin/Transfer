@@ -25,11 +25,13 @@ log = logging.getLogger(__name__)
 OUTPUT_FILE = "victoriametrics_repot.xlsx"
 HTTP_TIMEOUT_SEC = 60
 
-SLEEP_BETWEEN_QUERIES_SEC = 0.2
-SLEEP_BETWEEN_GROUPS_SEC = 0.1
+SLEEP_BETWEEN_QUERIES_SEC = 2.0
+SLEEP_BETWEEN_GROUPS_SEC = 10.0
 
+# BAN-лист команд (точное совпадение значения лейбла team)
 BAN_TEAMS: List[str] = [
-    "UNAITP",
+    # "team_a",
+    # "team_b",
 ]
 
 # Окна для оценки интервала (твоя логика)
@@ -42,8 +44,9 @@ WINDOWS: List[Tuple[str, int]] = [
     ("24h", 86400),
 ]
 
-# Lookback для оценки длины рядов (обрезается этим окном, если retention больше)
-SERIES_LENGTH_LOOKBACK = "365d"
+# Окно, в пределах которого берём первую/последнюю точку каждого ряда
+# ВАЖНО: если реальный retention больше — будет "обрезка" этим окном
+SERIES_POINTS_LOOKBACK = "365d"
 
 
 def safe_query(prom: PrometheusConnect, q: str):
@@ -133,6 +136,13 @@ def series_count_for_metric(prom: PrometheusConnect, group_matchers: str, metric
 
 
 def pick_interval_sec_for_metric(prom: PrometheusConnect, group_matchers: str, metric_name: str) -> int:
+    """
+    Твоя логика:
+    - пробуем 2m -> 30m -> 1h -> 6h -> 12h -> 24h
+    - смотрим count_over_time на любом ряду (берём первый элемент)
+    - если >=2 точки: interval = window/(points-1)
+    - если за 24h 1 точка: interval = 86400
+    """
     mn = esc_label_value(metric_name)
 
     for w, wsec in WINDOWS:
@@ -156,29 +166,36 @@ def pick_interval_sec_for_metric(prom: PrometheusConnect, group_matchers: str, m
     return 86400
 
 
-def series_length_stats_for_metric(
+def total_points_for_metric(
     prom: PrometheusConnect,
     group_matchers: str,
     metric_name: str,
+    interval_sec: int,
     lookback: str,
-) -> Dict[str, float]:
+) -> int:
+    """
+    Считает:
+      по каждому ряду: points = floor((last_ts - first_ts)/interval) + 1
+      затем sum по всем рядам метрики.
+
+    Делается одним PromQL, без разворачивания рядов в Python.
+
+    ВАЖНО: count получается "в пределах lookback", т.е. min(real_retention, lookback)
+    """
     mn = esc_label_value(metric_name)
     sel = f'{{{group_matchers}, __name__="{mn}"}}'
-    core = f'(max_over_time(timestamp({sel})[{lookback}]) - min_over_time(timestamp({sel})[{lookback}]))'
-
-    q_avg = f'avg({core})'
-    q_min = f'min({core})'
-    q_max = f'max({core})'
-
-    avg_rows = safe_query(prom, q_avg) or []
-    min_rows = safe_query(prom, q_min) or []
-    max_rows = safe_query(prom, q_max) or []
-
-    return {
-        "avg_len_sec": get_scalar_value(avg_rows),
-        "min_len_sec": get_scalar_value(min_rows),
-        "max_len_sec": get_scalar_value(max_rows),
-    }
+    # Берём длину ряда в секундах и переводим в точки
+    # clamp_min чтобы не уйти в отрицательные/NaN на пустых рядах
+    core = (
+        f'clamp_min('
+        f'(max_over_time(timestamp({sel})[{lookback}])'
+        f' - '
+        f'min_over_time(timestamp({sel})[{lookback}])), 0)'
+    )
+    # В VM/PromQL floor существует. Если вдруг у тебя его нет — скажешь, заменим на round/без floor.
+    q = f'sum(floor(({core}) / {int(interval_sec)}) + 1)'
+    rows = safe_query(prom, q) or []
+    return int(get_scalar_value(rows))
 
 
 def autosize_columns(ws):
@@ -191,29 +208,19 @@ def autosize_columns(ws):
         ws.column_dimensions[col_letter].width = min(max(10, max_len + 2), 70)
 
 
-def write_report(rows, out_file: str):
+def write_report(team_rows, out_file: str):
     wb = Workbook()
     ws = wb.active
-    ws.title = "report"
+    ws.title = "team_points"
 
-    headers = [
-        "team",
-        "service_id",
-        "__name__",
-        "series_count",
-        "interval_sec_est",
-        "points_per_day_est",
-        f"avg_series_len_sec@{SERIES_LENGTH_LOOKBACK}",
-        f"min_series_len_sec@{SERIES_LENGTH_LOOKBACK}",
-        f"max_series_len_sec@{SERIES_LENGTH_LOOKBACK}",
-    ]
+    headers = ["team", "points_total_est"]
     ws.append(headers)
     bold = Font(bold=True)
     for c in ws[1]:
         c.font = bold
     ws.freeze_panes = "A2"
 
-    for r in rows:
+    for r in team_rows:
         ws.append(r)
 
     autosize_columns(ws)
@@ -239,7 +246,7 @@ def main():
     groups = discover_groups(prom)
     log.info(f"Всего уникальных групп: {len(groups)}")
 
-    out_rows = []
+    team_points: Dict[str, int] = {}
 
     for team, service_id in groups:
         if team == "" and service_id == "":
@@ -254,7 +261,6 @@ def main():
         log.info(f"[GROUP] {group_tag}")
 
         group_matchers = build_group_matchers(team, service_id)
-
         metrics = metric_names_in_group(prom, group_matchers)
         if not metrics:
             log.info("  no metrics -> skip group")
@@ -263,43 +269,46 @@ def main():
 
         log.info(f"  metrics={len(metrics)}")
 
+        group_points_total = 0
+
         for mn in metrics:
+            interval_sec = pick_interval_sec_for_metric(prom, group_matchers, mn)
+
+            # если интервал совсем бредовый — пропустим
+            if interval_sec <= 0:
+                continue
+
+            # Быстрый фильтр: если рядов 0, смысла считать точки нет
             scount = series_count_for_metric(prom, group_matchers, mn)
             if scount <= 0:
                 continue
 
-            interval_sec = pick_interval_sec_for_metric(prom, group_matchers, mn)
-            points_day = scount * (86400.0 / float(interval_sec))
-
-            lens = series_length_stats_for_metric(
+            pts = total_points_for_metric(
                 prom=prom,
                 group_matchers=group_matchers,
                 metric_name=mn,
-                lookback=SERIES_LENGTH_LOOKBACK,
+                interval_sec=interval_sec,
+                lookback=SERIES_POINTS_LOOKBACK,
             )
 
-            out_rows.append(
-                [
-                    team or "<empty_team>",
-                    service_id or "<empty_service_id>",
-                    mn,
-                    int(scount),
-                    int(interval_sec),
-                    int(points_day),
-                    int(lens["avg_len_sec"]),
-                    int(lens["min_len_sec"]),
-                    int(lens["max_len_sec"]),
-                ]
-            )
+            group_points_total += int(pts)
 
+        team_key = team if team != "" else "<empty_team>"
+        team_points[team_key] = team_points.get(team_key, 0) + int(group_points_total)
+
+        log.info(f"  group total points ~= {int(group_points_total)}")
         time.sleep(SLEEP_BETWEEN_GROUPS_SEC)
 
-    if not out_rows:
+    if not team_points:
         log.warning("Нет данных для отчёта.")
         sys.exit(0)
 
+    team_rows = []
+    for t, pts in sorted(team_points.items(), key=lambda x: x[1], reverse=True):
+        team_rows.append([t, int(pts)])
+
     log.info(f"Сохранение файла {OUTPUT_FILE}...")
-    write_report(out_rows, OUTPUT_FILE)
+    write_report(team_rows, OUTPUT_FILE)
     log.info(f"✔ Готово. Файл {OUTPUT_FILE} создан.")
 
 
