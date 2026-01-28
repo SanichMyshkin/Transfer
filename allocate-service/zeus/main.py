@@ -1,6 +1,5 @@
 # main.py
 import os
-import json
 import logging
 import urllib3
 
@@ -14,7 +13,7 @@ from openpyxl.styles import Font
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger("zeus_deploy_resources")
+log = logging.getLogger("deploy_limits_report")
 
 load_dotenv()
 
@@ -22,7 +21,7 @@ GITLAB_URL = os.getenv("GITLAB_URL", "").rstrip("/")
 TOKEN = os.getenv("TOKEN", "")
 GROUP_ID = os.getenv("GROUP_ID", "").strip()
 
-OUTPUT_XLSX = "zeus_deploy_resources.xlsx"
+OUTPUT_XLSX = "deploy_limits_report.xlsx"
 GIT_REF = "main"
 
 
@@ -53,46 +52,8 @@ def get_file_text(proj, file_path: str, ref: str) -> str:
     return f.decode().decode("utf-8")
 
 
-def get_team_name_from_gitlab_json(proj, ref: str) -> str | None:
-    try:
-        root = repo_tree(proj)
-        gitlab_dir = next(
-            (i for i in root if i["type"] == "tree" and i["name"] == "gitlab"), None
-        )
-        if not gitlab_dir:
-            return None
-
-        lvl2 = repo_tree(proj, gitlab_dir["path"])
-        mapping = next(
-            (i for i in lvl2 if i["type"] == "tree" and i["name"] == "mapping"), None
-        )
-        if not mapping:
-            return None
-
-        items = repo_tree(proj, mapping["path"])
-        jf = next(
-            (i for i in items if i["type"] == "blob" and i["name"] == "gitlab.json"),
-            None,
-        )
-        if not jf:
-            return None
-
-        txt = get_file_text(proj, jf["path"], ref)
-        data = json.loads(txt)
-        name = (data.get("group", {}) or {}).get("name")
-        name = (name or "").strip()
-        return name or None
-    except Exception as e:
-        log.warning(f"[{proj.path_with_namespace}] Не смог прочитать gitlab.json: {e}")
-        return None
-
-
 def find_deployment_files(proj):
-    """
-    Аналогично monitors:
-    - ищем zeus-* папку
-    - внутри подпапок ищем файлы *-deployment.yml / *-deployment.yaml
-    """
+    # как было с monitors, только -deployment.yml/.yaml
     try:
         root = repo_tree(proj)
     except Exception as e:
@@ -106,7 +67,6 @@ def find_deployment_files(proj):
     if not zeus_dir:
         return []
 
-    files = []
     try:
         zeus_items = repo_tree(proj, zeus_dir["path"])
         subfolders = [i for i in zeus_items if i["type"] == "tree"]
@@ -114,6 +74,7 @@ def find_deployment_files(proj):
         log.warning(f"[{proj.path_with_namespace}] Не смог прочитать zeus-* дерево: {e}")
         return []
 
+    files = []
     for sub in subfolders:
         try:
             sub_items = repo_tree(proj, sub["path"])
@@ -131,28 +92,82 @@ def find_deployment_files(proj):
     return files
 
 
-def parse_deployment_yaml(text: str, project_name: str, file_path: str):
-    """
-    Эталонные YAML, без табов/мусора.
-    Поддерживаем multi-doc (---) и выбираем kind: Deployment.
-    Возвращаем список контейнеров с resources.
-    """
+def parse_cpu_to_cores(v):
+    # "1300m" -> 1.3 ; "1" -> 1.0
+    if v is None:
+        return 0.0
+    s = str(v).strip()
+    if not s:
+        return 0.0
+    if s.endswith("m"):
+        num = s[:-1].strip()
+        try:
+            return float(num) / 1000.0
+        except Exception:
+            return 0.0
+    try:
+        return float(s)
+    except Exception:
+        return 0.0
+
+
+def parse_mem_to_bytes(v):
+    # "600Mi" / "1Gi" / "500M" etc.
+    if v is None:
+        return 0
+    s = str(v).strip()
+    if not s:
+        return 0
+
+    units = {
+        "Ki": 1024,
+        "Mi": 1024**2,
+        "Gi": 1024**3,
+        "Ti": 1024**4,
+        "Pi": 1024**5,
+        "Ei": 1024**6,
+        "K": 1000,
+        "M": 1000**2,
+        "G": 1000**3,
+        "T": 1000**4,
+        "P": 1000**5,
+        "E": 1000**6,
+    }
+
+    for u, mul in units.items():
+        if s.endswith(u):
+            num = s[: -len(u)].strip()
+            try:
+                return int(float(num) * mul)
+            except Exception:
+                return 0
+
+    try:
+        return int(float(s))
+    except Exception:
+        return 0
+
+
+def bytes_to_mib(b: int) -> float:
+    return float(b) / (1024.0**2)
+
+
+def parse_deployment_limits(text: str, project_name: str, file_path: str):
+    # возвращаем сумму лимитов по файлу: (cpu_cores, mem_bytes)
     try:
         docs = list(yaml.safe_load_all(text))
     except Exception as e:
         log.warning(f"[{project_name}] YAML не распарсился: {file_path} ({e})")
-        return []
+        return 0.0, 0
 
-    out = []
+    cpu_sum = 0.0
+    mem_sum = 0
+
     for doc in docs:
         if not isinstance(doc, dict):
             continue
         if (doc.get("kind") or "").strip() != "Deployment":
             continue
-
-        meta = doc.get("metadata") or {}
-        dep_name = (meta.get("name") or "").strip()
-        namespace = (meta.get("namespace") or "").strip()
 
         spec = doc.get("spec") or {}
         tmpl = (spec.get("template") or {}).get("spec") or {}
@@ -163,120 +178,102 @@ def parse_deployment_yaml(text: str, project_name: str, file_path: str):
         for c in containers:
             if not isinstance(c, dict):
                 continue
-
-            cname = (c.get("name") or "").strip()
             res = c.get("resources") or {}
-            req = res.get("requests") or {}
             lim = res.get("limits") or {}
 
-            out.append(
-                {
-                    "deployment": dep_name,
-                    "namespace": namespace,
-                    "container": cname,
-                    "cpu_request": req.get("cpu"),
-                    "memory_request": req.get("memory"),
-                    "cpu_limit": lim.get("cpu"),
-                    "memory_limit": lim.get("memory"),
-                }
-            )
+            cpu_sum += parse_cpu_to_cores(lim.get("cpu"))
+            mem_sum += parse_mem_to_bytes(lim.get("memory"))
 
-    return out
+    return cpu_sum, mem_sum
 
 
-def collect_rows(gl, projects, ref: str):
-    rows = []
-    processed = 0
+def collect_project_totals(gl, projects):
+    totals = {}  # project_name -> {"cpu": float cores, "mem": int bytes}
 
     for p in projects:
-        processed += 1
         try:
             proj = gl.projects.get(p.id)
         except Exception as e:
             log.warning(f"[{p.name}] Не смог получить project объект: {e}")
             continue
 
-        service = get_team_name_from_gitlab_json(proj, ref) or p.name
-
         files = find_deployment_files(proj)
-        log.info(f"[{p.name}] service='{service}' deployment_files={len(files)}")
+        log.info(f"[{p.name}] deployment_files={len(files)}")
+
+        cpu_total = 0.0
+        mem_total = 0
 
         for path in files:
             try:
-                raw = get_file_text(proj, path, ref)
+                raw = get_file_text(proj, path, GIT_REF)
             except Exception as e:
-                log.warning(f"[{p.name}] Не смог прочитать {path} ({ref}): {e}")
+                log.warning(f"[{p.name}] Не смог прочитать {path} ({GIT_REF}): {e}")
                 continue
 
-            entries = parse_deployment_yaml(raw, p.name, path)
-            if not entries:
-                continue
+            cpu, mem = parse_deployment_limits(raw, p.name, path)
+            cpu_total += cpu
+            mem_total += mem
 
-            for e in entries:
-                rows.append(
-                    {
-                        "service": service,
-                        "project": p.name,
-                        "file_path": path,
-                        "deployment": e["deployment"],
-                        "namespace": e["namespace"],
-                        "container": e["container"],
-                        "cpu_request": e["cpu_request"],
-                        "memory_request": e["memory_request"],
-                        "cpu_limit": e["cpu_limit"],
-                        "memory_limit": e["memory_limit"],
-                    }
-                )
+        if cpu_total > 0 or mem_total > 0:
+            totals[p.name] = {"cpu": cpu_total, "mem": mem_total}
 
-    log.info(f"Проектов обработано: {processed}, строк в отчете: {len(rows)}")
-    return rows
+    return totals
 
 
-def write_excel(rows, out_file: str):
+def write_excel(project_totals, out_file: str):
+    # общий total для процентов
+    total_cpu = sum(v["cpu"] for v in project_totals.values())
+    total_mem = sum(v["mem"] for v in project_totals.values())
+
+    rows = []
+    for project, v in project_totals.items():
+        cpu = v["cpu"]
+        mem = v["mem"]
+
+        cpu_pct = (cpu / total_cpu * 100.0) if total_cpu > 0 else 0.0
+        mem_pct = (mem / total_mem * 100.0) if total_mem > 0 else 0.0
+
+        # как ты описал: (cpu% + mem%) / 2
+        pct = (cpu_pct + mem_pct) / 2.0
+
+        rows.append(
+            {
+                "project": project,
+                "cpu_cores": cpu,
+                "mem_mib": bytes_to_mib(mem),
+                "pct": pct,
+            }
+        )
+
+    rows.sort(key=lambda r: r["pct"], reverse=True)
+
     wb = Workbook()
     ws = wb.active
-    ws.title = "DeployResources"
+    ws.title = "Report"
 
-    headers = [
-        "Наименование сервиса",
-        "project",
-        "file_path",
-        "deployment",
-        "namespace",
-        "container",
-        "cpu_request",
-        "memory_request",
-        "cpu_limit",
-        "memory_limit",
-    ]
-
+    headers = ["ПРОЕКТ", "CPU (cores)", "MEM (MiB)", "% потребления"]
     bold = Font(bold=True)
     for col, h in enumerate(headers, start=1):
         c = ws.cell(row=1, column=col, value=h)
         c.font = bold
 
     for i, r in enumerate(rows, start=2):
-        ws.cell(i, 1, r["service"])
-        ws.cell(i, 2, r["project"])
-        ws.cell(i, 3, r["file_path"])
-        ws.cell(i, 4, r["deployment"])
-        ws.cell(i, 5, r["namespace"])
-        ws.cell(i, 6, r["container"])
-        ws.cell(i, 7, r["cpu_request"])
-        ws.cell(i, 8, r["memory_request"])
-        ws.cell(i, 9, r["cpu_limit"])
-        ws.cell(i, 10, r["memory_limit"])
+        ws.cell(i, 1, r["project"])
+        ws.cell(i, 2, round(r["cpu_cores"], 6))
+        ws.cell(i, 3, round(r["mem_mib"], 2))
+        ws.cell(i, 4, round(r["pct"], 2))
 
     wb.save(out_file)
     log.info(f"Excel отчет создан: {out_file}")
 
 
 def main():
-    log.info("=== START: GitLab deployment resources report ===")
+    log.info("=== START: Deployment limits report ===")
     gl = gl_connect()
     projects = get_group_projects(gl)
-    rows = collect_rows(gl, projects, ref=GIT_REF)
-    write_excel(rows, OUTPUT_XLSX)
+    totals = collect_project_totals(gl, projects)
+    log.info(f"Проектов с найденными лимитами: {len(totals)}")
+    write_excel(totals, OUTPUT_XLSX)
     log.info("=== DONE ===")
 
 
