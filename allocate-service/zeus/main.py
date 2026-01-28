@@ -143,11 +143,20 @@ def find_monitoring_files(proj):
 
 
 def parse_monitors_yaml(text: str, project_name: str, file_path: str):
+    def _try_load(src: str):
+        return yaml.safe_load(src) or {}
+
     try:
-        data = yaml.safe_load(text) or {}
-    except Exception as e:
-        log.warning(f"[{project_name}] YAML error in {file_path}: {e}")
-        return []
+        data = _try_load(text)
+    except Exception as e1:
+        cleaned = text.replace("\t", "  ")
+        try:
+            data = _try_load(cleaned)
+            log.warning(f"[{project_name}] YAML с табами починен на лету: {file_path}")
+        except Exception as e2:
+            log.warning(f"[{project_name}] YAML error in {file_path}: {e1}")
+            log.warning(f"[{project_name}] YAML still bad after tab-fix: {e2}")
+            return []
 
     listing = (((data.get("zeus") or {}).get("monitors") or {}).get("listing")) or []
     if not isinstance(listing, list):
@@ -162,12 +171,10 @@ def parse_monitors_yaml(text: str, project_name: str, file_path: str):
         telegram = notify.get("telegram") is True
         mail = notify.get("mail") is True
         out.append(
-            {
-                "enabled": enabled,
-                "has_notifications": telegram or mail,
-            }
+            {"enabled": enabled, "has_notifications": telegram or mail}
         )
     return out
+
 
 
 def build_report_rows(gl, projects, ref: str):
