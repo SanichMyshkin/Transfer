@@ -17,7 +17,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
 )
-log = logging.getLogger("zeus_report")
+log = logging.getLogger("deploy_limits_report")
 
 load_dotenv()
 
@@ -25,17 +25,20 @@ GITLAB_URL = os.getenv("GITLAB_URL", "").rstrip("/")
 TOKEN = os.getenv("TOKEN", "")
 GROUP_ID = os.getenv("GROUP_ID", "").strip()
 
-SD_FILE = os.getenv("SD_FILE")
-BK_FILE = os.getenv("BK_FILE")
+SD_FILE = os.getenv("SD_FILE", "sd.xlsx")
+BK_FILE = os.getenv("BK_FILE", "bk_all_users.xlsx")
 
-OUTPUT_XLSX = "zeus_report.xlsx"
+OUTPUT_XLSX = "deploy_limits_report.xlsx"
 GIT_REF = "main"
 
-
+# BAN-LIST: сервисы (именно service, без "-код"), которые нужно полностью пропустить
 BAN_SERVICES = [
-    "UNAITP",
-    "TEST",
+    # "CREDITFLOW",
+    # "EXPRESS",
 ]
+
+# Глобальный флаг: исключать ли проекты, у которых код = только нули (0000, 00, 0, ...)
+EXCLUDE_ZERO_CODES = True
 
 
 def clean_spaces(s: str) -> str:
@@ -281,7 +284,7 @@ def is_zero_code(code: str) -> bool:
     return set(code) == {"0"}
 
 
-def collect_service_totals(gl, projects, sd_people_map, bk_type_map):
+def collect_rows(gl, projects, sd_people_map, bk_type_map):
     totals = {}  # (service, code) -> {"cpu": float, "mem": int}
 
     for p in projects:
@@ -293,7 +296,7 @@ def collect_service_totals(gl, projects, sd_people_map, bk_type_map):
 
         service, code = split_service_and_code(p.name)
 
-        if is_zero_code(code):
+        if EXCLUDE_ZERO_CODES and is_zero_code(code):
             log.info(f"[{p.name}] SKIP (code is all zeros)")
             continue
 
@@ -329,14 +332,12 @@ def collect_service_totals(gl, projects, sd_people_map, bk_type_map):
         totals[key]["cpu"] += cpu_total
         totals[key]["mem"] += mem_total
 
-    rows = []
     total_cpu = sum(v["cpu"] for v in totals.values())
     total_mem = sum(v["mem"] for v in totals.values())
 
+    rows = []
     for (service, code), v in totals.items():
-        people = sd_people_map.get(
-            code, {"service_name": "", "owner": "", "manager": ""}
-        )
+        people = sd_people_map.get(code, {"owner": "", "manager": ""})
         owner = people.get("owner", "")
         manager = people.get("manager", "")
 
@@ -374,7 +375,7 @@ def write_excel(rows, out_file: str):
     headers = [
         "Тип бизнеса",
         "Наименование сервиса",
-        "код",
+        "КОД",
         "Владелец сервиса",
         "CPU (cores)",
         "MEM (MiB)",
@@ -387,10 +388,10 @@ def write_excel(rows, out_file: str):
         c.font = bold
 
     for i, r in enumerate(rows, start=2):
-        ws.cell(i, 1, r["service"])
-        ws.cell(i, 2, r["code"])
-        ws.cell(i, 3, r["owner"])
-        ws.cell(i, 4, r["business_type"])
+        ws.cell(i, 1, r["business_type"])
+        ws.cell(i, 2, r["service"])
+        ws.cell(i, 3, r["code"])
+        ws.cell(i, 4, r["owner"])
         ws.cell(i, 5, round(r["cpu_cores"], 6))
         ws.cell(i, 6, round(r["mem_mib"], 2))
         ws.cell(i, 7, round(r["pct"], 2))
@@ -400,6 +401,8 @@ def write_excel(rows, out_file: str):
 
 
 def main():
+    log.info("=== START: Deployment limits report ===")
+
     if not GITLAB_URL or not TOKEN or not GROUP_ID:
         raise SystemExit("Нужны ENV: GITLAB_URL, TOKEN, GROUP_ID")
 
@@ -414,12 +417,14 @@ def main():
     gl = gl_connect()
     projects = get_group_projects(gl)
 
-    rows = collect_service_totals(
+    rows = collect_rows(
         gl, projects, sd_people_map=sd_people_map, bk_type_map=bk_type_map
     )
 
     log.info(f"Строк в отчете: {len(rows)}")
     write_excel(rows, OUTPUT_XLSX)
+
+    log.info("=== DONE ===")
 
 
 if __name__ == "__main__":
