@@ -11,8 +11,7 @@ from dotenv import load_dotenv
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
+    level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
 )
 log = logging.getLogger("vault_report")
 
@@ -23,8 +22,8 @@ SD_FILE = os.getenv("SD_FILE", "sd.xlsx")
 BK_FILE = os.getenv("BK_FILE", "bk_all_users.xlsx")
 OUT_FILE = os.getenv("OUT_FILE", "vault_report.xlsx")
 
-BAN_SERVICE_IDS = [15473]          # коды, которые полностью исключаем
-SKIP_EMPTY_SECRETS = True          # <<< ВАЖНО: скипать secrets == 0
+BAN_SERVICE_IDS = [15473]
+SKIP_EMPTY_SECRETS = True
 
 
 def die(msg: str, code: int = 2):
@@ -80,10 +79,8 @@ def parse_kv_metrics_to_df(metrics_text: str) -> pd.DataFrame:
     df = df[df["code"].notna()].copy()
     df["code"] = df["code"].astype(str)
 
-    # бан-лист
     df = df[~df["code"].isin(ban_set)].copy()
 
-    # скип пустых
     if SKIP_EMPTY_SECRETS:
         df = df[df["secrets"] > 0].copy()
 
@@ -102,7 +99,6 @@ def read_sd_map(path: str) -> pd.DataFrame:
       B = code
       D = sd_name
       H = owner
-      I = manager
     """
     if not path:
         die("SD_FILE не задан")
@@ -116,7 +112,6 @@ def read_sd_map(path: str) -> pd.DataFrame:
             "code": df.iloc[:, 1].astype(str).str.extract(r"(\d+)", expand=False),
             "sd_name": df.iloc[:, 3].map(clean_spaces),
             "owner": df.iloc[:, 7].map(clean_spaces),
-            "manager": df.iloc[:, 8].map(clean_spaces),
         }
     )
 
@@ -126,11 +121,6 @@ def read_sd_map(path: str) -> pd.DataFrame:
 
 
 def load_bk_business_type_map(path: str) -> dict:
-    """
-    BK:
-      A,B,C = ФИО
-      AS    = тип бизнеса
-    """
     if not path or not os.path.exists(path):
         log.warning("BK_FILE не найден: %s", path)
         return {}
@@ -144,18 +134,6 @@ def load_bk_business_type_map(path: str) -> dict:
 
     df = df[df["fio_key"] != ""].drop_duplicates("fio_key", keep="last")
     return dict(zip(df["fio_key"], df["business_type"]))
-
-
-def pick_business_type(bk_map: dict, owner: str, manager: str) -> str:
-    if owner:
-        bt = bk_map.get(normalize_name_key(owner), "")
-        if bt:
-            return bt
-    if manager:
-        bt = bk_map.get(normalize_name_key(manager), "")
-        if bt:
-            return bt
-    return ""
 
 
 def main():
@@ -182,14 +160,11 @@ def main():
     out.loc[out["service_name"] == "", "service_name"] = out["kv"]
 
     out["owner_for_report"] = out["owner"]
-    out.loc[out["owner_for_report"] == "", "owner_for_report"] = out["manager"]
 
     out["business_type"] = out.apply(
-        lambda r: pick_business_type(
-            bk_map,
-            owner=str(r.get("owner") or ""),
-            manager=str(r.get("manager") or ""),
-        ),
+        lambda r: bk_map.get(normalize_name_key(str(r.get("owner") or "")), "")
+        if str(r.get("owner") or "")
+        else "",
         axis=1,
     )
 
