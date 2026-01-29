@@ -12,7 +12,9 @@ from jenkins_client import JenkinsGroovyClient
 
 logger = logging.getLogger("jenkins_report")
 logger.setLevel(logging.INFO)
-formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S")
+formatter = logging.Formatter(
+    "%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S"
+)
 console_handler = logging.StreamHandler(sys.stdout)
 console_handler.setFormatter(formatter)
 logger.handlers.clear()
@@ -77,6 +79,8 @@ ban_set = build_ban_set(BAN_SERVICE_IDS)
 
 
 def validate_env_and_files():
+    logger.info("Проверяем ENV и входные файлы...")
+
     if not JENKINS_URL:
         die("ENV JENKINS_URL пустой")
     if not USER:
@@ -93,6 +97,9 @@ def validate_env_and_files():
     if out_dir and not os.path.exists(out_dir):
         os.makedirs(out_dir, exist_ok=True)
 
+    logger.info(f"Бан-лист (КОД): {sorted(ban_set) if ban_set else 'пусто'}")
+    logger.info("ENV/файлы ок.")
+
 
 def clean_spaces(s: str) -> str:
     s = (s or "").strip()
@@ -106,7 +113,12 @@ def normalize_name_key(s: str) -> str:
 
 
 def get_builds_inventory():
-    return client.run_script(SCRIPT_BUILDS)
+    logger.info("Получаем инвентарь Jenkins (jobs + buildCount)...")
+    data = client.run_script(SCRIPT_BUILDS)
+    total = data.get("total")
+    jobs_len = len(data.get("jobs", []) or [])
+    logger.info(f"Jenkins вернул items(total): {total}, jobs в payload: {jobs_len}")
+    return data
 
 
 def split_project_and_team(project_raw: str):
@@ -119,6 +131,8 @@ def split_project_and_team(project_raw: str):
 
 
 def load_sd_people_map(path: str):
+    logger.info("Читаем SD (B=КОД, D=Наименование, H=Владелец)...")
+
     df = pd.read_excel(path, usecols="B,D,H", dtype=str, engine="openpyxl")
     df.columns = ["service_id", "service_name", "owner"]
     df = df.fillna("")
@@ -130,7 +144,7 @@ def load_sd_people_map(path: str):
     df = df[df["service_id"] != ""].copy()
     last = df.drop_duplicates("service_id", keep="last")
 
-    return {
+    mp = {
         sid: {"service_name": sn, "owner": o}
         for sid, sn, o in zip(
             last["service_id"].tolist(),
@@ -139,9 +153,15 @@ def load_sd_people_map(path: str):
         )
     }
 
+    logger.info(f"SD: загружено сервисов по КОД: {len(mp)}")
+    return mp
+
 
 def load_bk_business_type_map(path: str):
-    df = pd.read_excel(path, usecols="A:C,AS", dtype=str, engine="openpyxl").fillna("")
+    logger.info("Читаем BK (A:B:C=ФИО, AS=Тип бизнеса)...")
+
+    df = pd.read_excel(path, usecols="A:C,AS", dtype=str, engine="openpyxl")
+    df = df.fillna("")
     df.columns = ["c1", "c2", "c3", "business_type"]
 
     def make_fio(r):
@@ -153,35 +173,75 @@ def load_bk_business_type_map(path: str):
 
     df = df[df["fio_key"] != ""].copy()
     last = df.drop_duplicates("fio_key", keep="last")
-    return dict(zip(last["fio_key"], last["business_type"]))
+
+    mp = dict(zip(last["fio_key"], last["business_type"]))
+    logger.info(f"BK: загружено ФИО->Тип бизнеса: {len(mp)}")
+    return mp
 
 
 def aggregate_builds_by_service(data, sd_people_map, bk_type_map, exclude_without_team=True):
+    logger.info("Агрегируем билды по сервису...")
+
     acc = defaultdict(int)
 
+    skipped_folder = 0
+    skipped_empty_name = 0
+    skipped_empty_root = 0
+    skipped_no_team = 0
+    skipped_banned = 0
+
+    total_jobs_seen = 0
+    total_builds_seen = 0
+    total_builds_banned = 0
+
     for j in data.get("jobs", []) or []:
+        total_jobs_seen += 1
+
         if j.get("isFolder"):
+            skipped_folder += 1
             continue
 
         full_name = (j.get("name") or "").strip()
         if not full_name:
+            skipped_empty_name += 1
             continue
 
         root = full_name.split("/", 1)[0].strip()
         if not root:
+            skipped_empty_root += 1
             continue
 
         _, team_number = split_project_and_team(root)
+
         if exclude_without_team and not team_number:
+            skipped_no_team += 1
             continue
 
         builds = int(j.get("buildCount") or 0)
+        total_builds_seen += builds
+
         if team_number in ban_set:
+            skipped_banned += 1
+            total_builds_banned += builds
             continue
 
         acc[team_number] += builds
 
     total_builds = sum(acc.values())
+
+    logger.info(
+        "Статистика джоб: всего=%d, папки=%d, пустое_имя=%d, пустой_root=%d, без_кода=%d, бан=%d",
+        total_jobs_seen,
+        skipped_folder,
+        skipped_empty_name,
+        skipped_empty_root,
+        skipped_no_team,
+        skipped_banned,
+    )
+    logger.info(f"buildCount total seen: {total_builds_seen}")
+    logger.info(f"buildCount выкинули баном: {total_builds_banned}")
+    logger.info(f"Билдов по учтённым сервисам: {total_builds}")
+    logger.info(f"Уникальных сервисов (по КОД) в отчёте: {len(acc)}")
 
     rows = []
     for team_number, builds in sorted(acc.items(), key=lambda kv: kv[1], reverse=True):
@@ -189,6 +249,7 @@ def aggregate_builds_by_service(data, sd_people_map, bk_type_map, exclude_withou
         service_name = people.get("service_name", "")
         owner = people.get("owner", "")
         business_type = bk_type_map.get(normalize_name_key(owner), "") if owner else ""
+
         pct = (builds / total_builds * 100.0) if total_builds > 0 else 0.0
 
         rows.append([
@@ -204,6 +265,8 @@ def aggregate_builds_by_service(data, sd_people_map, bk_type_map, exclude_withou
 
 
 def export_excel(rows, filename):
+    logger.info("Формируем Excel...")
+
     wb = Workbook()
     ws = wb.active
     ws.title = "Отчет Jenkins"
@@ -235,24 +298,30 @@ def export_excel(rows, filename):
         ws.column_dimensions[get_column_letter(col_idx)].width = min(max(12, max_len + 2), 60)
 
     wb.save(filename)
+    logger.info(f"Excel сохранён: {filename}")
 
 
 def main():
-    validate_env_and_files()
+    try:
+        validate_env_and_files()
 
-    sd_people_map = load_sd_people_map(SD_FILE)
-    bk_type_map = load_bk_business_type_map(BK_FILE)
+        sd_people_map = load_sd_people_map(SD_FILE)
+        bk_type_map = load_bk_business_type_map(BK_FILE)
 
-    data = get_builds_inventory()
+        data = get_builds_inventory()
 
-    rows = aggregate_builds_by_service(
-        data,
-        sd_people_map=sd_people_map,
-        bk_type_map=bk_type_map,
-        exclude_without_team=EXCLUDE_PROJECTS_WITHOUT_TEAM_NUMBER,
-    )
+        rows = aggregate_builds_by_service(
+            data,
+            sd_people_map=sd_people_map,
+            bk_type_map=bk_type_map,
+            exclude_without_team=EXCLUDE_PROJECTS_WITHOUT_TEAM_NUMBER,
+        )
 
-    export_excel(rows, OUTPUT_XLSX)
+        export_excel(rows, OUTPUT_XLSX)
+
+        logger.info("Инвентаризация билдов завершена успешно.")
+    except Exception as e:
+        logger.exception(f"Ошибка при инвентаризации: {e}")
 
 
 if __name__ == "__main__":
