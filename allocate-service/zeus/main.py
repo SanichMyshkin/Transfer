@@ -31,7 +31,6 @@ BK_FILE = os.getenv("BK_FILE")
 OUTPUT_XLSX = "zeus_report.xlsx"
 GIT_REF = "main"
 
-# BAN-LIST: сервисы (именно service, без "-код"), которые нужно полностью пропустить
 BAN_SERVICES = [
     "TEST",
     "UNAITP",
@@ -52,27 +51,25 @@ def normalize_name_key(s: str) -> str:
 
 
 def load_sd_people_map(path: str):
-    log.info("Читаем SD (B=КОД, D=Наименование, H=Владелец, I=Менеджер)...")
+    log.info("Читаем SD (B=КОД, D=Наименование, H=Владелец)...")
 
-    df = pd.read_excel(path, usecols="B,D,H,I", dtype=str, engine="openpyxl")
-    df.columns = ["service_id", "service_name", "owner", "manager"]
+    df = pd.read_excel(path, usecols="B,D,H", dtype=str, engine="openpyxl")
+    df.columns = ["service_id", "service_name", "owner"]
     df = df.fillna("")
 
     df["service_id"] = df["service_id"].astype(str).str.strip()
     df["service_name"] = df["service_name"].astype(str).map(clean_spaces)
     df["owner"] = df["owner"].astype(str).map(clean_spaces)
-    df["manager"] = df["manager"].astype(str).map(clean_spaces)
 
     df = df[df["service_id"] != ""].copy()
     last = df.drop_duplicates("service_id", keep="last")
 
     mp = {
-        sid: {"service_name": sn, "owner": o, "manager": m}
-        for sid, sn, o, m in zip(
+        sid: {"service_name": sn, "owner": o}
+        for sid, sn, o in zip(
             last["service_id"].tolist(),
             last["service_name"].tolist(),
             last["owner"].tolist(),
-            last["manager"].tolist(),
         )
     }
 
@@ -102,18 +99,6 @@ def load_bk_business_type_map(path: str):
     mp = dict(zip(last["fio_key"], last["business_type"]))
     log.info(f"BK: загружено ФИО->Тип бизнеса: {len(mp)}")
     return mp
-
-
-def pick_business_type(bk_type_map: dict, owner: str, manager: str) -> str:
-    if owner:
-        bt = bk_type_map.get(normalize_name_key(owner), "")
-        if bt:
-            return bt
-    if manager:
-        bt = bk_type_map.get(normalize_name_key(manager), "")
-        if bt:
-            return bt
-    return ""
 
 
 def gl_connect():
@@ -298,10 +283,9 @@ def collect_rows(gl, projects, sd_people_map, bk_type_map):
         if EXCLUDE_ZERO_CODES and is_zero_code(code):
             log.info(f"[{p.name}] SKIP (code is all zeros)")
             continue
+
         sd = sd_people_map.get(code, {}) if code else {}
-        service_from_sd = (
-            clean_spaces(sd.get("service_name", "")) if isinstance(sd, dict) else ""
-        )
+        service_from_sd = clean_spaces(sd.get("service_name", "")) if sd else ""
         service_for_report = service_from_sd or service_from_git
 
         if service_for_report in BAN_SERVICES:
@@ -330,14 +314,12 @@ def collect_rows(gl, projects, sd_people_map, bk_type_map):
         if cpu_total <= 0 and mem_total <= 0:
             continue
 
-        owner = ""
-        manager = ""
-        if code and isinstance(sd, dict):
-            owner = sd.get("owner", "")
-            manager = sd.get("manager", "")
-
-        owner_for_report = clean_spaces(owner or manager)
-        business_type = pick_business_type(bk_type_map, owner=owner, manager=manager)
+        owner = sd.get("owner", "") if isinstance(sd, dict) else ""
+        owner_for_report = clean_spaces(owner)
+        business_type = (
+            bk_type_map.get(normalize_name_key(owner), "")
+            if owner else ""
+        )
 
         key = (service_for_report, code)
         if key not in totals:
