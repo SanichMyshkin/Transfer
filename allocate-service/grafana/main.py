@@ -27,7 +27,7 @@ SLEEP_BETWEEN_CALLS = 0.2
 
 EXCLUDE_ALL_ZERO_NUMBERS = True
 
-BAN_SERVICE_IDS = [15473]  # коды, которые полностью исключаем
+BAN_SERVICE_IDS = [15473]
 
 logger = logging.getLogger("grafana_usage_report")
 logger.setLevel(logging.INFO)
@@ -214,34 +214,20 @@ def load_bk_business_type_map(path: str):
     return mp
 
 
-def pick_business_type(bk_map, owner, manager):
-    if owner:
-        bt = bk_map.get(normalize_name_key(owner))
-        if bt:
-            return bt
-    if manager:
-        bt = bk_map.get(normalize_name_key(manager))
-        if bt:
-            return bt
-    return ""
-
-
 def load_sd_mapping(path):
     df = pd.read_excel(path, dtype=str, engine="openpyxl").fillna("")
     map_by_number = {}
     map_by_name = {}
 
     for _, row in df.iterrows():
-        num = normalize_number(row.iloc[1])       # B
-        sd_name_raw = row.iloc[3]                 # D
-        owner_raw = row.iloc[7] if len(row) > 7 else ""    # H
-        manager_raw = row.iloc[8] if len(row) > 8 else ""  # I
+        num = normalize_number(row.iloc[1])
+        sd_name_raw = row.iloc[3]
+        owner_raw = row.iloc[7] if len(row) > 7 else ""
 
         sd_name = clean_spaces(sd_name_raw)
         owner = clean_spaces(owner_raw)
-        manager = clean_spaces(manager_raw)
 
-        payload = {"sd_name": sd_name, "owner": owner, "manager": manager}
+        payload = {"sd_name": sd_name, "owner": owner}
 
         if num:
             map_by_number[num] = payload
@@ -292,17 +278,15 @@ def main():
 
         sd_name = (sd or {}).get("sd_name") or ""
         owner = (sd or {}).get("owner") or ""
-        manager = (sd or {}).get("manager") or ""
 
-        owner_for_report = owner or manager
-        business_type = pick_business_type(bk_type_map, owner, manager)
+        business_type = bk_type_map.get(normalize_name_key(owner), "") if owner else ""
 
         if not switch_org(org_id):
             no_access += 1
             logger.warning(
                 f'ORG {org_id}: "{org_name}" — NO ACCESS | '
                 f'сервис="{sd_name or org_name}" | '
-                f'владелец="{owner_for_report or "—"}" | '
+                f'владелец="{owner or "—"}" | '
                 f'тип="{business_type or "—"}"'
             )
             continue
@@ -317,7 +301,7 @@ def main():
         logger.info(
             f'ORG {org_id}: "{org_name}" ({org_number}) | '
             f'сервис="{sd_name if sd_name else org_name}" | '
-            f'владелец="{owner_for_report or "—"}" | '
+            f'владелец="{owner or "—"}" | '
             f'тип="{business_type or "—"}" | '
             f'панелей={panels_total}'
         )
@@ -327,7 +311,7 @@ def main():
                 "Тип бизнеса": business_type,
                 "Наименование сервиса": sd_name if sd_name else org_name,
                 "КОД": org_number,
-                "Владелец сервиса": owner_for_report,
+                "Владелец сервиса": owner,
                 "Кол-во панелей": panels_total,
                 "Потребление в %": None,
             }
