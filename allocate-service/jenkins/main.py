@@ -130,27 +130,25 @@ def split_project_and_team(project_raw: str):
 
 
 def load_sd_people_map(path: str):
-    logger.info("Читаем SD (B=КОД, D=Наименование, H=Владелец, I=Менеджер)...")
+    logger.info("Читаем SD (B=КОД, D=Наименование, H=Владелец)...")
 
-    df = pd.read_excel(path, usecols="B,D,H,I", dtype=str, engine="openpyxl")
-    df.columns = ["service_id", "service_name", "owner", "manager"]
+    df = pd.read_excel(path, usecols="B,D,H", dtype=str, engine="openpyxl")
+    df.columns = ["service_id", "service_name", "owner"]
     df = df.fillna("")
 
     df["service_id"] = df["service_id"].astype(str).str.strip()
     df["service_name"] = df["service_name"].astype(str).map(clean_spaces)
     df["owner"] = df["owner"].astype(str).map(clean_spaces)
-    df["manager"] = df["manager"].astype(str).map(clean_spaces)
 
     df = df[df["service_id"] != ""].copy()
     last = df.drop_duplicates("service_id", keep="last")
 
     mp = {
-        sid: {"service_name": sn, "owner": o, "manager": m}
-        for sid, sn, o, m in zip(
+        sid: {"service_name": sn, "owner": o}
+        for sid, sn, o in zip(
             last["service_id"].tolist(),
             last["service_name"].tolist(),
             last["owner"].tolist(),
-            last["manager"].tolist(),
         )
     }
 
@@ -178,18 +176,6 @@ def load_bk_business_type_map(path: str):
     mp = dict(zip(last["fio_key"], last["business_type"]))
     logger.info(f"BK: загружено ФИО->Тип бизнеса: {len(mp)}")
     return mp
-
-
-def pick_business_type(bk_type_map: dict, owner: str, manager: str) -> str:
-    if owner:
-        bt = bk_type_map.get(normalize_name_key(owner), "")
-        if bt:
-            return bt
-    if manager:
-        bt = bk_type_map.get(normalize_name_key(manager), "")
-        if bt:
-            return bt
-    return ""
 
 
 def aggregate_builds_by_service(data, sd_people_map, bk_type_map, exclude_without_team=True):
@@ -258,19 +244,17 @@ def aggregate_builds_by_service(data, sd_people_map, bk_type_map, exclude_withou
 
     rows = []
     for team_number, builds in sorted(acc.items(), key=lambda kv: kv[1], reverse=True):
-        people = sd_people_map.get(team_number, {"service_name": "", "owner": "", "manager": ""})
+        people = sd_people_map.get(team_number, {"service_name": "", "owner": ""})
         sd_service_name = people.get("service_name", "")
         owner = people.get("owner", "")
-        manager = people.get("manager", "")
 
-        owner_for_report = owner or manager
-        business_type = pick_business_type(bk_type_map, owner=owner, manager=manager)
+        business_type = bk_type_map.get(normalize_name_key(owner), "") if owner else ""
 
         service_name = sd_service_name
 
         pct = (builds / total_builds * 100.0) if total_builds > 0 else 0.0
 
-        rows.append([service_name, team_number, owner_for_report, business_type, builds, round(pct, 2)])
+        rows.append([service_name, team_number, owner, business_type, builds, round(pct, 2)])
 
     return rows
 
