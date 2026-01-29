@@ -138,7 +138,6 @@ def load_sd(path):
         m[code] = {
             "name": clean(r[3] if len(r) > 3 else ""),
             "owner": clean(r[7] if len(r) > 7 else ""),
-            "manager": clean(r[8] if len(r) > 8 else ""),
         }
     return m
 
@@ -159,8 +158,8 @@ def load_bk(path):
     return m
 
 
-def pick_bt(bk, owner, manager):
-    return bk.get(norm_key(owner)) or bk.get(norm_key(manager)) or ""
+def pick_bt(bk, owner):
+    return bk.get(norm_key(owner)) if owner else ""
 
 
 def process_sonar(url, token, sd, bk, acc):
@@ -188,8 +187,8 @@ def process_sonar(url, token, sd, bk, acc):
 
         sd_row = sd.get(code, {})
         svc = sd_row.get("name") or svc
-        owner = sd_row.get("owner") or sd_row.get("manager")
-        bt = pick_bt(bk, sd_row.get("owner"), sd_row.get("manager"))
+        owner = sd_row.get("owner") or ""
+        bt = pick_bt(bk, sd_row.get("owner") or "")
 
         tasks = get_tasks(s, url, key)
         tcnt, lines = 0, 0
