@@ -6,7 +6,7 @@ from common.logs import logging
 
 
 docker_tags_count_gauge = Gauge(
-    "docker_image_tags_count",
+    "docker_image_tags_info",
     "Количество тегов у Docker-образа в репозитории",
     ["image_name", "repository", "format", "blob", "nexus_url_path"],
 )
