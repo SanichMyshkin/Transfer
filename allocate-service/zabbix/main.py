@@ -132,23 +132,17 @@ def load_db(path):
 
 
 def load_sd_people_map(path):
-    # B = service_id, H = owner, I = manager
-    df = pd.read_excel(path, usecols="B,H,I", dtype=str, engine="openpyxl")
-    df.columns = ["service_id", "owner", "manager"]
+    df = pd.read_excel(path, usecols="B,H", dtype=str, engine="openpyxl")
+    df.columns = ["service_id", "owner"]
     df = df.fillna("")
 
     df["service_id"] = df["service_id"].astype(str).str.strip()
     df["owner"] = df["owner"].astype(str).map(clean_spaces)
-    df["manager"] = df["manager"].astype(str).map(clean_spaces)
 
     df = df[df["service_id"] != ""].copy()
     last = df.drop_duplicates("service_id", keep="last")
 
-    # value: {"owner": "...", "manager": "..."}
-    return {
-        sid: {"owner": o, "manager": m}
-        for sid, o, m in zip(last["service_id"].tolist(), last["owner"].tolist(), last["manager"].tolist())
-    }
+    return {sid: {"owner": o} for sid, o in zip(last["service_id"].tolist(), last["owner"].tolist())}
 
 
 def load_bk_business_type_map(path):
@@ -157,7 +151,6 @@ def load_bk_business_type_map(path):
     df.columns = ["c1", "c2", "c3", "business_type"]
 
     def make_fio(r):
-        # порядок оставляю как у тебя: c2 c1 c3
         fio = " ".join([clean_spaces(r["c2"]), clean_spaces(r["c1"]), clean_spaces(r["c3"])])
         return clean_spaces(fio)
 
@@ -176,20 +169,6 @@ def build_map(df, keys):
     last = tmp.drop_duplicates("_k", keep="last")
     mp = {k: (r["service"], r["service_id"]) for k, r in zip(last["_k"], last.to_dict("records"))}
     return mp, counts
-
-
-def pick_business_type(bk_type_map: dict, owner: str, manager: str) -> str:
-    # 1) owner
-    if owner:
-        bt = bk_type_map.get(normalize_name_key(owner), "")
-        if bt:
-            return bt
-    # 2) manager
-    if manager:
-        bt = bk_type_map.get(normalize_name_key(manager), "")
-        if bt:
-            return bt
-    return ""
 
 
 def main():
@@ -258,21 +237,17 @@ def main():
     for (service, service_id), cnt in per_service.items():
         pct = (cnt / matched) * 100 if matched else 0
 
-        people = sd_people_map.get(service_id, {"owner": "", "manager": ""})
+        people = sd_people_map.get(service_id, {"owner": ""})
         owner = people.get("owner", "")
-        manager = people.get("manager", "")
 
-        # если владельца нет — в отчёт подставляем менеджера
-        owner_for_report = owner or manager
-
-        business_type = pick_business_type(bk_type_map, owner=owner, manager=manager)
+        business_type = bk_type_map.get(normalize_name_key(owner), "") if owner else ""
 
         rows.append(
             {
                 "business_type": business_type,
                 "service": service,
                 "service_id": service_id,
-                "owner": owner_for_report,
+                "owner": owner,
                 "hosts_found": cnt,
                 "percent": round(pct, 2),
             }
