@@ -38,6 +38,9 @@ BAN_SERVICES = [
 
 EXCLUDE_ZERO_CODES = True
 
+CPU_WEIGHT = 0.40
+RAM_WEIGHT = 0.60
+
 
 def clean_spaces(s: str) -> str:
     s = (s or "").strip()
@@ -348,7 +351,7 @@ def collect_rows(gl, projects, sd_people_map, bk_type_map):
 
         cpu_pct = (cpu / total_cpu * 100.0) if total_cpu > 0 else 0.0
         mem_pct = (mem / total_mem * 100.0) if total_mem > 0 else 0.0
-        pct = (cpu_pct + mem_pct) / 2.0
+        pct = (cpu_pct * CPU_WEIGHT) + (mem_pct * RAM_WEIGHT)
 
         rows.append(
             {
