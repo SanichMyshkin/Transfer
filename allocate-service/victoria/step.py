@@ -14,7 +14,8 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(H:%M:%S) | %(levelname)s | %(message)s",
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    datefmt="%H:%M:%S",
 )
 log = logging.getLogger(__name__)
 
