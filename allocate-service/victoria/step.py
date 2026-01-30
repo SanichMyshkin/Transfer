@@ -23,6 +23,11 @@ OUTPUT_FILE = "victoriametrics_samples_by_group.xlsx"
 HTTP_TIMEOUT_SEC = 30
 SLEEP_SEC = 0.3
 
+BAN_TEAMS = [
+    # "sugar_team",
+    # "infra",
+]
+
 
 def http_query(vm_url: str, query: str):
     url = vm_url.rstrip("/") + "/api/v1/query"
@@ -56,6 +61,18 @@ def label(metric: dict, key: str) -> str:
     return "" if v is None else str(v).strip()
 
 
+def is_banned_team(team: str) -> bool:
+    t = "" if team is None else str(team).strip()
+    if t == "":
+        return False
+    for x in BAN_TEAMS:
+        if x is None:
+            continue
+        if t == str(x).strip():
+            return True
+    return False
+
+
 def discover_groups(vm_url: str):
     groups = set()
     queries = [
@@ -68,7 +85,10 @@ def discover_groups(vm_url: str):
         rows = http_query(vm_url, q)
         for r in rows:
             m = r.get("metric", {}) or {}
-            groups.add((label(m, "team"), label(m, "service_id")))
+            team = label(m, "team")
+            if is_banned_team(team):
+                continue
+            groups.add((team, label(m, "service_id")))
         time.sleep(SLEEP_SEC)
     return sorted(groups)
 
@@ -149,6 +169,9 @@ def main():
 
     out_rows = []
     for team, service_id in groups:
+        if is_banned_team(team):
+            continue
+
         log.info("[GROUP] " + (f"team={team} service_id={service_id}" if (team or service_id) else "UNLABELED"))
 
         try:
