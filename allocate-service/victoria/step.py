@@ -8,7 +8,6 @@ from collections import defaultdict
 import requests
 import urllib3
 from dotenv import load_dotenv
-
 from openpyxl import Workbook
 from openpyxl.styles import Font
 
@@ -21,60 +20,51 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-OUTPUT_FILE = os.getenv("OUTPUT_FILE", "victoriametrics_group_samples_24h.xlsx")
+OUTPUT_FILE = "victoriametrics_samples_by_group.xlsx"
 HTTP_TIMEOUT_SEC = 30
-
-SLEEP_BETWEEN_REQUESTS_SEC = float(os.getenv("SLEEP_BETWEEN_REQUESTS_SEC", "0.2"))
-TOP_GROUPS = int(os.getenv("TOP_GROUPS", "0"))
-MIN_TIME_SERIES = int(os.getenv("MIN_TIME_SERIES", "0"))
-INCLUDE_METRIC_NAMES = os.getenv("INCLUDE_METRIC_NAMES", "false").strip().lower() in {"1", "true", "yes", "y", "on"}
+SLEEP_SEC = 0.3
 
 
-def http_query(vm_url: str, q: str):
+def http_query(vm_url: str, query: str):
     url = vm_url.rstrip("/") + "/api/v1/query"
-    log.info(f"QUERY: {q}")
-    try:
-        r = requests.get(url, params={"query": q}, verify=False, timeout=HTTP_TIMEOUT_SEC)
-        r.raise_for_status()
-        data = r.json()
-        if data.get("status") != "success":
-            log.error(f"Bad response for `{q}`: {data}")
-            return None
-        return data.get("data", {}).get("result", [])
-    except Exception as e:
-        log.error(f"Ошибка выполнения `{q}`: {e}")
-        return None
+    log.info(f"QUERY: {query}")
+    r = requests.get(
+        url,
+        params={"query": query},
+        verify=False,
+        timeout=HTTP_TIMEOUT_SEC,
+    )
+    r.raise_for_status()
+    data = r.json()
+    if data.get("status") != "success":
+        raise RuntimeError(data)
+    return data["data"]["result"]
 
 
-def http_query_range(vm_url: str, q: str, start_ts: float, end_ts: float, step_sec: int):
+def http_query_range(vm_url: str, query: str, start_ts: float, end_ts: float, step: int):
     url = vm_url.rstrip("/") + "/api/v1/query_range"
-    log.info(f"QUERY_RANGE: {q}")
-    try:
-        r = requests.get(
-            url,
-            params={
-                "query": q,
-                "start": str(start_ts),
-                "end": str(end_ts),
-                "step": str(step_sec),
-            },
-            verify=False,
-            timeout=HTTP_TIMEOUT_SEC,
-        )
-        r.raise_for_status()
-        data = r.json()
-        if data.get("status") != "success":
-            log.error(f"Bad response for `{q}`: {data}")
-            return None
-        return data.get("data", {}).get("result", [])
-    except Exception as e:
-        log.error(f"Ошибка выполнения query_range `{q}`: {e}")
-        return None
+    log.info(f"QUERY_RANGE: {query}")
+    r = requests.get(
+        url,
+        params={
+            "query": query,
+            "start": start_ts,
+            "end": end_ts,
+            "step": step,
+        },
+        verify=False,
+        timeout=HTTP_TIMEOUT_SEC,
+    )
+    r.raise_for_status()
+    data = r.json()
+    if data.get("status") != "success":
+        raise RuntimeError(data)
+    return data["data"]["result"]
 
 
 def label(metric: dict, key: str) -> str:
     v = metric.get(key)
-    return "" if v is None or str(v).strip() == "" else str(v).strip()
+    return "" if v is None else str(v).strip()
 
 
 def discover_groups(vm_url: str):
@@ -87,13 +77,11 @@ def discover_groups(vm_url: str):
     ]
 
     for q in queries:
-        rows = http_query(vm_url, q) or []
+        rows = http_query(vm_url, q)
         for r in rows:
-            m = r.get("metric", {}) or {}
+            m = r.get("metric", {})
             groups.add((label(m, "team"), label(m, "service_id")))
-
-        if SLEEP_BETWEEN_REQUESTS_SEC > 0:
-            time.sleep(SLEEP_BETWEEN_REQUESTS_SEC)
+        time.sleep(SLEEP_SEC)
 
     return sorted(groups)
 
@@ -107,156 +95,80 @@ def build_matchers(team: str, service_id: str) -> str:
     )
 
 
-def get_group_time_series(vm_url: str, team: str, service_id: str) -> int:
-    m = build_matchers(team, service_id)
-    r = http_query(vm_url, f"count({{{m}}})")
-    if not r:
-        return 0
-    try:
-        return int(float(r[0]["value"][1]))
-    except Exception:
-        return 0
-
-
-def get_group_metric_names_count(vm_url: str, team: str, service_id: str) -> int:
-    m = build_matchers(team, service_id)
-    mr = http_query(vm_url, f"count by (__name__) ({{{m}}})") or []
-    names = set()
-    for x in mr:
-        n = (x.get("metric", {}) or {}).get("__name__")
-        if n is None:
-            continue
-        s = str(n).strip()
-        if s:
-            names.add(s)
-    return len(names)
-
-
-def get_group_samples_24h(vm_url: str, team: str, service_id: str, end_dt: datetime) -> tuple[int, int]:
-    m = build_matchers(team, service_id)
-    q = f"sum(count_over_time({{{m}}}[1h]))"
+def samples_24h_by_group(vm_url: str, team: str, service_id: str, end_dt: datetime) -> int:
+    matchers = build_matchers(team, service_id)
+    query = f"sum(count_over_time({{{matchers}}}[1h]))"
 
     start_dt = end_dt - timedelta(hours=24)
-    start_ts = start_dt.timestamp()
-    end_ts = end_dt.timestamp()
 
-    res = http_query_range(vm_url, q, start_ts, end_ts, 3600) or []
-    total = 0.0
-    points = 0
+    res = http_query_range(
+        vm_url,
+        query,
+        start_dt.timestamp(),
+        end_dt.timestamp(),
+        3600,
+    )
 
+    total = 0
     for row in res:
-        vals = row.get("values") or []
-        for tv in vals:
-            if not isinstance(tv, list) or len(tv) < 2:
-                continue
-            try:
-                total += float(tv[1])
-                points += 1
-            except Exception:
-                continue
+        for ts, value in row.get("values", []):
+            total += float(value)
 
-    return int(round(total)), points
+    return int(total)
 
 
-def write_report(rows: list[dict], out_file: str):
+def write_report(rows):
     wb = Workbook()
     ws = wb.active
-    ws.title = "team_service_samples_24h"
+    ws.title = "samples_24h"
 
-    headers = ["team", "service_id", "time_series", "samples_24h", "hours_points"]
-    if INCLUDE_METRIC_NAMES:
-        headers.insert(2, "metric_names_count")
-
-    bold = Font(bold=True)
+    headers = ["team", "service_id", "samples_24h"]
     ws.append(headers)
     for c in ws[1]:
-        c.font = bold
+        c.font = Font(bold=True)
 
     for r in rows:
-        team = r["team"]
-        service_id = r["service_id"]
-        out_team = "unlabeled" if team == "" and service_id == "" else team
+        ws.append([r["team"], r["service_id"], r["samples_24h"]])
 
-        line = [out_team, service_id, r["time_series"], r["samples_24h"], r["hours_points"]]
-        if INCLUDE_METRIC_NAMES:
-            line.insert(2, r["metric_names_count"])
-        ws.append(line)
-
-    wb.save(out_file)
+    wb.save(OUTPUT_FILE)
 
 
 def main():
     load_dotenv()
-    vm_url = os.getenv("VM_URL", "").strip()
+    vm_url = os.getenv("VM_URL")
     if not vm_url:
-        log.error("VM_URL отсутствует")
+        log.error("VM_URL не задан")
         sys.exit(1)
 
-    log.info(f"VM_URL: {vm_url}")
-    log.info("Поиск групп (team/service_id), включая отсутствующие лейблы...")
+    log.info("Собираю группы (team / service_id)...")
     groups = discover_groups(vm_url)
-    log.info(f"Всего уникальных групп: {len(groups)}")
-
-    log.info("Считаю time_series по группам...")
-    group_stats = []
-    total_series = 0
-    for i, (team, service_id) in enumerate(groups, 1):
-        ts = get_group_time_series(vm_url, team, service_id)
-        total_series += ts
-        group_stats.append({"team": team, "service_id": service_id, "time_series": ts})
-
-        if SLEEP_BETWEEN_REQUESTS_SEC > 0:
-            time.sleep(SLEEP_BETWEEN_REQUESTS_SEC)
-
-    group_stats.sort(key=lambda x: x["time_series"], reverse=True)
-
-    selected = []
-    for g in group_stats:
-        if MIN_TIME_SERIES > 0 and g["time_series"] < MIN_TIME_SERIES:
-            continue
-        selected.append(g)
-        if TOP_GROUPS > 0 and len(selected) >= TOP_GROUPS:
-            break
-
-    log.info(f"Групп для подсчета samples_24h: {len(selected)} (TOP_GROUPS={TOP_GROUPS}, MIN_TIME_SERIES={MIN_TIME_SERIES})")
+    log.info(f"Групп найдено: {len(groups)}")
 
     end_dt = datetime.now(timezone.utc)
 
-    out_rows = []
-    for i, g in enumerate(selected, 1):
-        team = g["team"]
-        service_id = g["service_id"]
-
+    rows = []
+    for team, service_id in groups:
         log.info(
-            f"[{i}/{len(selected)}] "
-            + ("[UNLABELED]" if team == "" and service_id == "" else f"team={team} service_id={service_id}")
-            + f" time_series={g['time_series']}"
+            "[UNLABELED]"
+            if team == "" and service_id == ""
+            else f"team={team} service_id={service_id}"
         )
 
-        metric_names_count = 0
-        if INCLUDE_METRIC_NAMES:
-            metric_names_count = get_group_metric_names_count(vm_url, team, service_id)
-            if SLEEP_BETWEEN_REQUESTS_SEC > 0:
-                time.sleep(SLEEP_BETWEEN_REQUESTS_SEC)
+        samples = samples_24h_by_group(vm_url, team, service_id, end_dt)
+        rows.append(
+            {
+                "team": team,
+                "service_id": service_id,
+                "samples_24h": samples,
+            }
+        )
+        time.sleep(SLEEP_SEC)
 
-        samples_24h, hours_points = get_group_samples_24h(vm_url, team, service_id, end_dt=end_dt)
+    rows.sort(key=lambda x: (x["team"], x["service_id"]))
 
-        row = {
-            "team": team,
-            "service_id": service_id,
-            "time_series": g["time_series"],
-            "samples_24h": samples_24h,
-            "hours_points": hours_points,
-            "metric_names_count": metric_names_count,
-        }
-        out_rows.append(row)
-
-        if SLEEP_BETWEEN_REQUESTS_SEC > 0:
-            time.sleep(SLEEP_BETWEEN_REQUESTS_SEC)
-
-    log.info(f"Сохранение файла {OUTPUT_FILE}...")
-    write_report(out_rows, OUTPUT_FILE)
-    log.info(f"✔ Готово. Файл {OUTPUT_FILE} создан.")
+    log.info(f"Сохраняю отчет: {OUTPUT_FILE}")
+    write_report(rows)
+    log.info("✔ Готово")
 
 
 if __name__ == "__main__":
