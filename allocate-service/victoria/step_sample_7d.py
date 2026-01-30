@@ -21,11 +21,10 @@ log = logging.getLogger(__name__)
 
 OUTPUT_FILE = "victoriametrics_samples_by_group.xlsx"
 HTTP_TIMEOUT_SEC = 30
-SLEEP_SEC = 0.3
+SLEEP_SEC = 0.1
 
 BAN_TEAMS = [
-    # "sugar_team",
-    # "infra",
+    "UNAITP",
 ]
 
 RANGE_DAYS = 7
