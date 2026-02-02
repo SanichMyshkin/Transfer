@@ -22,7 +22,9 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-OUTPUT_FILE = os.getenv("OUT_FILE", "victoriametrics_samples_by_group.xlsx")
+load_dotenv()
+
+OUTPUT_FILE = os.getenv("OUT_FILE", "victoriareport.xlsx")
 HTTP_TIMEOUT_SEC = 30
 SLEEP_SEC = 0.1
 
@@ -34,12 +36,20 @@ BAN_SERVICE_IDS = [15473]
 EXCLUDE_NO_SERVICE_ID_AT_QUERY = False
 EXTRAPOLATION_DAYS = 90
 
-PERCENT_ROUND_DIGITS = 4
-
-SD_FILE = os.getenv("SD_FILE", "sd.xlsx")
-BK_FILE = os.getenv("BK_FILE", "bk_all_users.xlsx")
+SD_FILE = os.getenv("SD_FILE")
+BK_FILE = os.getenv("BK_FILE")
 
 TEAM_TAIL_ID_RE = re.compile(r"^(.*)-(\d+)$")
+
+REPORT_COLS = [
+    "Тип бизнеса",
+    "Наименование сервиса",
+    "КОД",
+    "Владелец сервиса",
+    "samples_24h",
+    "эксрополяция",
+    "% от общего числа",
+]
 
 
 def build_ban_set(ban_list):
@@ -294,16 +304,7 @@ def normalize_out_rows(rows):
 def enrich_with_sd_and_bk(rows, sd_df: pd.DataFrame, bk_map: dict) -> pd.DataFrame:
     df = pd.DataFrame(rows)
     if df.empty:
-        return pd.DataFrame(
-            columns=[
-                "Тип бизнеса",
-                "Наименование сервиса",
-                "КОД",
-                "Владелец сервиса",
-                "samples_24h",
-                "эксрополяция",
-            ]
-        )
+        return pd.DataFrame(columns=REPORT_COLS[:-1])
 
     df["service_id"] = df["service_id"].astype(str).fillna("").map(lambda x: x.strip())
     df["code"] = df["service_id"].str.extract(r"(\d+)", expand=False).fillna("")
@@ -333,7 +334,7 @@ def enrich_with_sd_and_bk(rows, sd_df: pd.DataFrame, bk_map: dict) -> pd.DataFra
         }
     )
 
-    out = out[
+    return out[
         [
             "Тип бизнеса",
             "Наименование сервиса",
@@ -344,7 +345,6 @@ def enrich_with_sd_and_bk(rows, sd_df: pd.DataFrame, bk_map: dict) -> pd.DataFra
         ]
     ]
 
-    return out
 
 def is_missing_code(code: str) -> bool:
     code = (code or "").strip()
@@ -361,8 +361,9 @@ def _first_non_empty(vals):
 
 def dedupe_and_add_percent(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
-        df["% от общего числа"] = []
-        return df
+        out = df.copy()
+        out["% от общего числа"] = []
+        return out.reindex(columns=REPORT_COLS)
 
     df = df.copy()
     df["КОД"] = df["КОД"].fillna("").astype(str).map(lambda x: x.strip())
@@ -406,24 +407,14 @@ def dedupe_and_add_percent(df: pd.DataFrame) -> pd.DataFrame:
 
     total = float(out["samples_24h"].sum()) if "samples_24h" in out.columns else 0.0
     out["% от общего числа"] = (out["samples_24h"] / total * 100.0) if total else 0.0
-    out["% от общего числа"] = out["% от общего числа"].round(PERCENT_ROUND_DIGITS)
+    out["% от общего числа"] = out["% от общего числа"].round(5)
 
-    out = out[
-        [
-            "Тип бизнеса",
-            "Наименование сервиса",
-            "КОД",
-            "Владелец сервиса",
-            "samples_24h",
-            "эксрополяция",
-            "% от общего числа",
-        ]
-    ]
-
-    return out
+    return out.reindex(columns=REPORT_COLS)
 
 
 def write_report(df: pd.DataFrame):
+    df = df.reindex(columns=REPORT_COLS)
+
     wb = Workbook()
     ws = wb.active
     ws.title = "samples_24h"
@@ -434,6 +425,12 @@ def write_report(df: pd.DataFrame):
 
     for row in df.itertuples(index=False):
         ws.append(list(row))
+
+    if "% от общего числа" in df.columns:
+        col_idx = df.columns.get_loc("% от общего числа") + 1
+        for cell in ws.iter_cols(min_col=col_idx, max_col=col_idx, min_row=2):
+            for c in cell:
+                c.number_format = "0.00000"
 
     wb.save(OUTPUT_FILE)
 
@@ -448,7 +445,6 @@ def main():
     log.info("VM_URL=%s", vm_url)
     log.info("EXCLUDE_NO_SERVICE_ID_AT_QUERY=%s", EXCLUDE_NO_SERVICE_ID_AT_QUERY)
     log.info("EXTRAPOLATION_DAYS=%s", EXTRAPOLATION_DAYS)
-    log.info("PERCENT_ROUND_DIGITS=%s", PERCENT_ROUND_DIGITS)
     log.info("BAN_SERVICE_IDS=%s", sorted(ban_service_set) if ban_service_set else "[]")
     log.info("SD_FILE=%s", SD_FILE)
     log.info("BK_FILE=%s", BK_FILE)
