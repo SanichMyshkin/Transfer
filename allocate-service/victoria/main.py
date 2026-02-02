@@ -22,9 +22,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-load_dotenv()
-
-OUTPUT_FILE = os.getenv("OUT_FILE", "victoriareport.xlsx")
+OUTPUT_FILE = os.getenv("OUT_FILE", "victoriametrics_samples_by_group.xlsx")
 HTTP_TIMEOUT_SEC = 30
 SLEEP_SEC = 0.1
 
@@ -36,8 +34,10 @@ BAN_SERVICE_IDS = [15473]
 EXCLUDE_NO_SERVICE_ID_AT_QUERY = False
 EXTRAPOLATION_DAYS = 90
 
-SD_FILE = os.getenv("SD_FILE")
-BK_FILE = os.getenv("BK_FILE") 
+PERCENT_ROUND_DIGITS = 4
+
+SD_FILE = os.getenv("SD_FILE", "sd.xlsx")
+BK_FILE = os.getenv("BK_FILE", "bk_all_users.xlsx")
 
 TEAM_TAIL_ID_RE = re.compile(r"^(.*)-(\d+)$")
 
@@ -333,7 +333,7 @@ def enrich_with_sd_and_bk(rows, sd_df: pd.DataFrame, bk_map: dict) -> pd.DataFra
         }
     )
 
-    return out[
+    out = out[
         [
             "Тип бизнеса",
             "Наименование сервиса",
@@ -344,6 +344,7 @@ def enrich_with_sd_and_bk(rows, sd_df: pd.DataFrame, bk_map: dict) -> pd.DataFra
         ]
     ]
 
+    return out
 
 def is_missing_code(code: str) -> bool:
     code = (code or "").strip()
@@ -405,7 +406,19 @@ def dedupe_and_add_percent(df: pd.DataFrame) -> pd.DataFrame:
 
     total = float(out["samples_24h"].sum()) if "samples_24h" in out.columns else 0.0
     out["% от общего числа"] = (out["samples_24h"] / total * 100.0) if total else 0.0
-    out["% от общего числа"] = out["% от общего числа"].round(2)
+    out["% от общего числа"] = out["% от общего числа"].round(PERCENT_ROUND_DIGITS)
+
+    out = out[
+        [
+            "Тип бизнеса",
+            "Наименование сервиса",
+            "КОД",
+            "Владелец сервиса",
+            "samples_24h",
+            "эксрополяция",
+            "% от общего числа",
+        ]
+    ]
 
     return out
 
@@ -435,6 +448,7 @@ def main():
     log.info("VM_URL=%s", vm_url)
     log.info("EXCLUDE_NO_SERVICE_ID_AT_QUERY=%s", EXCLUDE_NO_SERVICE_ID_AT_QUERY)
     log.info("EXTRAPOLATION_DAYS=%s", EXTRAPOLATION_DAYS)
+    log.info("PERCENT_ROUND_DIGITS=%s", PERCENT_ROUND_DIGITS)
     log.info("BAN_SERVICE_IDS=%s", sorted(ban_service_set) if ban_service_set else "[]")
     log.info("SD_FILE=%s", SD_FILE)
     log.info("BK_FILE=%s", BK_FILE)
