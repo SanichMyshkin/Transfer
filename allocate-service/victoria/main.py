@@ -22,7 +22,9 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-OUTPUT_FILE = os.getenv("OUT_FILE", "victoriametrics_samples_by_group.xlsx")
+load_dotenv()
+
+OUTPUT_FILE = os.getenv("OUT_FILE", "victoriareport.xlsx")
 HTTP_TIMEOUT_SEC = 30
 SLEEP_SEC = 0.1
 
@@ -31,13 +33,11 @@ BAN_TEAMS = [
 ]
 
 BAN_SERVICE_IDS = [15473]
-
 EXCLUDE_NO_SERVICE_ID_AT_QUERY = False
-
 EXTRAPOLATION_DAYS = 90
 
-SD_FILE = os.getenv("SD_FILE", "sd.xlsx")
-BK_FILE = os.getenv("BK_FILE", "bk_all_users.xlsx")
+SD_FILE = os.getenv("SD_FILE")
+BK_FILE = os.getenv("BK_FILE") 
 
 TEAM_TAIL_ID_RE = re.compile(r"^(.*)-(\d+)$")
 
@@ -291,10 +291,19 @@ def normalize_out_rows(rows):
     return list(acc.values())
 
 
-def enrich_with_sd_and_bk(rows, sd_df: pd.DataFrame, bk_map: dict):
+def enrich_with_sd_and_bk(rows, sd_df: pd.DataFrame, bk_map: dict) -> pd.DataFrame:
     df = pd.DataFrame(rows)
     if df.empty:
-        return df
+        return pd.DataFrame(
+            columns=[
+                "Тип бизнеса",
+                "Наименование сервиса",
+                "КОД",
+                "Владелец сервиса",
+                "samples_24h",
+                "эксрополяция",
+            ]
+        )
 
     df["service_id"] = df["service_id"].astype(str).fillna("").map(lambda x: x.strip())
     df["code"] = df["service_id"].str.extract(r"(\d+)", expand=False).fillna("")
@@ -334,6 +343,71 @@ def enrich_with_sd_and_bk(rows, sd_df: pd.DataFrame, bk_map: dict):
             "эксрополяция",
         ]
     ]
+
+
+def is_missing_code(code: str) -> bool:
+    code = (code or "").strip()
+    return (code == "") or is_all_zeros(code)
+
+
+def _first_non_empty(vals):
+    for v in vals:
+        s = "" if v is None else str(v).strip()
+        if s:
+            return s
+    return ""
+
+
+def dedupe_and_add_percent(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        df["% от общего числа"] = []
+        return df
+
+    df = df.copy()
+    df["КОД"] = df["КОД"].fillna("").astype(str).map(lambda x: x.strip())
+
+    has_code = df[~df["КОД"].map(is_missing_code)].copy()
+    no_code = df[df["КОД"].map(is_missing_code)].copy()
+
+    if not has_code.empty:
+        has_code = has_code.groupby("КОД", as_index=False).agg(
+            {
+                "Тип бизнеса": _first_non_empty,
+                "Наименование сервиса": _first_non_empty,
+                "Владелец сервиса": _first_non_empty,
+                "samples_24h": "sum",
+                "эксрополяция": "sum",
+            }
+        )
+
+    if not no_code.empty:
+        no_code = no_code.groupby("Наименование сервиса", as_index=False).agg(
+            {
+                "Тип бизнеса": _first_non_empty,
+                "КОД": _first_non_empty,
+                "Владелец сервиса": _first_non_empty,
+                "samples_24h": "sum",
+                "эксрополяция": "sum",
+            }
+        )
+        no_code = no_code[
+            [
+                "Тип бизнеса",
+                "Наименование сервиса",
+                "КОД",
+                "Владелец сервиса",
+                "samples_24h",
+                "эксрополяция",
+            ]
+        ]
+
+    out = pd.concat([has_code, no_code], ignore_index=True)
+
+    total = float(out["samples_24h"].sum()) if "samples_24h" in out.columns else 0.0
+    out["% от общего числа"] = (out["samples_24h"] / total * 100.0) if total else 0.0
+    out["% от общего числа"] = out["% от общего числа"].round(2)
+
+    return out
 
 
 def write_report(df: pd.DataFrame):
@@ -429,7 +503,8 @@ def main():
     out_rows = normalize_out_rows(out_rows)
 
     df = enrich_with_sd_and_bk(out_rows, sd_df, bk_map)
-    df = df.sort_values(["Наименование сервиса", "КОД"]).reset_index(drop=True)
+    df = dedupe_and_add_percent(df)
+    df = df.sort_values(["samples_24h"], ascending=False).reset_index(drop=True)
 
     log.info(f"Сохраняю отчет: {OUTPUT_FILE}")
     write_report(df)
