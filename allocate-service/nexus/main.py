@@ -15,6 +15,12 @@ from confluence_names import confluence_table_as_dicts, repo_to_service_map
 SKIP_EMPTY_SERVICE = True
 
 
+def to_int_bytes(x):
+    if x is None:
+        return 0
+    return int(x)
+
+
 def write_excel(path, rows):
     wb = Workbook()
     ws = wb.active
@@ -108,10 +114,10 @@ def main():
                 continue
             raw_service = "unknown"
 
-        size_bytes = repo_sizes.get(repo_name, 0) or 0
+        size_bytes = to_int_bytes(repo_sizes.get(repo_name))
         totals_bytes[raw_service] = totals_bytes.get(raw_service, 0) + size_bytes
 
-    grand_total = sum(totals_bytes.values()) or 0
+    grand_total = sum(totals_bytes.values())
 
     rows = []
     for raw_service, size_bytes in totals_bytes.items():
