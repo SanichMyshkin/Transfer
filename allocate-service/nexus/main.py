@@ -16,6 +16,9 @@ from confluence_names import confluence_table_as_dicts, repo_to_service_map
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 SKIP_EMPTY_SERVICE = True
+BAN_SERVICE_CODES = [
+    15473,
+]
 
 
 def clean_spaces(s):
@@ -31,7 +34,7 @@ def normalize_name_key(s):
 
 def split_service_and_code(raw_service):
     s = clean_spaces(raw_service)
-    if not s:
+    if not s or s in {"-", "—"}:
         return "", ""
 
     parts = s.split("-")
@@ -42,7 +45,12 @@ def split_service_and_code(raw_service):
     if m:
         code = m.group(1)
         name = s[: -len(code)].rstrip("-").strip()
+        if name in {"-", "—"}:
+            name = ""
         return name, code
+
+    if s in {"-", "—"}:
+        return "", ""
 
     return s, ""
 
@@ -51,6 +59,13 @@ def to_int_bytes(x):
     if x is None:
         return 0
     return int(x)
+
+
+def build_ban_set(ban_list):
+    return {str(x).strip() for x in ban_list if str(x).strip()}
+
+
+BAN_SET = build_ban_set(BAN_SERVICE_CODES)
 
 
 def read_sd_map(path):
@@ -94,7 +109,7 @@ def load_bk_business_type_map(path):
         c1 = clean_spaces(str(row[0] or "")) if len(row) > 0 else ""
         c2 = clean_spaces(str(row[1] or "")) if len(row) > 1 else ""
         c3 = clean_spaces(str(row[2] or "")) if len(row) > 2 else ""
-        business_type = clean_spaces(str(row[44] or "")) if len(row) > 44 else ""  # AS = 45
+        business_type = clean_spaces(str(row[44] or "")) if len(row) > 44 else ""
 
         fio = clean_spaces(f"{c2} {c1} {c3}")
         fio_key = normalize_name_key(fio)
@@ -178,9 +193,10 @@ def main():
     logging.info("Считаю размеры репозиториев из БД")
     repo_sizes = get_repository_sizes()
 
-    totals = {}  # key=(base_name, code) -> bytes
+    totals = {}
     hosted_total = 0
     skipped_no_service = 0
+    skipped_ban = 0
 
     for r in repo_data:
         if (r.get("repository_type") or "").strip().lower() != "hosted":
@@ -190,16 +206,14 @@ def main():
         repo_name = r["repository_name"]
 
         raw_service = repo_service.get(repo_name, "")
-        if not raw_service:
-            if SKIP_EMPTY_SERVICE:
-                skipped_no_service += 1
-                continue
-            raw_service = "unknown"
-
         base_name, code = split_service_and_code(raw_service)
 
-        if SKIP_EMPTY_SERVICE and not base_name:
+        if SKIP_EMPTY_SERVICE and (not base_name):
             skipped_no_service += 1
+            continue
+
+        if code and code in BAN_SET:
+            skipped_ban += 1
             continue
 
         size_bytes = to_int_bytes(repo_sizes.get(repo_name))
@@ -238,6 +252,7 @@ def main():
 
     logging.info(f"hosted repos: {hosted_total}")
     logging.info(f"skipped without service: {skipped_no_service}")
+    logging.info(f"skipped by ban: {skipped_ban}")
     logging.info(f"services in report: {len(rows)}")
     logging.info(f"write excel: {out_file}")
 
