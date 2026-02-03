@@ -6,14 +6,10 @@ from openpyxl import Workbook
 from openpyxl.styles import Font
 from openpyxl.utils import get_column_letter
 
+from humanfriendly import format_size
+
 from nexus_sizes import get_repository_data, get_repository_sizes
 from confluence_names import confluence_table_as_dicts, repo_to_service_map
-
-
-def gib(x):
-    if not x:
-        return 0.0
-    return float(x) / (1024.0**3)
 
 
 def write_excel(path, rows):
@@ -21,7 +17,7 @@ def write_excel(path, rows):
     ws = wb.active
     ws.title = "report"
 
-    header = ["service_name", "size_gib", "repository_name"]
+    header = ["service_name", "size_gib", "size_human", "repository_name"]
     ws.append(header)
 
     bold = Font(bold=True)
@@ -29,13 +25,19 @@ def write_excel(path, rows):
         ws.cell(row=1, column=i).font = bold
 
     for r in rows:
-        ws.append([r["service_name"], r["size_gib"], r["repository_name"]])
+        ws.append([
+            r["service_name"],
+            r["size_gib"],
+            r["size_human"],
+            r["repository_name"],
+        ])
 
     widths = [len(h) for h in header]
     for r in rows:
         widths[0] = max(widths[0], len(str(r["service_name"])))
         widths[1] = max(widths[1], len(str(r["size_gib"])))
-        widths[2] = max(widths[2], len(str(r["repository_name"])))
+        widths[2] = max(widths[2], len(str(r["size_human"])))
+        widths[3] = max(widths[3], len(str(r["repository_name"])))
 
     for idx, w in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(idx)].width = min(max(w + 2, 12), 60)
@@ -56,6 +58,7 @@ def main():
     conf_page_id = os.getenv("CONF_PAGE_ID", "").strip()
     conf_user = os.getenv("CONF_USER", "").strip()
     conf_pass = os.getenv("CONF_PASS", "").strip()
+
     out_file = os.getenv("OUT_FILE", "nexus_repo_by_service.xlsx")
 
     if not conf_url or not conf_page_id or not conf_user or not conf_pass:
@@ -64,9 +67,7 @@ def main():
     logging.info("Читаю таблицу из Confluence")
     conf_rows = confluence_table_as_dicts(conf_url, conf_page_id, conf_user, conf_pass)
     repo_service = repo_to_service_map(conf_rows)
-    logging.info(
-        f"Confluence rows: {len(conf_rows)}; mapped repos: {len(repo_service)}"
-    )
+    logging.info(f"Confluence rows: {len(conf_rows)}; mapped repos: {len(repo_service)}")
 
     logging.info("Читаю репозитории из БД")
     repo_data = get_repository_data()
@@ -76,9 +77,9 @@ def main():
     repo_sizes = get_repository_sizes()
     logging.info(f"Repos with size: {len(repo_sizes)}")
 
+    rows = []
     hosted_total = 0
     matched = 0
-    rows = []
 
     for r in repo_data:
         if (r.get("repository_type") or "").strip().lower() != "hosted":
@@ -96,7 +97,8 @@ def main():
         rows.append(
             {
                 "service_name": service_name,
-                "size_gib": round(gib(size_bytes), 4),
+                "size_gib": round(size_bytes / (1024 ** 3), 4),
+                "size_human": format_size(size_bytes, binary=True),
                 "repository_name": repo_name,
             }
         )
