@@ -22,7 +22,7 @@ OPENSEARCH_PORT = int(os.getenv("OPENSEARCH_PORT", "9200"))
 USER = os.getenv("USER")
 PASS = os.getenv("PASS")
 
-BAN_SERVICE_IDS = {15473, 7788}
+BAN_SERVICE_IDS = {15473}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -55,7 +55,7 @@ def parse_host_and_ssl(raw: str, default_port: int) -> Tuple[str, int, bool]:
     return raw, default_port, True
 
 
-def normalize_index_name(index_name: str) -> Optional[Tuple[str, int]]:
+def normalize_index_name(index_name: str) -> Optional[Tuple[str, int, str]]:
     name = (index_name or "").strip()
     m = TEAM_SERVICE_RE.match(name)
     if not m:
@@ -67,10 +67,10 @@ def normalize_index_name(index_name: str) -> Optional[Tuple[str, int]]:
     if team == "ib":
         t = TAIL_SERVICE_RE.search(name)
         if t:
-            return team, int(t.group(1))
-        return team, head_service_id
+            return team, int(t.group(1)), "ib-tail"
+        return team, head_service_id, "ib-head"
 
-    return team, head_service_id
+    return team, head_service_id, "default"
 
 
 def read_sd_map(path: str) -> dict[int, dict[str, str]]:
@@ -123,16 +123,31 @@ def fetch_and_aggregate(client: OpenSearch) -> list[dict[str, Any]]:
     raw = client.cat.indices(format="json", bytes="b")
 
     acc = defaultdict(int)
+    parsed_cnt = 0
+    skipped_cnt = 0
+    banned_cnt = 0
+
     for idx in raw:
-        parsed = normalize_index_name(idx.get("index"))
+        index_name = idx.get("index") or ""
+        parsed = normalize_index_name(index_name)
         if not parsed:
+            skipped_cnt += 1
             continue
 
-        team, service_id = parsed
+        team, service_id, rule = parsed
+
         if service_id in BAN_SERVICE_IDS:
+            banned_cnt += 1
             continue
 
-        acc[(team, service_id)] += int(idx.get("store.size", 0))
+        size_b = int(idx.get("store.size", 0))
+        acc[(team, service_id)] += size_b
+        parsed_cnt += 1
+
+        log.info(
+            f"INDEX_MAP | rule={rule} | index={index_name} "
+            f"-> team={team} service_id={service_id} size={size_b}B"
+        )
 
     rows = [
         {
@@ -143,7 +158,10 @@ def fetch_and_aggregate(client: OpenSearch) -> list[dict[str, Any]]:
         for (team, service_id), total in acc.items()
     ]
 
-    log.info(f"OpenSearch aggregated: {len(rows)} services")
+    log.info(
+        f"OpenSearch parsed={parsed_cnt} skipped={skipped_cnt} "
+        f"banned={banned_cnt} aggregated_services={len(rows)}"
+    )
     return rows
 
 
