@@ -13,7 +13,6 @@ from openpyxl.styles import Font
 
 load_dotenv()
 
-
 SD_FILE = os.getenv("SD_FILE")
 BK_FILE = os.getenv("BK_FILE")
 
@@ -25,7 +24,6 @@ PASS = os.getenv("PASS")
 
 BAN_SERVICE_IDS = {15473, 7788}
 
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -33,9 +31,9 @@ logging.basicConfig(
 )
 log = logging.getLogger("cpl")
 
-
 TEAM_SERVICE_RE = re.compile(r"^index_([a-z0-9\-]+)-(\d+)_", re.IGNORECASE)
 DIGITS_RE = re.compile(r"(\d+)")
+TAIL_SERVICE_RE = re.compile(r"-(\d+)(?:_\d+)?$", re.IGNORECASE)
 
 
 def clean_spaces(s: str) -> str:
@@ -58,17 +56,28 @@ def parse_host_and_ssl(raw: str, default_port: int) -> Tuple[str, int, bool]:
 
 
 def normalize_index_name(index_name: str) -> Optional[Tuple[str, int]]:
-    m = TEAM_SERVICE_RE.match(index_name or "")
+    name = (index_name or "").strip()
+    m = TEAM_SERVICE_RE.match(name)
     if not m:
         return None
-    return m.group(1).lower(), int(m.group(2))
+
+    team = m.group(1).lower()
+    head_service_id = int(m.group(2))
+
+    if team == "ib":
+        t = TAIL_SERVICE_RE.search(name)
+        if t:
+            return team, int(t.group(1))
+        return team, head_service_id
+
+    return team, head_service_id
 
 
 def read_sd_map(path: str) -> dict[int, dict[str, str]]:
     wb = load_workbook(path, read_only=True, data_only=True)
     ws = wb.worksheets[0]
 
-    sd = {}
+    sd: dict[int, dict[str, str]] = {}
     for row in ws.iter_rows(values_only=True):
         m = DIGITS_RE.search(str(row[1] or ""))
         if not m:
@@ -92,7 +101,7 @@ def read_bk_map(path: str) -> dict[str, str]:
     wb = load_workbook(path, read_only=True, data_only=True)
     ws = wb.worksheets[0]
 
-    out = {}
+    out: dict[str, str] = {}
     for row in ws.iter_rows(values_only=True):
         if len(row) < 45:
             continue
@@ -184,12 +193,12 @@ def write_to_excel(path: str, rows):
     for r in rows:
         ws.append(
             [
-                r["business_type"],
-                r["service_name"],
-                r["service_id"],
-                r["owner"],
-                r["size_human"],
-                r["pct"],
+                r.get("business_type", ""),
+                r.get("service_name", ""),
+                r.get("service_id", ""),
+                r.get("owner", ""),
+                r.get("size_human", ""),
+                r.get("pct", 0),
             ]
         )
 
