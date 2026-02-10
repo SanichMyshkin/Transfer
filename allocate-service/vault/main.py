@@ -23,7 +23,13 @@ BK_FILE = os.getenv("BK_FILE", "bk_all_users.xlsx")
 OUT_FILE = os.getenv("OUT_FILE", "vault_report.xlsx")
 
 BAN_SERVICE_IDS = [15473]
+
+BAN_BUSINESS_TYPES = [
+     "Розничный",
+]
+
 SKIP_EMPTY_SECRETS = True
+SKIP_EMPTY_BUSINESS_TYPE = True
 
 
 def die(msg: str, code: int = 2):
@@ -38,6 +44,7 @@ def build_ban_set(ban_list):
 
 
 ban_set = build_ban_set(BAN_SERVICE_IDS)
+ban_business_set = {" ".join(str(x).replace(",", " ").split()) for x in BAN_BUSINESS_TYPES if " ".join(str(x).replace(",", " ").split())}
 
 
 def clean_spaces(s: str) -> str:
@@ -94,12 +101,6 @@ def parse_kv_metrics_to_df(metrics_text: str) -> pd.DataFrame:
 
 
 def read_sd_map(path: str) -> pd.DataFrame:
-    """
-    SD:
-      B = code
-      D = sd_name
-      H = owner
-    """
     if not path:
         die("SD_FILE не задан")
     if not os.path.exists(path):
@@ -167,6 +168,16 @@ def main():
         else "",
         axis=1,
     )
+
+    if SKIP_EMPTY_BUSINESS_TYPE:
+        out = out[out["business_type"].map(clean_spaces) != ""].copy()
+
+    if ban_business_set:
+        out = out[~out["business_type"].map(clean_spaces).isin(ban_business_set)].copy()
+
+    total = int(out["Кол-во секретов"].sum()) if "Кол-во секретов" in out.columns else int(out["secrets"].sum())
+    if total:
+        out["percent"] = (out["secrets"] / total) * 100
 
     for _, r in out.iterrows():
         log.info(
