@@ -33,6 +33,13 @@ BAN_TEAMS = [
 ]
 
 BAN_SERVICE_IDS = [15473]
+
+BAN_BUSINESS_TYPES = [
+    # "Блок Розничный бизнес",
+]
+
+SKIP_EMPTY_BUSINESS_TYPE = True
+
 EXCLUDE_NO_SERVICE_ID_AT_QUERY = False
 EXTRAPOLATION_DAYS = 90
 
@@ -59,6 +66,7 @@ def build_ban_set(ban_list):
 
 
 ban_service_set = build_ban_set(BAN_SERVICE_IDS)
+ban_business_set = {" ".join(str(x).replace(",", " ").split()) for x in BAN_BUSINESS_TYPES if " ".join(str(x).replace(",", " ").split())}
 
 
 def clean_spaces(s: str) -> str:
@@ -322,6 +330,12 @@ def enrich_with_sd_and_bk(rows, sd_df: pd.DataFrame, bk_map: dict) -> pd.DataFra
         return bk_map.get(normalize_name_key(owner), "") if owner else ""
 
     out["business_type"] = out["owner_for_report"].map(_bt)
+
+    if SKIP_EMPTY_BUSINESS_TYPE:
+        out = out[out["business_type"].map(clean_spaces) != ""].copy()
+
+    if ban_business_set:
+        out = out[~out["business_type"].map(clean_spaces).isin(ban_business_set)].copy()
 
     out = out.rename(
         columns={
