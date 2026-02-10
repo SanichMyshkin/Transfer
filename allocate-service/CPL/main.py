@@ -24,6 +24,11 @@ PASS = os.getenv("PASS")
 
 BAN_SERVICE_IDS = {15473}
 
+BAN_BUSINESS_TYPES = {
+    # "Розница",
+    # "Инвестиции",
+}
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -165,31 +170,55 @@ def fetch_and_aggregate(client: OpenSearch) -> list[dict[str, Any]]:
     return rows
 
 
-def enrich(rows, sd, bk):
+def enrich(
+    rows: list[dict[str, Any]], sd: dict[int, dict[str, str]], bk: dict[str, str]
+) -> list[dict[str, Any]]:
     for r in rows:
         meta = sd.get(r["service_id"], {})
         r["service_name"] = meta.get("service_name", "")
         r["owner"] = meta.get("owner", "")
 
         owner_norm = clean_spaces(r["owner"])
-        r["business_type"] = bk.get(owner_norm, "")
+        r["business_type"] = clean_spaces(bk.get(owner_norm, ""))
 
     return rows
 
 
-def finalize(rows):
-    total_all = sum(r["total_bytes"] for r in rows)
+def apply_business_type_ban(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not BAN_BUSINESS_TYPES:
+        return rows
+
+    kept: list[dict[str, Any]] = []
+    banned = 0
+
+    for r in rows:
+        bt = clean_spaces(r.get("business_type", ""))
+        if bt in BAN_BUSINESS_TYPES:
+            banned += 1
+            log.info(
+                f"BAN_BT | business_type={bt!r} | service_id={r.get('service_id')} "
+                f"service_name={r.get('service_name')!r}"
+            )
+            continue
+        kept.append(r)
+
+    log.info(f"BusinessType banned rows: {banned} (kept {len(kept)})")
+    return kept
+
+
+def finalize(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    total_all = sum(int(r["total_bytes"]) for r in rows)
 
     for r in rows:
         r["size_human"] = humanize_bytes(r["total_bytes"])
         r["pct"] = (r["total_bytes"] / total_all) if total_all else 0
 
     rows.sort(key=lambda x: x["total_bytes"], reverse=True)
-    log.info(f"TOTAL: {humanize_bytes(total_all)}")
+    log.info(f"TOTAL (after business_type ban): {humanize_bytes(total_all)}")
     return rows
 
 
-def write_to_excel(path: str, rows):
+def write_to_excel(path: str, rows: list[dict[str, Any]]):
     wb = Workbook()
     ws = wb.active
     ws.title = "CPL report"
@@ -243,8 +272,10 @@ def main():
     bk = read_bk_map(BK_FILE)
 
     rows = enrich(rows, sd, bk)
-    rows = finalize(rows)
 
+    rows = apply_business_type_ban(rows)
+
+    rows = finalize(rows)
     write_to_excel("CPL_report.xlsx", rows)
 
 
