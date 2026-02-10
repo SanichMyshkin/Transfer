@@ -36,6 +36,12 @@ BAN_SERVICES = [
     "UNAITP",
 ]
 
+BAN_BUSINESS_TYPES = [
+    "Блок банковских технологий",
+]
+
+SKIP_EMPTY_BUSINESS_TYPE = True
+
 EXCLUDE_ZERO_CODES = True
 
 CPU_WEIGHT = 0.40
@@ -272,6 +278,7 @@ def is_zero_code(code: str) -> bool:
 
 
 def collect_rows(gl, projects, sd_people_map, bk_type_map):
+    ban_business_set = {clean_spaces(x) for x in BAN_BUSINESS_TYPES if clean_spaces(x)}
     totals = {}
 
     for p in projects:
@@ -295,6 +302,15 @@ def collect_rows(gl, projects, sd_people_map, bk_type_map):
             log.info(f"[{p.name}] SKIP (ban service): service='{service_for_report}'")
             continue
 
+        owner = sd.get("owner", "") if isinstance(sd, dict) else ""
+        owner_for_report = clean_spaces(owner)
+        business_type = bk_type_map.get(normalize_name_key(owner), "") if owner else ""
+
+        if SKIP_EMPTY_BUSINESS_TYPE and not clean_spaces(business_type):
+            continue
+        if ban_business_set and clean_spaces(business_type) in ban_business_set:
+            continue
+
         files = find_deployment_files(proj)
         log.info(
             f"[p={p.name}] service='{service_for_report}' code='{code}' deployment_files={len(files)}"
@@ -316,13 +332,6 @@ def collect_rows(gl, projects, sd_people_map, bk_type_map):
 
         if cpu_total <= 0 and mem_total <= 0:
             continue
-
-        owner = sd.get("owner", "") if isinstance(sd, dict) else ""
-        owner_for_report = clean_spaces(owner)
-        business_type = (
-            bk_type_map.get(normalize_name_key(owner), "")
-            if owner else ""
-        )
 
         key = (service_for_report, code)
         if key not in totals:

@@ -18,6 +18,12 @@ OUTPUT_XLSX = os.getenv("OUTPUT_XLSX", "zabbix_report.xlsx")
 BAN_SERVICE_IDS = [15473]
 SKIP_EMPTY_SERVICE_ID = True
 
+BAN_BUSINESS_TYPES = [
+    "Блок банковских технологий",
+]
+
+SKIP_EMPTY_BUSINESS_TYPE = True
+
 logger = logging.getLogger("zabbix_report")
 logger.setLevel(logging.INFO)
 handler = logging.StreamHandler()
@@ -66,6 +72,7 @@ def build_ban_set(ban_list):
 
 
 ban_set = build_ban_set(BAN_SERVICE_IDS)
+ban_business_set = {" ".join(str(x).replace(",", " ").split()) for x in BAN_BUSINESS_TYPES if " ".join(str(x).replace(",", " ").split())}
 
 
 def clean_spaces(s: str) -> str:
@@ -235,12 +242,18 @@ def main():
 
     rows = []
     for (service, service_id), cnt in per_service.items():
-        pct = (cnt / matched) * 100 if matched else 0
-
         people = sd_people_map.get(service_id, {"owner": ""})
         owner = people.get("owner", "")
 
         business_type = bk_type_map.get(normalize_name_key(owner), "") if owner else ""
+
+        if SKIP_EMPTY_BUSINESS_TYPE and not clean_spaces(business_type):
+            continue
+
+        if ban_business_set and clean_spaces(business_type) in ban_business_set:
+            continue
+
+        pct = (cnt / matched) * 100 if matched else 0
 
         rows.append(
             {
