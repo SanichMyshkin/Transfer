@@ -50,6 +50,13 @@ session = requests.Session()
 session.verify = False
 
 
+def clean_spaces(s: str) -> str:
+    s = (s or "").strip()
+    s = s.replace(",", " ")
+    s = " ".join(s.split())
+    return s
+
+
 def die(msg: str, code: int = 2):
     logger.error(msg)
     raise SystemExit(code)
@@ -86,13 +93,6 @@ def validate_env_and_files():
         die(f"BK_FILE не найден: {BK_FILE}")
 
     logger.info(f"Бан-лист (КОД): {sorted(ban_set) if ban_set else 'пусто'}")
-
-
-def clean_spaces(s: str) -> str:
-    s = (s or "").strip()
-    s = s.replace(",", " ")
-    s = " ".join(s.split())
-    return s
 
 
 def normalize_name_key(s: str) -> str:

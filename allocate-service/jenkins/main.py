@@ -35,6 +35,10 @@ OUTPUT_XLSX = os.getenv("OUTPUT_XLSX", "jenkins_report.xlsx")
 
 BAN_SERVICE_IDS = [15473]
 
+BAN_BUSINESS_TYPES = ["Розница"]
+
+SKIP_EMPTY_BUSINESS_TYPE = True
+
 SCRIPT_BUILDS = r"""
 import jenkins.model.Jenkins
 import groovy.json.JsonOutput
@@ -165,7 +169,9 @@ def load_bk_business_type_map(path: str):
     df.columns = ["c1", "c2", "c3", "business_type"]
 
     def make_fio(r):
-        fio = " ".join([clean_spaces(r["c2"]), clean_spaces(r["c1"]), clean_spaces(r["c3"])])
+        fio = " ".join(
+            [clean_spaces(r["c2"]), clean_spaces(r["c1"]), clean_spaces(r["c3"])]
+        )
         return clean_spaces(fio)
 
     df["fio_key"] = df.apply(make_fio, axis=1).map(normalize_name_key)
@@ -179,7 +185,9 @@ def load_bk_business_type_map(path: str):
     return mp
 
 
-def aggregate_builds_by_service(data, sd_people_map, bk_type_map, exclude_without_team=True):
+def aggregate_builds_by_service(
+    data, sd_people_map, bk_type_map, exclude_without_team=True
+):
     logger.info("Агрегируем билды по сервису...")
 
     acc = defaultdict(int)
@@ -243,6 +251,10 @@ def aggregate_builds_by_service(data, sd_people_map, bk_type_map, exclude_withou
     logger.info(f"Билдов по учтённым сервисам: {total_builds}")
     logger.info(f"Уникальных сервисов (по КОД) в отчёте: {len(acc)}")
 
+    ban_business_types_set = {
+        clean_spaces(x) for x in BAN_BUSINESS_TYPES if clean_spaces(x)
+    }
+
     rows = []
     for team_number, builds in sorted(acc.items(), key=lambda kv: kv[1], reverse=True):
         people = sd_people_map.get(team_number, {"service_name": "", "owner": ""})
@@ -250,16 +262,27 @@ def aggregate_builds_by_service(data, sd_people_map, bk_type_map, exclude_withou
         owner = people.get("owner", "")
         business_type = bk_type_map.get(normalize_name_key(owner), "") if owner else ""
 
+        if SKIP_EMPTY_BUSINESS_TYPE and not clean_spaces(business_type):
+            continue
+
+        if (
+            ban_business_types_set
+            and clean_spaces(business_type) in ban_business_types_set
+        ):
+            continue
+
         pct = (builds / total_builds * 100.0) if total_builds > 0 else 0.0
 
-        rows.append([
-            business_type,
-            service_name,
-            team_number,
-            owner,
-            builds,
-            round(pct, 2),
-        ])
+        rows.append(
+            [
+                business_type,
+                service_name,
+                team_number,
+                owner,
+                builds,
+                round(pct, 2),
+            ]
+        )
 
     return rows
 
@@ -295,7 +318,9 @@ def export_excel(rows, filename):
             if v is None:
                 continue
             max_len = max(max_len, len(str(v)))
-        ws.column_dimensions[get_column_letter(col_idx)].width = min(max(12, max_len + 2), 60)
+        ws.column_dimensions[get_column_letter(col_idx)].width = min(
+            max(12, max_len + 2), 60
+        )
 
     wb.save(filename)
     logger.info(f"Excel сохранён: {filename}")
