@@ -20,6 +20,12 @@ BAN_SERVICE_CODES = [
     15473,
 ]
 
+BAN_BUSINESS_TYPES = [
+    "Розница",
+]
+
+SKIP_EMPTY_BUSINESS_TYPE = True
+
 
 def clean_spaces(s):
     s = (s or "").strip()
@@ -66,6 +72,7 @@ def build_ban_set(ban_list):
 
 
 BAN_SET = build_ban_set(BAN_SERVICE_CODES)
+BAN_BUSINESS_SET = {clean_spaces(x) for x in BAN_BUSINESS_TYPES if clean_spaces(x)}
 
 
 def read_sd_map(path):
@@ -231,6 +238,12 @@ def main():
         business_type = ""
         if owner:
             business_type = bk_map.get(normalize_name_key(owner), "")
+
+        if SKIP_EMPTY_BUSINESS_TYPE and not clean_spaces(business_type):
+            continue
+
+        if BAN_BUSINESS_SET and clean_spaces(business_type) in BAN_BUSINESS_SET:
+            continue
 
         percent = 0.0
         if grand_total > 0:
