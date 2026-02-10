@@ -24,10 +24,12 @@ PASS = os.getenv("PASS")
 
 BAN_SERVICE_IDS = {15473}
 
-BAN_BUSINESS_TYPES = {
+
+BAN_BUSINESS_TYPES: set[str] = {
     # "Розница",
-    # "Инвестиции",
 }
+
+SKIP_UNKNOWN_SERVICE_IDS: bool = True
 
 logging.basicConfig(
     level=logging.INFO,
@@ -171,7 +173,9 @@ def fetch_and_aggregate(client: OpenSearch) -> list[dict[str, Any]]:
 
 
 def enrich(
-    rows: list[dict[str, Any]], sd: dict[int, dict[str, str]], bk: dict[str, str]
+    rows: list[dict[str, Any]],
+    sd: dict[int, dict[str, str]],
+    bk: dict[str, str],
 ) -> list[dict[str, Any]]:
     for r in rows:
         meta = sd.get(r["service_id"], {})
@@ -182,6 +186,33 @@ def enrich(
         r["business_type"] = clean_spaces(bk.get(owner_norm, ""))
 
     return rows
+
+
+def apply_unknown_service_filter(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    Если SKIP_UNKNOWN_SERVICE_IDS=True, выкидываем:
+      - service_id == 0
+      - сервисы, которых нет в SD (service_name пустой)
+    """
+    if not SKIP_UNKNOWN_SERVICE_IDS:
+        return rows
+
+    kept: list[dict[str, Any]] = []
+    skipped = 0
+
+    for r in rows:
+        service_id = int(r.get("service_id") or 0)
+        if service_id == 0 or not clean_spaces(r.get("service_name", "")):
+            skipped += 1
+            log.info(
+                f"SKIP_UNKNOWN | service_id={service_id} team={r.get('team')} "
+                f"size={int(r.get('total_bytes') or 0)}B"
+            )
+            continue
+        kept.append(r)
+
+    log.info(f"Unknown services skipped: {skipped} (kept {len(kept)})")
+    return kept
 
 
 def apply_business_type_ban(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -214,7 +245,7 @@ def finalize(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         r["pct"] = (r["total_bytes"] / total_all) if total_all else 0
 
     rows.sort(key=lambda x: x["total_bytes"], reverse=True)
-    log.info(f"TOTAL (after business_type ban): {humanize_bytes(total_all)}")
+    log.info(f"TOTAL (after filters): {humanize_bytes(total_all)}")
     return rows
 
 
@@ -272,7 +303,8 @@ def main():
     bk = read_bk_map(BK_FILE)
 
     rows = enrich(rows, sd, bk)
-
+    rows = apply_unknown_service_filter(rows)
+    
     rows = apply_business_type_ban(rows)
 
     rows = finalize(rows)
