@@ -29,9 +29,17 @@ EXCLUDE_ALL_ZERO_NUMBERS = True
 
 BAN_SERVICE_IDS = [15473]
 
+BAN_BUSINESS_TYPES = [
+    "",
+]
+
+SKIP_EMPTY_BUSINESS_TYPE = True
+
 logger = logging.getLogger("grafana_usage_report")
 logger.setLevel(logging.INFO)
-fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S")
+fmt = logging.Formatter(
+    "%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S"
+)
 handler = logging.StreamHandler()
 handler.setFormatter(fmt)
 logger.handlers.clear()
@@ -53,7 +61,14 @@ def build_ban_set(ban_list):
     return {str(x).strip() for x in ban_list if str(x).strip()}
 
 
+def build_ban_business_types_set(ban_list):
+    if not isinstance(ban_list, (list, tuple, set)):
+        die("BAN_BUSINESS_TYPES должен быть list / tuple / set")
+    return {clean_spaces(x) for x in ban_list if clean_spaces(x)}
+
+
 ban_set = build_ban_set(BAN_SERVICE_IDS)
+ban_business_types_set = build_ban_business_types_set(BAN_BUSINESS_TYPES)
 
 
 def validate_env_and_files():
@@ -201,7 +216,9 @@ def load_bk_business_type_map(path: str):
     df.columns = ["c1", "c2", "c3", "business_type"]
 
     def make_fio(r):
-        fio = " ".join([clean_spaces(r["c2"]), clean_spaces(r["c1"]), clean_spaces(r["c3"])])
+        fio = " ".join(
+            [clean_spaces(r["c2"]), clean_spaces(r["c1"]), clean_spaces(r["c3"])]
+        )
         return clean_spaces(fio)
 
     df["fio_key"] = df.apply(make_fio, axis=1).map(normalize_name_key)
@@ -234,7 +251,9 @@ def load_sd_mapping(path):
         if sd_name:
             map_by_name[normalize_name(sd_name)] = payload
 
-    logger.info(f"SD: загружено сервисов по номеру={len(map_by_number)}, по имени={len(map_by_name)}")
+    logger.info(
+        f"SD: загружено сервисов по номеру={len(map_by_number)}, по имени={len(map_by_name)}"
+    )
     return map_by_number, map_by_name
 
 
@@ -281,6 +300,15 @@ def main():
 
         business_type = bk_type_map.get(normalize_name_key(owner), "") if owner else ""
 
+        if SKIP_EMPTY_BUSINESS_TYPE and not clean_spaces(business_type):
+            continue
+
+        if (
+            ban_business_types_set
+            and clean_spaces(business_type) in ban_business_types_set
+        ):
+            continue
+
         if not switch_org(org_id):
             no_access += 1
             logger.warning(
@@ -303,7 +331,7 @@ def main():
             f'сервис="{sd_name if sd_name else org_name}" | '
             f'владелец="{owner or "—"}" | '
             f'тип="{business_type or "—"}" | '
-            f'панелей={panels_total}'
+            f"панелей={panels_total}"
         )
 
         rows_orgs.append(
