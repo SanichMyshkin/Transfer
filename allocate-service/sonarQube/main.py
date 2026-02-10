@@ -15,11 +15,9 @@ load_dotenv()
 
 SONAR_URL = os.getenv("SONAR_URL", "").rstrip("/")
 SONAR2_URL = os.getenv("SONAR2_URL", "").rstrip("/")
-SONAR3_URL = os.getenv("SONAR3_URL", "").rstrip("/")
 
 SONAR_TOKEN = os.getenv("SONAR_TOKEN", "")
 SONAR2_TOKEN = os.getenv("SONAR2_TOKEN", "")
-SONAR3_TOKEN = os.getenv("SONAR3_TOKEN", "")
 
 OUT_FILE = os.getenv("OUT_FILE", "sonarQube_report.xlsx")
 SD_FILE = os.getenv("SD_FILE")
@@ -30,9 +28,7 @@ SKIP_EMPTY_SERVICES = True
 
 BAN_SERVICE_IDS = [15473]
 
-BAN_BUSINESS_TYPES = [
-    "Розничный",
-]
+BAN_BUSINESS_TYPES = []
 
 SKIP_EMPTY_BUSINESS_TYPE = True
 
@@ -286,7 +282,6 @@ def main():
 
     process_sonar(SONAR_URL, SONAR_TOKEN, sd, bk, services)
     process_sonar(SONAR2_URL, SONAR2_TOKEN, sd, bk, services)
-    process_sonar(SONAR3_URL, SONAR3_TOKEN, sd, bk, services)
 
     rows = sorted(services.values(), key=lambda x: x["total_lines"], reverse=True)
     write_xlsx(rows)
