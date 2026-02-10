@@ -30,6 +30,12 @@ SKIP_EMPTY_SERVICES = True
 
 BAN_SERVICE_IDS = [15473]
 
+BAN_BUSINESS_TYPES = [
+    "Розничный",
+]
+
+SKIP_EMPTY_BUSINESS_TYPE = True
+
 
 def die(msg: str):
     logger.error(msg)
@@ -43,6 +49,7 @@ def build_ban_set(v):
 
 
 ban_set = build_ban_set(BAN_SERVICE_IDS)
+ban_business_set = {" ".join(str(x).replace(",", " ").split()) for x in BAN_BUSINESS_TYPES if " ".join(str(x).replace(",", " ").split())}
 
 
 def clean(s):
@@ -189,6 +196,11 @@ def process_sonar(url, token, sd, bk, acc):
         svc = sd_row.get("name") or svc
         owner = sd_row.get("owner") or ""
         bt = pick_bt(bk, sd_row.get("owner") or "")
+
+        if SKIP_EMPTY_BUSINESS_TYPE and not clean(bt):
+            continue
+        if ban_business_set and clean(bt) in ban_business_set:
+            continue
 
         tasks = get_tasks(s, url, key)
         tcnt, lines = 0, 0
