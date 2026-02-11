@@ -71,10 +71,6 @@ def build_ban_set(ban_list):
     return {str(x).strip() for x in ban_list if str(x).strip()}
 
 
-ban_set = build_ban_set(BAN_SERVICE_IDS)
-ban_business_set = {" ".join(str(x).replace(",", " ").split()) for x in BAN_BUSINESS_TYPES if " ".join(str(x).replace(",", " ").split())}
-
-
 def clean_spaces(s: str) -> str:
     s = (s or "").strip()
     s = s.replace(",", " ")
@@ -149,7 +145,10 @@ def load_sd_people_map(path):
     df = df[df["service_id"] != ""].copy()
     last = df.drop_duplicates("service_id", keep="last")
 
-    return {sid: {"owner": o} for sid, o in zip(last["service_id"].tolist(), last["owner"].tolist())}
+    return {
+        sid: {"owner": o}
+        for sid, o in zip(last["service_id"].tolist(), last["owner"].tolist())
+    }
 
 
 def load_bk_business_type_map(path):
@@ -158,7 +157,9 @@ def load_bk_business_type_map(path):
     df.columns = ["c1", "c2", "c3", "business_type"]
 
     def make_fio(r):
-        fio = " ".join([clean_spaces(r["c2"]), clean_spaces(r["c1"]), clean_spaces(r["c3"])])
+        fio = " ".join(
+            [clean_spaces(r["c2"]), clean_spaces(r["c1"]), clean_spaces(r["c3"])]
+        )
         return clean_spaces(fio)
 
     df["fio_key"] = df.apply(make_fio, axis=1).map(normalize_name_key)
@@ -180,6 +181,9 @@ def build_map(df, keys):
 
 def main():
     validate_env_and_files()
+
+    ban_set = build_ban_set(BAN_SERVICE_IDS)
+    ban_business_set = {clean_spaces(x) for x in BAN_BUSINESS_TYPES if clean_spaces(x)}
 
     api = ZabbixAPI(url=ZABBIX_URL)
     try:
@@ -206,6 +210,9 @@ def main():
     ambiguous = 0
     banned_hits = 0
     skipped_empty = 0
+
+    # это хосты, которые дошли до per_service (т.е. после пустых/бана service_id)
+    total_hosts_after_serviceid_filters = 0
 
     for ip, dns in df_hosts[["ip", "dns"]].itertuples(index=False, name=None):
         svc_key = None
@@ -235,32 +242,71 @@ def main():
             continue
 
         matched += 1
+        total_hosts_after_serviceid_filters += 1
+
         if amb:
             ambiguous += 1
 
         per_service[(service, service_id)] = per_service.get((service, service_id), 0) + 1
 
-    rows = []
+    # ===== ВАЖНО: фильтрация business_type ДО расчёта процентов =====
+    candidates = []
+    skipped_empty_bt = 0
+    skipped_ban_bt = 0
+    hosts_skipped_empty_bt = 0
+    hosts_skipped_ban_bt = 0
+
     for (service, service_id), cnt in per_service.items():
         people = sd_people_map.get(service_id, {"owner": ""})
         owner = people.get("owner", "")
 
         business_type = bk_type_map.get(normalize_name_key(owner), "") if owner else ""
+        business_type = clean_spaces(business_type)
 
-        if SKIP_EMPTY_BUSINESS_TYPE and not clean_spaces(business_type):
+        if SKIP_EMPTY_BUSINESS_TYPE and not business_type:
+            skipped_empty_bt += 1
+            hosts_skipped_empty_bt += cnt
             continue
 
-        if ban_business_set and clean_spaces(business_type) in ban_business_set:
+        if ban_business_set and business_type in ban_business_set:
+            skipped_ban_bt += 1
+            hosts_skipped_ban_bt += cnt
             continue
 
-        pct = (cnt / matched) * 100 if matched else 0
-
-        rows.append(
+        candidates.append(
             {
                 "business_type": business_type,
                 "service": service,
                 "service_id": service_id,
                 "owner": owner,
+                "hosts_found": cnt,
+            }
+        )
+
+    eligible_hosts_total = sum(x["hosts_found"] for x in candidates)
+
+    rows = []
+    for x in sorted(candidates, key=lambda d: (d["hosts_found"], d["service"], d["service_id"]), reverse=False):
+        pass  # заглушка, ниже нормальная сортировка
+
+    # сортировка как было: hosts_found desc, service asc, service_id asc
+    candidates_sorted = sorted(
+        candidates,
+        key=lambda d: (d["hosts_found"], d["service"], d["service_id"]),
+        reverse=False,
+    )
+    candidates_sorted = list(reversed(candidates_sorted))
+
+    for x in candidates_sorted:
+        cnt = x["hosts_found"]
+        pct = (cnt / eligible_hosts_total) * 100 if eligible_hosts_total else 0.0
+
+        rows.append(
+            {
+                "business_type": x["business_type"],
+                "service": x["service"],
+                "service_id": x["service_id"],
+                "owner": x["owner"],
                 "hosts_found": cnt,
                 "percent": round(pct, 2),
             }
@@ -284,7 +330,14 @@ def main():
     }
     df_report = df_report.rename(columns=rename_map)
 
-    out_cols = ["Тип бизнеса", "Наименование сервиса", "КОД", "Владелец сервиса", "Кол-во хостов", "% потребления"]
+    out_cols = [
+        "Тип бизнеса",
+        "Наименование сервиса",
+        "КОД",
+        "Владелец сервиса",
+        "Кол-во хостов",
+        "% потребления",
+    ]
     df_report = df_report.reindex(columns=out_cols)
 
     logger.info(f"Активных хостов: {total_active}")
@@ -293,8 +346,14 @@ def main():
         f"({(matched / total_active * 100) if total_active else 0:.2f}%)"
     )
     logger.info(f"Сомнительных совпадений: {ambiguous}")
-    logger.info(f"Скип по бан-листу: {banned_hits}")
+    logger.info(f"Скип по бан-листу (service_id): {banned_hits}")
     logger.info(f"Скип пустых service_id: {skipped_empty}")
+
+    logger.info(f"После фильтров service_id (зачётные хосты): {total_hosts_after_serviceid_filters}")
+    logger.info(f"Скип пустого business_type: {skipped_empty_bt} (hosts: {hosts_skipped_empty_bt})")
+    logger.info(f"Скип бана business_type: {skipped_ban_bt} (hosts: {hosts_skipped_ban_bt})")
+    logger.info(f"Итого хостов для процентов (eligible): {eligible_hosts_total}")
+
     logger.info(f"Сервисов в отчёте: {len(df_report)}")
 
     with pd.ExcelWriter(OUTPUT_XLSX, engine="openpyxl") as writer:
