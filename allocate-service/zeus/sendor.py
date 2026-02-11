@@ -21,13 +21,12 @@ DB_PORT = int(os.getenv("DB_PORT", "5432"))
 DB_NAME = os.getenv("DB_NAME")
 DB_USER = os.getenv("DB_USER")
 DB_PASSWORD = os.getenv("DB_PASSWORD")
-
 SINCE = os.getenv("SINCE", "2026-01-01 00:00:00")
 
 GITLAB_URL = os.getenv("GITLAB_URL", "").rstrip("/")
 TOKEN = os.getenv("TOKEN", "")
 GROUP_ID = os.getenv("GROUP_ID", "").strip()
-GIT_REF = "main"
+GIT_REF = os.getenv("GIT_REF", "main")
 
 
 def get_chat_counts_since(since):
@@ -61,33 +60,33 @@ def get_chat_counts_since(since):
 
 
 def gl_connect():
-    gl = gitlab.Gitlab(GITLAB_URL, private_token=TOKEN, ssl_verify=False)
+    gl = gitlab.Gitlab(GITLAB_URL, private_token=TOKEN, ssl_verify=False, timeout=60)
     gl.auth()
     return gl
 
 
 def extract_chat_ids_from_yaml(text):
     data = yaml.safe_load(text)
+    if not data:
+        return set()
+
+    try:
+        custom = (
+            data["zeus"]["monitoringProperties"]["vars"]["zeusmonitoring"]["custom"]
+        )
+    except Exception:
+        return set()
+
     result = set()
 
-    if not data:
-        return result
+    test_telegram = custom.get("testTelegram")
+    if isinstance(test_telegram, list):
+        for item in test_telegram:
+            if isinstance(item, dict) and "chatId" in item:
+                v = item["chatId"]
+                if v is not None:
+                    result.add(str(v))
 
-    def walk(obj):
-        if isinstance(obj, dict):
-            if "chatId" in obj:
-                v = obj["chatId"]
-                if isinstance(v, str) and v.lstrip("-").isdigit():
-                    result.add(int(v))
-                elif isinstance(v, int):
-                    result.add(v)
-            for v in obj.values():
-                walk(v)
-        elif isinstance(obj, list):
-            for item in obj:
-                walk(item)
-
-    walk(data)
     return result
 
 
@@ -118,6 +117,8 @@ def get_gitlab_chat_ids(gl):
                 f = proj.files.get(file_path=item["path"], ref=GIT_REF)
                 text = f.decode().decode("utf-8")
                 chat_ids = extract_chat_ids_from_yaml(text)
+                if chat_ids:
+                    log.info(f"[{proj.path_with_namespace}] {item['path']} -> {len(chat_ids)} chatId")
                 all_chat_ids.update(chat_ids)
             except Exception:
                 continue
