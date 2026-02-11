@@ -15,7 +15,9 @@ from confluence_names import confluence_table_as_dicts, repo_to_service_map
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+# если True — репы без кода выкидываем (агрегация ТОЛЬКО по коду)
 SKIP_EMPTY_SERVICE = True
+
 BAN_SERVICE_CODES = [
     15473,
 ]
@@ -203,6 +205,7 @@ def main():
     totals = {}
     hosted_total = 0
     skipped_no_service = 0
+    skipped_no_code = 0
     skipped_ban_service_code = 0
 
     for r in repo_data:
@@ -218,22 +221,34 @@ def main():
         if SKIP_EMPTY_SERVICE and (not base_name):
             skipped_no_service += 1
             continue
+        
+        if not code:
+            skipped_no_code += 1
+            continue
 
-        if code and code in BAN_SET:
+        if code in BAN_SET:
             skipped_ban_service_code += 1
             continue
 
         size_bytes = to_int_bytes(repo_sizes.get(repo_name))
-        key = (base_name, code)
-        totals[key] = totals.get(key, 0) + size_bytes
 
-    # ===== ВАЖНО: grand_total считаем ПОСЛЕ фильтрации по business_type =====
+        if code not in totals:
+            totals[code] = {"size_bytes": 0, "base_name": base_name}
+        totals[code]["size_bytes"] += size_bytes
+
+        # на всякий: если в confluence разные base_name для одного code, оставим более длинное
+        if base_name and len(base_name) > len(totals[code]["base_name"] or ""):
+            totals[code]["base_name"] = base_name
+
     candidates = []
     skipped_empty_business_type = 0
     skipped_ban_business_type = 0
 
-    for (base_name, code), size_bytes in totals.items():
-        sd = sd_map.get(code, {}) if code else {}
+    for code, v in totals.items():
+        size_bytes = v["size_bytes"]
+        base_name = v["base_name"]
+
+        sd = sd_map.get(code, {})
         service_name = sd.get("sd_name") or base_name
         owner = sd.get("owner") or ""
 
@@ -285,6 +300,7 @@ def main():
 
     logging.info(f"hosted repos: {hosted_total}")
     logging.info(f"skipped without service: {skipped_no_service}")
+    logging.info(f"skipped without code: {skipped_no_code}")
     logging.info(f"skipped by service code ban: {skipped_ban_service_code}")
     logging.info(f"skipped empty business type: {skipped_empty_business_type}")
     logging.info(f"skipped by business type ban: {skipped_ban_business_type}")
