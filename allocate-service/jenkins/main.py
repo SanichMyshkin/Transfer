@@ -34,9 +34,7 @@ BK_FILE = os.getenv("BK_FILE", "bk_all_users.xlsx")
 OUTPUT_XLSX = os.getenv("OUTPUT_XLSX", "jenkins_report.xlsx")
 
 BAN_SERVICE_IDS = [15473]
-
-BAN_BUSINESS_TYPES = ["Розница"]
-
+BAN_BUSINESS_TYPES = ["Блок банковских технологий"]
 SKIP_EMPTY_BUSINESS_TYPE = True
 
 SCRIPT_BUILDS = r"""
@@ -192,93 +190,79 @@ def aggregate_builds_by_service(
 
     acc = defaultdict(int)
 
-    skipped_folder = 0
-    skipped_empty_name = 0
-    skipped_empty_root = 0
-    skipped_no_team = 0
-    skipped_banned = 0
-
-    total_jobs_seen = 0
-    total_builds_seen = 0
-    total_builds_banned = 0
-
     for j in data.get("jobs", []) or []:
-        total_jobs_seen += 1
-
         if j.get("isFolder"):
-            skipped_folder += 1
             continue
 
         full_name = (j.get("name") or "").strip()
         if not full_name:
-            skipped_empty_name += 1
             continue
 
         root = full_name.split("/", 1)[0].strip()
         if not root:
-            skipped_empty_root += 1
             continue
 
         _, team_number = split_project_and_team(root)
 
         if exclude_without_team and not team_number:
-            skipped_no_team += 1
             continue
 
         builds = int(j.get("buildCount") or 0)
-        total_builds_seen += builds
 
         if team_number in ban_set:
-            skipped_banned += 1
-            total_builds_banned += builds
             continue
 
         acc[team_number] += builds
-
-    total_builds = sum(acc.values())
-
-    logger.info(
-        "Статистика джоб: всего=%d, папки=%d, пустое_имя=%d, пустой_root=%d, без_кода=%d, бан=%d",
-        total_jobs_seen,
-        skipped_folder,
-        skipped_empty_name,
-        skipped_empty_root,
-        skipped_no_team,
-        skipped_banned,
-    )
-    logger.info(f"buildCount total seen: {total_builds_seen}")
-    logger.info(f"buildCount выкинули баном: {total_builds_banned}")
-    logger.info(f"Билдов по учтённым сервисам: {total_builds}")
-    logger.info(f"Уникальных сервисов (по КОД) в отчёте: {len(acc)}")
 
     ban_business_types_set = {
         clean_spaces(x) for x in BAN_BUSINESS_TYPES if clean_spaces(x)
     }
 
-    rows = []
-    for team_number, builds in sorted(acc.items(), key=lambda kv: kv[1], reverse=True):
+    candidates = []
+
+    for team_number, builds in acc.items():
         people = sd_people_map.get(team_number, {"service_name": "", "owner": ""})
         service_name = people.get("service_name", "")
         owner = people.get("owner", "")
-        business_type = bk_type_map.get(normalize_name_key(owner), "") if owner else ""
 
-        if SKIP_EMPTY_BUSINESS_TYPE and not clean_spaces(business_type):
+        business_type = (
+            bk_type_map.get(normalize_name_key(owner), "") if owner else ""
+        )
+        business_type = clean_spaces(business_type)
+
+        if SKIP_EMPTY_BUSINESS_TYPE and not business_type:
             continue
 
-        if (
-            ban_business_types_set
-            and clean_spaces(business_type) in ban_business_types_set
-        ):
+        if ban_business_types_set and business_type in ban_business_types_set:
             continue
 
-        pct = (builds / total_builds * 100.0) if total_builds > 0 else 0.0
+        candidates.append(
+            {
+                "business_type": business_type,
+                "service_name": service_name,
+                "team_number": team_number,
+                "owner": owner,
+                "builds": builds,
+            }
+        )
+
+    eligible_total_builds = sum(x["builds"] for x in candidates)
+
+    rows = []
+    for x in sorted(candidates, key=lambda d: d["builds"], reverse=True):
+        builds = x["builds"]
+        pct = (
+            (builds / eligible_total_builds * 100.0)
+            if eligible_total_builds > 0
+            else 0.0
+        )
 
         rows.append(
             [
-                business_type,
-                service_name,
-                team_number,
-                owner,
+                x["business_type"],
+                x["service_name"],
+                x["team_number"],
+                x["owner"],
                 builds,
                 round(pct, 2),
             ]
