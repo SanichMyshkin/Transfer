@@ -71,15 +71,12 @@ def extract_chat_ids_from_yaml(text):
         return set()
 
     try:
-        custom = (
-            data["zeus"]["monitoringProperties"]["vars"]["zeusmonitoring"]["custom"]
-        )
+        custom = data["zeus"]["monitoringProperties"]["vars"]["zeusmonitoring"]["custom"]
+        test_telegram = custom.get("testTelegram")
     except Exception:
         return set()
 
     result = set()
-
-    test_telegram = custom.get("testTelegram")
     if isinstance(test_telegram, list):
         for item in test_telegram:
             if isinstance(item, dict) and "chatId" in item:
@@ -101,17 +98,23 @@ def get_gitlab_chat_ids(gl):
         log.info(f"Обрабатываем проект: {proj.path_with_namespace}")
 
         try:
-            tree = proj.repository_tree(all=True)
-        except Exception:
+            # ВАЖНО: recursive=True, иначе видишь только корень репы
+            tree = proj.repository_tree(ref=GIT_REF, recursive=True, all=True)
+        except Exception as e:
+            log.warning(f"[{proj.path_with_namespace}] repository_tree error: {e}")
             continue
 
+        found_files = 0
+
         for item in tree:
-            if item["type"] != "blob":
+            if item.get("type") != "blob":
                 continue
 
-            name = item["name"].lower()
+            name = (item.get("name") or "").lower()
             if not (name.endswith("-monitors.yml") or name.endswith("-monitors.yaml")):
                 continue
+
+            found_files += 1
 
             try:
                 f = proj.files.get(file_path=item["path"], ref=GIT_REF)
@@ -120,8 +123,11 @@ def get_gitlab_chat_ids(gl):
                 if chat_ids:
                     log.info(f"[{proj.path_with_namespace}] {item['path']} -> {len(chat_ids)} chatId")
                 all_chat_ids.update(chat_ids)
-            except Exception:
+            except Exception as e:
+                log.warning(f"[{proj.path_with_namespace}] read {item['path']} error: {e}")
                 continue
+
+        log.info(f"[{proj.path_with_namespace}] monitors-файлов найдено: {found_files}")
 
     log.info(f"Найдено chatId в GitLab: {len(all_chat_ids)}")
     return all_chat_ids
@@ -129,7 +135,6 @@ def get_gitlab_chat_ids(gl):
 
 def main():
     get_chat_counts_since(SINCE)
-
     gl = gl_connect()
     get_gitlab_chat_ids(gl)
 
