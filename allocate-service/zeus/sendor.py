@@ -1,13 +1,13 @@
 import os
 import logging
-from typing import Any, Dict, Iterable, List, Set, Tuple
-
 from dotenv import load_dotenv
 import psycopg2
 import gitlab
 import yaml
+import urllib3
 
 load_dotenv()
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -27,18 +27,10 @@ SINCE = os.getenv("SINCE", "2026-01-01 00:00:00")
 GITLAB_URL = os.getenv("GITLAB_URL", "").rstrip("/")
 TOKEN = os.getenv("TOKEN", "")
 GROUP_ID = os.getenv("GROUP_ID", "").strip()
-GIT_REF = os.getenv("GIT_REF", "main")
+GIT_REF = "main"
 
 
-def get_chat_counts_since(since: str) -> List[Tuple[int, int]]:
-    sql = """
-        select chat_id, count(*)
-        from sender.telegram_events_history
-        where created >= %s
-        group by chat_id
-        order by count(*) desc
-    """
-
+def get_chat_counts_since(since):
     conn = psycopg2.connect(
         host=DB_HOST,
         port=DB_PORT,
@@ -46,212 +38,108 @@ def get_chat_counts_since(since: str) -> List[Tuple[int, int]]:
         user=DB_USER,
         password=DB_PASSWORD,
     )
-    conn.autocommit = False
-    conn.set_session(readonly=True, isolation_level="REPEATABLE READ")
+    conn.set_session(readonly=True)
 
     try:
         with conn:
             with conn.cursor() as cur:
-                log.info(f"DB: подключено к {DB_HOST}:{DB_PORT}/{DB_NAME}")
-                cur.execute(sql, (since,))
+                log.info("DB подключено")
+                cur.execute(
+                    """
+                    select chat_id, count(*)
+                    from sender.telegram_events_history
+                    where created >= %s
+                    group by chat_id
+                    """,
+                    (since,),
+                )
                 rows = cur.fetchall()
-                log.info(f"DB: получено строк {len(rows)}")
+                log.info(f"Получено {len(rows)} chat_id из БД")
                 return rows
     finally:
         conn.close()
-        log.info("DB: соединение закрыто")
 
 
-def gl_connect() -> gitlab.Gitlab:
-    log.info("GitLab: подключаемся...")
-    gl = gitlab.Gitlab(GITLAB_URL, private_token=TOKEN, ssl_verify=False, timeout=60)
+def gl_connect():
+    gl = gitlab.Gitlab(GITLAB_URL, private_token=TOKEN, ssl_verify=False)
     gl.auth()
-    log.info("GitLab: ok")
     return gl
 
 
-def get_group_projects(gl: gitlab.Gitlab):
-    log.info(
-        f"GitLab: получаем проекты группы GROUP_ID={GROUP_ID} (включая сабгруппы)..."
-    )
+def extract_chat_ids_from_yaml(text):
+    data = yaml.safe_load(text)
+    result = set()
+
+    if not data:
+        return result
+
+    def walk(obj):
+        if isinstance(obj, dict):
+            if "chatId" in obj:
+                v = obj["chatId"]
+                if isinstance(v, str) and v.lstrip("-").isdigit():
+                    result.add(int(v))
+                elif isinstance(v, int):
+                    result.add(v)
+            for v in obj.values():
+                walk(v)
+        elif isinstance(obj, list):
+            for item in obj:
+                walk(item)
+
+    walk(data)
+    return result
+
+
+def get_gitlab_chat_ids(gl):
     group = gl.groups.get(GROUP_ID)
-    projs = group.projects.list(all=True, include_subgroups=True)
-    log.info(f"GitLab: проектов найдено: {len(projs)}")
-    return projs
+    projects = group.projects.list(all=True, include_subgroups=True)
 
+    all_chat_ids = set()
 
-def repo_tree(proj, path: str | None = None):
-    if path:
-        return proj.repository_tree(path=path, all=True)
-    return proj.repository_tree(all=True)
+    for p in projects:
+        proj = gl.projects.get(p.id)
+        log.info(f"Обрабатываем проект: {proj.path_with_namespace}")
 
-
-def get_file_text(proj, file_path: str, ref: str) -> str:
-    f = proj.files.get(file_path=file_path, ref=ref)
-    return f.decode().decode("utf-8")
-
-
-def find_zeus_dirs(root_items: List[Dict[str, Any]]) -> List[str]:
-    return [
-        i["path"]
-        for i in root_items
-        if i.get("type") == "tree" and (i.get("name") or "").startswith("zeus-")
-    ]
-
-
-def find_monitor_files_in_zeus(proj) -> List[str]:
-    try:
-        root = repo_tree(proj)
-    except Exception as e:
-        log.warning(f"[{proj.path_with_namespace}] repository_tree error: {e}")
-        return []
-
-    zeus_dirs = find_zeus_dirs(root)
-    if not zeus_dirs:
-        return []
-
-    files: List[str] = []
-    for zeus_dir in zeus_dirs:
         try:
-            zeus_items = repo_tree(proj, zeus_dir)
-        except Exception as e:
-            log.warning(f"[{proj.path_with_namespace}] tree({zeus_dir}) error: {e}")
+            tree = proj.repository_tree(all=True)
+        except Exception:
             continue
 
-        subfolders = [i for i in zeus_items if i.get("type") == "tree"]
-
-        for sub in subfolders:
-            sub_path = sub["path"]
-            try:
-                sub_items = repo_tree(proj, sub_path)
-            except Exception as e:
-                log.warning(f"[{proj.path_with_namespace}] tree({sub_path}) error: {e}")
+        for item in tree:
+            if item["type"] != "blob":
                 continue
 
-            for f in sub_items:
-                if f.get("type") != "blob":
-                    continue
-                name = (f.get("name") or "").lower()
-                # как ты просил: именно *-monitors.yml/yaml
-                if name.endswith("-monitors.yml") or name.endswith("-monitors.yaml"):
-                    files.append(f["path"])
+            name = item["name"].lower()
+            if not (name.endswith("-monitors.yml") or name.endswith("-monitors.yaml")):
+                continue
 
-    return files
-
-
-def iter_chat_ids_from_obj(obj: Any) -> Iterable[int]:
-    if obj is None:
-        return
-
-    if isinstance(obj, dict):
-        for k in ("chatId", "chat_id", "chatID", "chatid"):
-            if k in obj:
-                v = obj.get(k)
-                for x in iter_chat_ids_from_obj(v):
-                    yield x
-
-        for v in obj.values():
-            for x in iter_chat_ids_from_obj(v):
-                yield x
-
-    elif isinstance(obj, list):
-        for item in obj:
-            for x in iter_chat_ids_from_obj(item):
-                yield x
-
-    elif isinstance(obj, int):
-        yield obj
-
-    elif isinstance(obj, str):
-        s = obj.strip()
-        # иногда могут быть кавычки/пробелы
-        if s.lstrip("-").isdigit():
             try:
-                yield int(s)
+                f = proj.files.get(file_path=item["path"], ref=GIT_REF)
+                text = f.decode().decode("utf-8")
+                chat_ids = extract_chat_ids_from_yaml(text)
+                all_chat_ids.update(chat_ids)
             except Exception:
-                return
-
-
-def extract_chat_ids_from_yaml_text(text: str) -> Set[int]:
-    try:
-        data = yaml.safe_load(text)
-    except Exception:
-        return set()
-
-    chat_ids: Set[int] = set()
-    for cid in iter_chat_ids_from_obj(data):
-        chat_ids.add(cid)
-    return chat_ids
-
-
-def get_cipher_chats(gl: gitlab.Gitlab) -> Dict[int, List[str]]:
-    projs = get_group_projects(gl)
-
-    chat_sources: Dict[int, List[str]] = {}
-
-    for p in projs:
-        try:
-            proj = gl.projects.get(p.id)
-        except Exception as e:
-            log.warning(
-                f"[{getattr(p, 'path_with_namespace', p.id)}] project.get error: {e}"
-            )
-            continue
-
-        files = find_monitor_files_in_zeus(proj)
-        if not files:
-            continue
-
-        for fp in files:
-            try:
-                txt = get_file_text(proj, fp, GIT_REF)
-            except Exception as e:
-                log.warning(f"[{proj.path_with_namespace}] read {fp} error: {e}")
                 continue
 
-            cids = extract_chat_ids_from_yaml_text(txt)
-            if not cids:
-                continue
-
-            src = f"{proj.path_with_namespace}:{fp}"
-            for cid in cids:
-                chat_sources.setdefault(cid, []).append(src)
-
-    log.info(f"GitLab: уникальных chat_id в monitors-файлах: {len(chat_sources)}")
-    return chat_sources
+    log.info(f"Уникальных chat_id в GitLab: {len(all_chat_ids)}")
+    return all_chat_ids
 
 
 def main():
-    db_counts = get_chat_counts_since(SINCE)
-    db_chat_ids = {cid for cid, _ in db_counts}
+    db_rows = get_chat_counts_since(SINCE)
+    db_chat_ids = {cid for cid, _ in db_rows}
 
     gl = gl_connect()
-    cfg_sources = get_cipher_chats(gl)
-    cfg_chat_ids = set(cfg_sources.keys())
+    gitlab_chat_ids = get_gitlab_chat_ids(gl)
 
-    only_in_db = sorted(db_chat_ids - cfg_chat_ids)
-    only_in_cfg = sorted(cfg_chat_ids - db_chat_ids)
-    in_both = sorted(db_chat_ids & cfg_chat_ids)
+    only_in_db = db_chat_ids - gitlab_chat_ids
+    only_in_git = gitlab_chat_ids - db_chat_ids
+    in_both = db_chat_ids & gitlab_chat_ids
 
-    log.info(f"RESULT: chat_id только в БД (после {SINCE}): {len(only_in_db)}")
-    log.info(f"RESULT: chat_id только в конфигах: {len(only_in_cfg)}")
-    log.info(f"RESULT: chat_id и в БД и в конфигах: {len(in_both)}")
-
-    log.info("TOP DB chat_id by count:")
-    for cid, cnt in db_counts[:20]:
-        tag = []
-        if cid in cfg_sources:
-            tag.append("in_cfg")
-        log.info(f"  {cid}: {cnt}" + (f" ({', '.join(tag)})" if tag else ""))
-
-    if in_both:
-        sample = in_both[:20]
-        log.info("SOURCES for first chats that are in both:")
-        for cid in sample:
-            srcs = cfg_sources.get(cid, [])
-            log.info(f"  {cid}:")
-            for s in srcs[:10]:
-                log.info(f"    - {s}")
+    log.info(f"Только в БД: {len(only_in_db)}")
+    log.info(f"Только в GitLab: {len(only_in_git)}")
+    log.info(f"И там и там: {len(in_both)}")
 
 
 if __name__ == "__main__":
