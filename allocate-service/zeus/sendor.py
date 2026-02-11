@@ -122,24 +122,15 @@ def get_gitlab_chat_ids(gl):
             except Exception:
                 continue
 
-    log.info(f"Уникальных chat_id в GitLab: {len(all_chat_ids)}")
+    log.info(f"Найдено chatId в GitLab: {len(all_chat_ids)}")
     return all_chat_ids
 
 
 def main():
-    db_rows = get_chat_counts_since(SINCE)
-    db_chat_ids = {cid for cid, _ in db_rows}
+    get_chat_counts_since(SINCE)
 
     gl = gl_connect()
-    gitlab_chat_ids = get_gitlab_chat_ids(gl)
-
-    only_in_db = db_chat_ids - gitlab_chat_ids
-    only_in_git = gitlab_chat_ids - db_chat_ids
-    in_both = db_chat_ids & gitlab_chat_ids
-
-    log.info(f"Только в БД: {len(only_in_db)}")
-    log.info(f"Только в GitLab: {len(only_in_git)}")
-    log.info(f"И там и там: {len(in_both)}")
+    get_gitlab_chat_ids(gl)
 
 
 if __name__ == "__main__":
