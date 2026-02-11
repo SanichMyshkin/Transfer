@@ -21,7 +21,7 @@ BAN_SERVICE_CODES = [
 ]
 
 BAN_BUSINESS_TYPES = [
-    "Розница",
+    "Блок банковских технологий",
 ]
 
 SKIP_EMPTY_BUSINESS_TYPE = True
@@ -203,7 +203,7 @@ def main():
     totals = {}
     hosted_total = 0
     skipped_no_service = 0
-    skipped_ban = 0
+    skipped_ban_service_code = 0
 
     for r in repo_data:
         if (r.get("repository_type") or "").strip().lower() != "hosted":
@@ -220,16 +220,18 @@ def main():
             continue
 
         if code and code in BAN_SET:
-            skipped_ban += 1
+            skipped_ban_service_code += 1
             continue
 
         size_bytes = to_int_bytes(repo_sizes.get(repo_name))
         key = (base_name, code)
         totals[key] = totals.get(key, 0) + size_bytes
 
-    grand_total = sum(totals.values())
+    # ===== ВАЖНО: grand_total считаем ПОСЛЕ фильтрации по business_type =====
+    candidates = []
+    skipped_empty_business_type = 0
+    skipped_ban_business_type = 0
 
-    rows = []
     for (base_name, code), size_bytes in totals.items():
         sd = sd_map.get(code, {}) if code else {}
         service_name = sd.get("sd_name") or base_name
@@ -238,23 +240,41 @@ def main():
         business_type = ""
         if owner:
             business_type = bk_map.get(normalize_name_key(owner), "")
+        business_type = clean_spaces(business_type)
 
-        if SKIP_EMPTY_BUSINESS_TYPE and not clean_spaces(business_type):
+        if SKIP_EMPTY_BUSINESS_TYPE and not business_type:
+            skipped_empty_business_type += 1
             continue
 
-        if BAN_BUSINESS_SET and clean_spaces(business_type) in BAN_BUSINESS_SET:
+        if BAN_BUSINESS_SET and business_type in BAN_BUSINESS_SET:
+            skipped_ban_business_type += 1
             continue
 
-        percent = 0.0
-        if grand_total > 0:
-            percent = (size_bytes / grand_total) * 100.0
-
-        rows.append(
+        candidates.append(
             {
                 "business_type": business_type,
                 "service_name": service_name,
                 "code": code,
                 "owner": owner,
+                "size_bytes": size_bytes,
+            }
+        )
+
+    eligible_total = sum(x["size_bytes"] for x in candidates)
+
+    rows = []
+    for x in candidates:
+        size_bytes = x["size_bytes"]
+        percent = 0.0
+        if eligible_total > 0:
+            percent = (size_bytes / eligible_total) * 100.0
+
+        rows.append(
+            {
+                "business_type": x["business_type"],
+                "service_name": x["service_name"],
+                "code": x["code"],
+                "owner": x["owner"],
                 "size_bytes": size_bytes,
                 "size_human": format_size(size_bytes, binary=True),
                 "percent": round(percent, 4),
@@ -265,8 +285,11 @@ def main():
 
     logging.info(f"hosted repos: {hosted_total}")
     logging.info(f"skipped without service: {skipped_no_service}")
-    logging.info(f"skipped by ban: {skipped_ban}")
+    logging.info(f"skipped by service code ban: {skipped_ban_service_code}")
+    logging.info(f"skipped empty business type: {skipped_empty_business_type}")
+    logging.info(f"skipped by business type ban: {skipped_ban_business_type}")
     logging.info(f"services in report: {len(rows)}")
+    logging.info(f"eligible_total: {format_size(eligible_total, binary=True)}")
     logging.info(f"write excel: {out_file}")
 
     write_excel(out_file, rows)
