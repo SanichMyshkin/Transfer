@@ -65,14 +65,37 @@ def gl_connect():
     return gl
 
 
-def extract_chat_ids_from_yaml(text):
-    data = yaml.safe_load(text)
+def normalize_cipher_value(v):
+    s = str(v or "").strip()
+    if not s.startswith("{cipher}"):
+        return ""
+    s = s[len("{cipher}") :].strip()
+    if not s:
+        return ""
+    hex_only = True
+    for ch in s:
+        if ch not in "0123456789abcdefABCDEF":
+            hex_only = False
+            break
+    if not hex_only:
+        return ""
+    return s.lower()
+
+
+def extract_cipher_hashes_from_yaml(text):
+    try:
+        data = yaml.safe_load(text)
+    except Exception:
+        return set()
     if not data:
         return set()
 
     try:
-        custom = data["zeus"]["monitoringProperties"]["vars"]["zeusmonitoring"]["custom"]
-        test_telegram = custom.get("testTelegram")
+        test_telegram = (
+            data["zeus"]["monitoringProperties"]["vars"]["zeusmonitoring"]["custom"].get(
+                "testTelegram"
+            )
+        )
     except Exception:
         return set()
 
@@ -80,25 +103,23 @@ def extract_chat_ids_from_yaml(text):
     if isinstance(test_telegram, list):
         for item in test_telegram:
             if isinstance(item, dict) and "chatId" in item:
-                v = item["chatId"]
-                if v is not None:
-                    result.add(str(v))
-
+                h = normalize_cipher_value(item.get("chatId"))
+                if h:
+                    result.add(h)
     return result
 
 
-def get_gitlab_chat_ids(gl):
+def get_gitlab_cipher_map(gl):
     group = gl.groups.get(GROUP_ID)
     projects = group.projects.list(all=True, include_subgroups=True)
 
-    all_chat_ids = set()
+    cipher_map = {}
 
     for p in projects:
         proj = gl.projects.get(p.id)
         log.info(f"Обрабатываем проект: {proj.path_with_namespace}")
 
         try:
-            # ВАЖНО: recursive=True, иначе видишь только корень репы
             tree = proj.repository_tree(ref=GIT_REF, recursive=True, all=True)
         except Exception as e:
             log.warning(f"[{proj.path_with_namespace}] repository_tree error: {e}")
@@ -119,24 +140,36 @@ def get_gitlab_chat_ids(gl):
             try:
                 f = proj.files.get(file_path=item["path"], ref=GIT_REF)
                 text = f.decode().decode("utf-8")
-                chat_ids = extract_chat_ids_from_yaml(text)
-                if chat_ids:
-                    log.info(f"[{proj.path_with_namespace}] {item['path']} -> {len(chat_ids)} chatId")
-                all_chat_ids.update(chat_ids)
+                hashes = extract_cipher_hashes_from_yaml(text)
+                if hashes:
+                    log.info(
+                        f"[{proj.path_with_namespace}] {item['path']} -> {len(hashes)}"
+                    )
+                for h in hashes:
+                    cipher_map.setdefault(h, set()).add(proj.path_with_namespace)
             except Exception as e:
-                log.warning(f"[{proj.path_with_namespace}] read {item['path']} error: {e}")
+                log.warning(
+                    f"[{proj.path_with_namespace}] read {item['path']} error: {e}"
+                )
                 continue
 
         log.info(f"[{proj.path_with_namespace}] monitors-файлов найдено: {found_files}")
 
-    log.info(f"Найдено chatId в GitLab: {len(all_chat_ids)}")
-    return all_chat_ids
+    out = {}
+    for h, projs in cipher_map.items():
+        out[h] = sorted(projs)
+    return out
 
 
 def main():
     get_chat_counts_since(SINCE)
     gl = gl_connect()
-    get_gitlab_chat_ids(gl)
+    cipher_map = get_gitlab_cipher_map(gl)
+
+    for h in sorted(cipher_map.keys()):
+        print(h)
+        for p in cipher_map[h]:
+            print(f"  {p}")
 
 
 if __name__ == "__main__":
