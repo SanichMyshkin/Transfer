@@ -115,17 +115,22 @@ def parse_yaml_with_heal(text, project, path):
     try:
         return yaml.safe_load(text)
     except yaml.YAMLError as e:
-        log.warning(f"[{project}] {path} -> YAML parse error: {e}")
+        log.error(f"[{project}] {path} -> YAML PARSE ERROR: {type(e).__name__}: {e}")
+        snippet = text[:500].replace("\n", "\\n")
+        log.error(f"[{project}] {path} -> YAML SNIPPET (first 500 chars): {snippet}")
+
         healed = text.replace("\t", "  ")
         try:
             data = yaml.safe_load(healed)
-            log.warning(f"[{project}] {path} -> YAML healed")
+            log.warning(f"[{project}] {path} -> YAML healed (TAB->spaces)")
             return data
         except yaml.YAMLError as e2:
-            log.error(f"[{project}] {path} -> YAML heal failed: {e2}")
+            log.error(
+                f"[{project}] {path} -> YAML HEAL FAILED: {type(e2).__name__}: {e2}"
+            )
             return None
     except Exception as e:
-        log.error(f"[{project}] {path} -> YAML parse error: {e}")
+        log.error(f"[{project}] {path} -> YAML UNKNOWN ERROR: {type(e).__name__}: {e}")
         return None
 
 
