@@ -29,83 +29,69 @@ GROUP_ID = os.getenv("GROUP_ID", "").strip()
 GIT_REF = os.getenv("GIT_REF", "main")
 
 
-def get_chat_counts_since(since):
-    conn = psycopg2.connect(
-        host=DB_HOST,
-        port=DB_PORT,
-        dbname=DB_NAME,
-        user=DB_USER,
-        password=DB_PASSWORD,
-    )
-    conn.set_session(readonly=True)
-
-    try:
-        with conn:
-            with conn.cursor() as cur:
-                log.info("DB подключено")
-                cur.execute(
-                    """
-                    select chat_id, count(*)
-                    from sender.telegram_events_history
-                    where created >= %s
-                    group by chat_id
-                    """,
-                    (since,),
-                )
-                rows = cur.fetchall()
-                log.info(f"Получено {len(rows)} chat_id из БД")
-                return rows
-    finally:
-        conn.close()
-
-
 def gl_connect():
     gl = gitlab.Gitlab(GITLAB_URL, private_token=TOKEN, ssl_verify=False, timeout=60)
     gl.auth()
     return gl
 
 
-def normalize_cipher_value(v):
+def normalize_cipher_value(v, project, path):
     s = str(v or "").strip()
+
     if not s.startswith("{cipher}"):
+        log.error(f"[{project}] {path} -> chatId без {{cipher}}: {s}")
         return ""
+
     s = s[len("{cipher}") :].strip()
+
     if not s:
+        log.error(f"[{project}] {path} -> пустой hash")
         return ""
-    hex_only = True
+
     for ch in s:
         if ch not in "0123456789abcdefABCDEF":
-            hex_only = False
-            break
-    if not hex_only:
-        return ""
+            log.error(f"[{project}] {path} -> не hex значение: {s}")
+            return ""
+
     return s.lower()
 
 
-def extract_cipher_hashes_from_yaml(text):
+def extract_cipher_hashes_from_yaml(text, project, path):
     try:
         data = yaml.safe_load(text)
-    except Exception:
-        return set()
-    if not data:
+    except Exception as e:
+        log.error(f"[{project}] YAML parse error в {path}: {e}")
         return set()
 
     try:
         test_telegram = (
-            data["zeus"]["monitoringProperties"]["vars"]["zeusmonitoring"]["custom"].get(
+            data["zeus"]["monitoringProperties"]["vars"]["zeusmonitoring"]["custom"][
                 "testTelegram"
-            )
+            ]
         )
     except Exception:
+        log.error(f"[{project}] неправильная структура YAML в {path}")
         return set()
 
     result = set()
-    if isinstance(test_telegram, list):
-        for item in test_telegram:
-            if isinstance(item, dict) and "chatId" in item:
-                h = normalize_cipher_value(item.get("chatId"))
-                if h:
-                    result.add(h)
+
+    if not isinstance(test_telegram, list):
+        log.error(f"[{project}] testTelegram не список в {path}")
+        return set()
+
+    for item in test_telegram:
+        if not isinstance(item, dict):
+            log.error(f"[{project}] testTelegram элемент не dict в {path}")
+            continue
+
+        if "chatId" not in item:
+            log.error(f"[{project}] нет chatId в {path}")
+            continue
+
+        h = normalize_cipher_value(item["chatId"], project, path)
+        if h:
+            result.add(h)
+
     return result
 
 
@@ -122,10 +108,8 @@ def get_gitlab_cipher_map(gl):
         try:
             tree = proj.repository_tree(ref=GIT_REF, recursive=True, all=True)
         except Exception as e:
-            log.warning(f"[{proj.path_with_namespace}] repository_tree error: {e}")
+            log.error(f"[{proj.path_with_namespace}] repository_tree error: {e}")
             continue
-
-        found_files = 0
 
         for item in tree:
             if item.get("type") != "blob":
@@ -135,34 +119,25 @@ def get_gitlab_cipher_map(gl):
             if not (name.endswith("-monitors.yml") or name.endswith("-monitors.yaml")):
                 continue
 
-            found_files += 1
-
             try:
                 f = proj.files.get(file_path=item["path"], ref=GIT_REF)
                 text = f.decode().decode("utf-8")
-                hashes = extract_cipher_hashes_from_yaml(text)
-                if hashes:
-                    log.info(
-                        f"[{proj.path_with_namespace}] {item['path']} -> {len(hashes)}"
-                    )
+                hashes = extract_cipher_hashes_from_yaml(
+                    text,
+                    proj.path_with_namespace,
+                    item["path"],
+                )
                 for h in hashes:
                     cipher_map.setdefault(h, set()).add(proj.path_with_namespace)
             except Exception as e:
-                log.warning(
-                    f"[{proj.path_with_namespace}] read {item['path']} error: {e}"
+                log.error(
+                    f"[{proj.path_with_namespace}] ошибка чтения {item['path']}: {e}"
                 )
-                continue
 
-        log.info(f"[{proj.path_with_namespace}] monitors-файлов найдено: {found_files}")
-
-    out = {}
-    for h, projs in cipher_map.items():
-        out[h] = sorted(projs)
-    return out
+    return {h: sorted(v) for h, v in cipher_map.items()}
 
 
 def main():
-    get_chat_counts_since(SINCE)
     gl = gl_connect()
     cipher_map = get_gitlab_cipher_map(gl)
 
