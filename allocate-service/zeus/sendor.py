@@ -1,12 +1,19 @@
 import os
+import re
 import logging
 from datetime import datetime, timedelta, timezone
+from collections import defaultdict
+
 from dotenv import load_dotenv
 import psycopg2
 import requests
 import gitlab
 import yaml
 import urllib3
+
+from openpyxl import Workbook
+from openpyxl.styles import Font, Alignment
+from openpyxl.utils import get_column_letter
 
 load_dotenv()
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -33,6 +40,7 @@ GIT_REF = os.getenv("GIT_REF", "main")
 
 DECRYPT_URL = os.getenv("DECRYPT_URL")
 
+OUT_XLSX = os.getenv("OUT_XLSX", "chat_project_report.xlsx")
 HTTP_TIMEOUT_SEC = 30
 
 
@@ -146,7 +154,7 @@ def get_gitlab_cipher_map(gl):
     group = gl.groups.get(GROUP_ID)
     projects = group.projects.list(all=True, include_subgroups=True)
 
-    cipher_map = {}  # cipher_hash -> set(projects)
+    cipher_map = {}
 
     for p in projects:
         proj = gl.projects.get(p.id)
@@ -195,10 +203,6 @@ def decrypt_cipher_hash(cipher_hash: str):
 
 
 def normalize_git_cipher_map(cipher_map: dict):
-    """
-    returns:
-      chat_id(str) -> [projects]
-    """
     result = {}
     for cipher_hash, projects in cipher_map.items():
         real_chat_id = decrypt_cipher_hash(cipher_hash)
@@ -214,10 +218,6 @@ def normalize_git_cipher_map(cipher_map: dict):
 
 
 def build_db_count_map(db_rows):
-    """
-    returns:
-      chat_id(str) -> count(int)
-    """
     m = {}
     for chat_id, cnt in db_rows:
         key = str(chat_id).strip()
@@ -227,19 +227,80 @@ def build_db_count_map(db_rows):
     return m
 
 
-def build_project_rows(chat_to_projects: dict, db_counts: dict):
-    """
-    returns list of tuples:
-      (project, chat_id, message_count)
-    """
+PROJECT_CODE_RE = re.compile(r"^(?P<team>.+)-(?P<code>\d+)$")
+
+
+def parse_team_and_code(project_path_with_namespace: str):
+    last = (project_path_with_namespace or "").split("/")[-1].strip()
+    if not last:
+        return "", "", ""
+
+    m = PROJECT_CODE_RE.match(last)
+    if not m:
+        return last, "", last
+
+    team = (m.group("team") or "").strip()
+    code = (m.group("code") or "").strip()
+    return team, code, last
+
+
+def build_rows_for_excel(chat_to_projects: dict, db_counts: dict):
     rows = []
     for chat_id, projects in chat_to_projects.items():
         cnt = int(db_counts.get(str(chat_id).strip(), 0))
-        for proj in projects:
-            rows.append((proj, str(chat_id).strip(), cnt))
+        for proj_full in projects:
+            team, code, _ = parse_team_and_code(proj_full)
+            rows.append((team, code, str(chat_id).strip(), cnt, proj_full))
 
-    rows.sort(key=lambda x: (x[0], x[1]))
+    rows.sort(key=lambda x: (x[0], x[1], x[2]))
     return rows
+
+
+def write_excel(rows, out_path: str, since_days: int, since_str: str):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "report"
+
+    headers = [
+        "Наименование команды",
+        "Код (номер команды)",
+        "Chat ID",
+        "Кол-во сообщений",
+    ]
+    ws.append(headers)
+
+    header_font = Font(bold=True)
+    for col in range(1, len(headers) + 1):
+        c = ws.cell(row=1, column=col)
+        c.font = header_font
+        c.alignment = Alignment(horizontal="center", vertical="center")
+
+    for team, code, chat_id, cnt, _proj_full in rows:
+        ws.append([team, code, chat_id, cnt])
+
+    wb.save(out_path)
+    log.info(f"XLSX: сохранено {out_path} (строк: {len(rows)})")
+
+
+def _log_chat_id_sets(git_chat_ids, db_chat_ids):
+    git_sorted = sorted(git_chat_ids)
+    db_sorted = sorted(db_chat_ids)
+
+    log.info(f"CHAT_ID: в Git (после decrypt) = {len(git_sorted)}")
+    log.info(f"CHAT_ID: в DB = {len(db_sorted)}")
+
+    log.info(f"CHAT_ID: первые Git: {git_sorted[:50]}")
+    log.info(f"CHAT_ID: первые DB: {db_sorted[:50]}")
+
+    only_git = sorted(set(git_chat_ids) - set(db_chat_ids))
+    only_db = sorted(set(db_chat_ids) - set(git_chat_ids))
+
+    log.info(
+        f"CHAT_ID: есть в Git, но нет в DB = {len(only_git)} (первые 50: {only_git[:50]})"
+    )
+    log.info(
+        f"CHAT_ID: есть в DB, но нет в Git = {len(only_db)} (первые 50: {only_db[:50]})"
+    )
 
 
 def main():
@@ -250,35 +311,13 @@ def main():
     cipher_map = get_gitlab_cipher_map(gl)
     chat_to_projects = normalize_git_cipher_map(cipher_map)
 
-    project_rows = build_project_rows(chat_to_projects, db_counts)
-
-    print(
-        f"\n=== Итог по проектам (последние {SINCE_DAYS} дней, since={since_str}) ==="
-    )
-    print("project | chat_id | messages_count")
-    for proj, chat_id, cnt in project_rows:
-        print(f"{proj} | {chat_id} | {cnt}")
-
     git_chat_ids = set(chat_to_projects.keys())
     db_chat_ids = set(db_counts.keys())
+    _log_chat_id_sets(git_chat_ids, db_chat_ids)
 
-    missing_in_db = sorted(git_chat_ids - db_chat_ids)
-    missing_in_git = sorted(db_chat_ids - git_chat_ids)
+    rows = build_rows_for_excel(chat_to_projects, db_counts)
 
-    print("\n=== Диагностика ===")
-    print(f"chat_id в Git (после decrypt): {len(git_chat_ids)}")
-    print(f"chat_id в DB: {len(db_chat_ids)}")
-    print(f"chat_id есть в Git, но нет в DB: {len(missing_in_db)}")
-    for x in missing_in_db[:50]:
-        print(f"  {x}")
-    if len(missing_in_db) > 50:
-        print(f"  ... и еще {len(missing_in_db) - 50}")
-
-    print(f"\nchat_id есть в DB, но нет в Git: {len(missing_in_git)}")
-    for x in missing_in_git[:50]:
-        print(f"  {x}")
-    if len(missing_in_git) > 50:
-        print(f"  ... и еще {len(missing_in_git) - 50}")
+    write_excel(rows, OUT_XLSX, SINCE_DAYS, since_str)
 
 
 if __name__ == "__main__":
