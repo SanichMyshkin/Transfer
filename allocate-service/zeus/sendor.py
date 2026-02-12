@@ -1,7 +1,6 @@
 import os
 import logging
 from dotenv import load_dotenv
-import psycopg2
 import gitlab
 import yaml
 import urllib3
@@ -16,13 +15,6 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-DB_HOST = os.getenv("DB_HOST")
-DB_PORT = int(os.getenv("DB_PORT", "5432"))
-DB_NAME = os.getenv("DB_NAME")
-DB_USER = os.getenv("DB_USER")
-DB_PASSWORD = os.getenv("DB_PASSWORD")
-SINCE = os.getenv("SINCE", "2026-01-01 00:00:00")
-
 GITLAB_URL = os.getenv("GITLAB_URL", "").rstrip("/")
 TOKEN = os.getenv("TOKEN", "")
 GROUP_ID = os.getenv("GROUP_ID", "").strip()
@@ -35,32 +27,40 @@ def gl_connect():
     return gl
 
 
-def normalize_cipher_value(v, project, path):
+def normalize_cipher_value(v):
     s = str(v or "").strip()
-
     if not s.startswith("{cipher}"):
-        log.error(f"[{project}] {path} -> chatId без {{cipher}}: {s}")
         return ""
-
     s = s[len("{cipher}") :].strip()
-
     if not s:
-        log.error(f"[{project}] {path} -> пустой hash")
         return ""
-
     for ch in s:
         if ch not in "0123456789abcdefABCDEF":
-            log.error(f"[{project}] {path} -> не hex значение: {s}")
             return ""
-
     return s.lower()
 
 
-def extract_cipher_hashes_from_yaml(text, project, path):
+def parse_yaml_with_heal(text, project, path):
     try:
-        data = yaml.safe_load(text)
-    except Exception as e:
-        log.error(f"[{project}] YAML parse error в {path}: {e}")
+        return yaml.safe_load(text)
+    except yaml.YAMLError as e:
+        log.warning(f"[{project}] {path} -> YAML parse error: {e}")
+        log.warning(f"[{project}] {path} -> пробуем вылечить (замена TAB на пробелы)")
+
+        healed = text.replace("\t", "  ")
+
+        try:
+            data = yaml.safe_load(healed)
+            log.warning(f"[{project}] {path} -> успешно вылечили YAML")
+            return data
+        except yaml.YAMLError as e2:
+            log.error(f"[{project}] {path} -> вылечить не удалось: {e2}")
+            return None
+
+
+def extract_cipher_hashes_from_yaml(text, project, path):
+    data = parse_yaml_with_heal(text, project, path)
+    if not data:
         return set()
 
     try:
@@ -70,25 +70,22 @@ def extract_cipher_hashes_from_yaml(text, project, path):
             ]
         )
     except Exception:
-        log.error(f"[{project}] неправильная структура YAML в {path}")
+        log.error(f"[{project}] {path} -> неправильная структура YAML")
+        return set()
+
+    if not isinstance(test_telegram, list):
+        log.error(f"[{project}] {path} -> testTelegram не список")
         return set()
 
     result = set()
 
-    if not isinstance(test_telegram, list):
-        log.error(f"[{project}] testTelegram не список в {path}")
-        return set()
-
     for item in test_telegram:
         if not isinstance(item, dict):
-            log.error(f"[{project}] testTelegram элемент не dict в {path}")
             continue
-
         if "chatId" not in item:
-            log.error(f"[{project}] нет chatId в {path}")
             continue
 
-        h = normalize_cipher_value(item["chatId"], project, path)
+        h = normalize_cipher_value(item["chatId"])
         if h:
             result.add(h)
 
@@ -123,9 +120,7 @@ def get_gitlab_cipher_map(gl):
                 f = proj.files.get(file_path=item["path"], ref=GIT_REF)
                 text = f.decode().decode("utf-8")
                 hashes = extract_cipher_hashes_from_yaml(
-                    text,
-                    proj.path_with_namespace,
-                    item["path"],
+                    text, proj.path_with_namespace, item["path"]
                 )
                 for h in hashes:
                     cipher_map.setdefault(h, set()).add(proj.path_with_namespace)
@@ -141,6 +136,7 @@ def main():
     gl = gl_connect()
     cipher_map = get_gitlab_cipher_map(gl)
 
+    print("\n=== Результат ===")
     for h in sorted(cipher_map.keys()):
         print(h)
         for p in cipher_map[h]:
