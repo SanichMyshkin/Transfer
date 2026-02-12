@@ -234,13 +234,21 @@ def extract_alertmanager_chat_ids(text, project, path):
         return set()
 
     ids = set()
+    found_any_alias = False
     for alias in ALERT_ALIASES:
         vals = deep_find_values_by_key(data, alias)
         if not vals:
-            log.warning(f"[{project}] {path} -> {alias}: не найдено")
             continue
+        found_any_alias = True
         for v in vals:
+            before = len(ids)
             ids |= extract_chat_ids_from_obj(v)
+            if len(ids) == before:
+                pass
+
+    if found_any_alias and not ids:
+        log.warning(f"[{project}] {path} -> aliases found, but chat_id not extracted")
+
     return ids
 
 
@@ -250,11 +258,8 @@ def is_zeus_monitor_file(path):
 
 
 def is_alertmanager_file(path):
-    p = (path or "").lower()
-    return p in {
-        "monitoring/alert_manager/rules/alert.yml",
-        "monitoring/alert_manager/rules/alert.yaml",
-    }
+    name = (path or "").lower().split("/")[-1]
+    return name in {"values.yml", "values.yaml", "alert.yml", "alert.yaml"}
 
 
 def scan_gitlab(gl):
@@ -311,9 +316,7 @@ def scan_gitlab(gl):
 
             if need_am:
                 ids = extract_alertmanager_chat_ids(text, proj_name, file_path)
-                if not ids:
-                    log.info(f"[{proj_name}] {file_path} -> alertmanager: пусто")
-                else:
+                if ids:
                     for cid in ids:
                         am_chat_to_projects[str(cid).strip()].add(proj_name)
                     log.info(
