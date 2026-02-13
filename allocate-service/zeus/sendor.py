@@ -44,8 +44,6 @@ HTTP_TIMEOUT_SEC = 30
 
 PROJECT_CODE_RE = re.compile(r"^(?P<team>.+)-(?P<code>\d+)$")
 HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
-CHAT_ID_IN_STR_RE = re.compile(r'"chat_id"\s*:\s*"(?P<id>-?\d+)"')
-ALERT_ALIASES = ("chat_sre", "chat_gods")
 
 
 def gl_connect():
@@ -98,6 +96,8 @@ def build_db_count_map(db_rows):
 
 
 def decrypt_cipher_hash(cipher_hash):
+    if not DECRYPT_URL:
+        return ""
     r = requests.post(
         url=DECRYPT_URL,
         data=cipher_hash,
@@ -117,17 +117,15 @@ def parse_yaml_with_heal(text, project, path):
     except yaml.YAMLError as e:
         log.error(f"[{project}] {path} -> YAML PARSE ERROR: {type(e).__name__}: {e}")
         snippet = text[:500].replace("\n", "\\n")
-        log.error(f"[{project}] {path} -> YAML SNIPPET (first 500 chars): {snippet}")
+        log.error(f"[{project}] {path} -> YAML SNIPPET: {snippet}")
 
         healed = text.replace("\t", "  ")
         try:
             data = yaml.safe_load(healed)
-            log.warning(f"[{project}] {path} -> YAML healed (TAB->spaces)")
+            log.warning(f"[{project}] {path} -> YAML healed")
             return data
         except yaml.YAMLError as e2:
-            log.error(
-                f"[{project}] {path} -> YAML HEAL FAILED: {type(e2).__name__}: {e2}"
-            )
+            log.error(f"[{project}] {path} -> YAML HEAL FAILED: {type(e2).__name__}: {e2}")
             return None
     except Exception as e:
         log.error(f"[{project}] {path} -> YAML UNKNOWN ERROR: {type(e).__name__}: {e}")
@@ -144,135 +142,61 @@ def parse_team_and_code(project_path_with_namespace):
     return (m.group("team") or "").strip(), (m.group("code") or "").strip()
 
 
-def normalize_cipher_value(v, project, path):
-    s = str(v or "").strip()
-    if not s.startswith("{cipher}"):
-        log.error(f"[{project}] {path} -> chatId без {{cipher}}: {s}")
-        return ""
-    s = s[len("{cipher}") :].strip()
-    if not s:
-        log.error(f"[{project}] {path} -> пустой hash")
-        return ""
-    if not HEX_RE.fullmatch(s):
-        log.error(f"[{project}] {path} -> не hex значение: {s}")
-        return ""
-    return s.lower()
-
-
-def deep_find_values_by_key(node, key):
-    out = []
-    if isinstance(node, dict):
-        for k, v in node.items():
-            if str(k) == key:
-                out.append(v)
-            out.extend(deep_find_values_by_key(v, key))
-    elif isinstance(node, list):
-        for x in node:
-            out.extend(deep_find_values_by_key(x, key))
-    return out
-
-
-def extract_chat_ids_from_obj(obj):
-    ids = set()
-
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            if str(k).lower() == "chat_id":
-                vv = str(v).strip()
-                if vv:
-                    ids.add(vv)
-            else:
-                ids |= extract_chat_ids_from_obj(v)
-
-    elif isinstance(obj, list):
-        for x in obj:
-            ids |= extract_chat_ids_from_obj(x)
-
-    elif isinstance(obj, str):
-        s = obj.strip()
-        if not s:
-            return ids
-        try:
-            parsed = json.loads(s)
-            ids |= extract_chat_ids_from_obj(parsed)
-            return ids
-        except Exception:
-            pass
-        for m in CHAT_ID_IN_STR_RE.finditer(s):
-            ids.add(m.group("id"))
-
-    return ids
-
-
-def extract_zeus_cipher_hashes(text, project, path):
-    data = parse_yaml_with_heal(text, project, path)
-    if not data:
-        return set()
-
-    try:
-        test_telegram = data["zeus"]["monitoringProperties"]["vars"]["zeusmonitoring"][
-            "custom"
-        ]["testTelegram"]
-    except Exception:
-        log.error(f"[{project}] {path} -> неверная структура zeus YAML")
-        return set()
-
-    if not isinstance(test_telegram, list):
-        log.error(f"[{project}] {path} -> testTelegram не список")
-        return set()
-
-    hashes = set()
-    for item in test_telegram:
-        if not isinstance(item, dict):
-            continue
-        if "chatId" not in item:
-            continue
-        h = normalize_cipher_value(item["chatId"], project, path)
-        if h:
-            hashes.add(h)
-    return hashes
-
-
-def extract_alertmanager_chat_ids(text, project, path):
+def extract_all_chat_ids(text, project, path):
     data = parse_yaml_with_heal(text, project, path)
     if not data:
         return set()
 
     ids = set()
-    found_any_alias = False
-    for alias in ALERT_ALIASES:
-        vals = deep_find_values_by_key(data, alias)
-        if not vals:
-            continue
-        found_any_alias = True
-        for v in vals:
-            before = len(ids)
-            ids |= extract_chat_ids_from_obj(v)
-            if len(ids) == before:
+
+    def walk(node):
+        if isinstance(node, dict):
+            for k, v in node.items():
+                if str(k).lower() == "chat_id":
+                    val = str(v).strip()
+                    if not val:
+                        return
+                    if val.startswith("{cipher}"):
+                        cipher = val[len("{cipher}") :].strip()
+                        if HEX_RE.fullmatch(cipher):
+                            real = decrypt_cipher_hash(cipher)
+                            if real:
+                                ids.add(str(real).strip())
+                        else:
+                            log.error(f"[{project}] {path} -> invalid cipher: {val}")
+                    else:
+                        ids.add(val)
+                walk(v)
+
+        elif isinstance(node, list):
+            for x in node:
+                walk(x)
+
+        elif isinstance(node, str):
+            try:
+                parsed = json.loads(node)
+                walk(parsed)
+            except Exception:
                 pass
 
-    if found_any_alias and not ids:
-        log.warning(f"[{project}] {path} -> aliases found, but chat_id not extracted")
-
+    walk(data)
     return ids
 
 
-def is_zeus_monitor_file(path):
-    p = (path or "").lower().split("/")[-1]
-    return p.endswith("-monitors.yml") or p.endswith("-monitors.yaml")
-
-
-def is_alertmanager_file(path):
+def is_target_file(path):
     name = (path or "").lower().split("/")[-1]
-    return name in {"values.yml", "values.yaml", "alert.yml", "alert.yaml"}
+    if name.endswith("-monitors.yml") or name.endswith("-monitors.yaml"):
+        return True
+    if name in {"values.yml", "values.yaml", "alert.yml", "alert.yaml"}:
+        return True
+    return False
 
 
 def scan_gitlab(gl):
     group = gl.groups.get(GROUP_ID)
     projects = group.projects.list(all=True, include_subgroups=True)
 
-    zeus_chat_to_projects = defaultdict(set)
-    am_chat_to_projects = defaultdict(set)
+    chat_to_projects = defaultdict(set)
 
     for p in projects:
         proj = gl.projects.get(p.id)
@@ -288,13 +212,9 @@ def scan_gitlab(gl):
         for item in tree:
             if item.get("type") != "blob":
                 continue
-            file_path = item.get("path") or ""
-            if not file_path:
-                continue
 
-            need_zeus = is_zeus_monitor_file(file_path)
-            need_am = is_alertmanager_file(file_path)
-            if not (need_zeus or need_am):
+            file_path = item.get("path") or ""
+            if not is_target_file(file_path):
                 continue
 
             try:
@@ -304,31 +224,16 @@ def scan_gitlab(gl):
                 log.error(f"[{proj_name}] чтение {file_path}: {e}")
                 continue
 
-            if need_zeus:
-                hashes = extract_zeus_cipher_hashes(text, proj_name, file_path)
-                if not hashes:
-                    log.info(f"[{proj_name}] {file_path} -> zeus: пусто")
-                else:
-                    real_ids = set()
-                    for h in hashes:
-                        real = decrypt_cipher_hash(h)
-                        if real:
-                            real_ids.add(real)
-                            zeus_chat_to_projects[str(real).strip()].add(proj_name)
-                    log.info(
-                        f"[{proj_name}] {file_path} -> zeus: found={len(real_ids)} ids={sorted(real_ids)[:20]}"
-                    )
+            ids = extract_all_chat_ids(text, proj_name, file_path)
 
-            if need_am:
-                ids = extract_alertmanager_chat_ids(text, proj_name, file_path)
-                if ids:
-                    for cid in ids:
-                        am_chat_to_projects[str(cid).strip()].add(proj_name)
-                    log.info(
-                        f"[{proj_name}] {file_path} -> alertmanager: found={len(ids)} ids={sorted(ids)[:20]}"
-                    )
+            if ids:
+                for cid in ids:
+                    chat_to_projects[str(cid).strip()].add(proj_name)
+                log.info(
+                    f"[{proj_name}] {file_path} -> found={len(ids)} ids={sorted(ids)[:20]}"
+                )
 
-    return zeus_chat_to_projects, am_chat_to_projects
+    return chat_to_projects
 
 
 def build_rows(chat_to_projects, db_counts):
@@ -342,20 +247,21 @@ def build_rows(chat_to_projects, db_counts):
     return rows
 
 
-def log_chat_id_sets(name, git_ids, db_ids):
+def log_chat_id_sets(git_ids, db_ids):
     git_sorted = sorted(git_ids)
     db_sorted = sorted(db_ids)
-    log.info(f"[{name}] chat_id Git = {len(git_sorted)} sample={git_sorted[:50]}")
-    log.info(f"[{name}] chat_id DB  = {len(db_sorted)} sample={db_sorted[:50]}")
+    log.info(f"chat_id Git = {len(git_sorted)} sample={git_sorted[:50]}")
+    log.info(f"chat_id DB  = {len(db_sorted)} sample={db_sorted[:50]}")
     only_git = sorted(set(git_ids) - set(db_ids))
     only_db = sorted(set(db_ids) - set(git_ids))
-    log.info(f"[{name}] Git-DB = {len(only_git)} sample={only_git[:50]}")
-    log.info(f"[{name}] DB-Git = {len(only_db)} sample={only_db[:50]}")
+    log.info(f"Git-DB = {len(only_git)} sample={only_git[:50]}")
+    log.info(f"DB-Git = {len(only_db)} sample={only_db[:50]}")
 
 
-def write_excel(out_path, zeus_rows, am_rows):
+def write_excel(out_path, rows):
     wb = Workbook()
-    wb.remove(wb.active)
+    ws = wb.active
+    ws.title = "report"
 
     headers = [
         "Наименование команды",
@@ -364,15 +270,9 @@ def write_excel(out_path, zeus_rows, am_rows):
         "Кол-во сообщений",
     ]
 
-    ws1 = wb.create_sheet("zeus")
-    ws1.append(headers)
-    for r in zeus_rows:
-        ws1.append(list(r))
-
-    ws2 = wb.create_sheet("alertmanager")
-    ws2.append(headers)
-    for r in am_rows:
-        ws2.append(list(r))
+    ws.append(headers)
+    for r in rows:
+        ws.append(list(r))
 
     wb.save(out_path)
     log.info(f"XLSX: saved {out_path}")
@@ -384,17 +284,14 @@ def main():
     db_chat_ids = set(db_counts.keys())
 
     gl = gl_connect()
-    zeus_map, am_map = scan_gitlab(gl)
+    chat_map = scan_gitlab(gl)
 
     log.info(f"since={since_str} days={SINCE_DAYS}")
 
-    log_chat_id_sets("zeus", set(zeus_map.keys()), db_chat_ids)
-    log_chat_id_sets("alertmanager", set(am_map.keys()), db_chat_ids)
+    log_chat_id_sets(set(chat_map.keys()), db_chat_ids)
 
-    zeus_rows = build_rows(zeus_map, db_counts)
-    am_rows = build_rows(am_map, db_counts)
-
-    write_excel(OUT_XLSX, zeus_rows, am_rows)
+    rows = build_rows(chat_map, db_counts)
+    write_excel(OUT_XLSX, rows)
 
 
 if __name__ == "__main__":
