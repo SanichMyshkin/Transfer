@@ -226,8 +226,8 @@ def scan_gitlab(gl):
     group = gl.groups.get(GROUP_ID)
     projects = group.projects.list(all=True, include_subgroups=True)
 
-    zeus_map = defaultdict(set)
-    am_map = defaultdict(set)
+    zeus_map = defaultdict(set)  # chat_id -> set(projects)
+    am_map = defaultdict(set)    # chat_id -> set(projects)
 
     for p in projects:
         proj = gl.projects.get(p.id)
@@ -277,37 +277,42 @@ def scan_gitlab(gl):
             if need_zeus:
                 for cid in ids:
                     zeus_map[cid].add(proj_name)
-                log.info(
-                    f"[{proj_name}] {file_path} -> zeus found={len(ids)} ids={sorted(ids)[:20]}"
-                )
+                log.info(f"[{proj_name}] {file_path} -> zeus found={len(ids)}")
 
             if need_am:
                 for cid in ids:
                     am_map[cid].add(proj_name)
-                log.info(
-                    f"[{proj_name}] {file_path} -> alertmanager found={len(ids)} ids={sorted(ids)[:20]}"
-                )
+                log.info(f"[{proj_name}] {file_path} -> alertmanager found={len(ids)}")
 
     return zeus_map, am_map
 
 
-def build_rows(chat_map, db_counts):
-    rows = []
-    total = 0
+def build_rows_agg_by_service(chat_map, db_counts):
+    service_to_chat_ids = defaultdict(set)  # (team, code) -> set(chat_id)
 
     for chat_id, projects in chat_map.items():
-        cnt = int(db_counts.get(str(chat_id).strip(), 0))
-        total += cnt
         for proj in projects:
             team, code = parse_team_and_code(proj)
-            rows.append([team, code, chat_id, cnt])
+            service_to_chat_ids[(team, code)].add(str(chat_id).strip())
 
-    for r in rows:
-        cnt = int(r[3] or 0)
+    service_to_cnt = {}
+    total = 0
+
+    for svc, chat_ids in service_to_chat_ids.items():
+        cnt = 0
+        for cid in chat_ids:
+            cnt += int(db_counts.get(str(cid).strip(), 0))
+        service_to_cnt[svc] = cnt
+        total += cnt
+
+    rows = []
+    for (team, code), chat_ids in service_to_chat_ids.items():
+        cnt = int(service_to_cnt.get((team, code), 0))
         pct = 0.0 if total <= 0 else (cnt * 100.0 / total)
-        r.append(pct)
+        chat_list = ",".join(sorted(chat_ids))
+        rows.append([team, code, chat_list, cnt, pct])
 
-    rows.sort(key=lambda x: (x[0], x[1], x[2]))
+    rows.sort(key=lambda x: (x[0], x[1]))
     return rows, total
 
 
@@ -329,8 +334,8 @@ def write_excel(out_path, zeus_rows, am_rows):
     headers = [
         "Наименование команды",
         "Код (номер команды)",
-        "Chat ID",
-        "Кол-во сообщений",
+        "Chat ID список",
+        "Кол-во сообщений (сумма)",
         "% от общего",
     ]
 
@@ -361,8 +366,8 @@ def main():
     log_chat_id_sets("zeus", set(zeus_map.keys()), db_chat_ids)
     log_chat_id_sets("alertmanager", set(am_map.keys()), db_chat_ids)
 
-    zeus_rows, zeus_total = build_rows(zeus_map, db_counts)
-    am_rows, am_total = build_rows(am_map, db_counts)
+    zeus_rows, zeus_total = build_rows_agg_by_service(zeus_map, db_counts)
+    am_rows, am_total = build_rows_agg_by_service(am_map, db_counts)
 
     log.info(f"[zeus] total_messages={zeus_total}")
     log.info(f"[alertmanager] total_messages={am_total}")
