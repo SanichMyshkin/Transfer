@@ -43,7 +43,7 @@ OUT_XLSX = os.getenv("OUT_XLSX", "chat_project_report.xlsx")
 HTTP_TIMEOUT_SEC = 30
 
 SKIP_ZERO_SERVICES = True
-BAN_SERVICE_CODES = {"123"}
+BAN_SERVICE_CODES = {"123", "5531"}
 
 PROJECT_CODE_RE = re.compile(r"^(?P<team>.+)-(?P<code>\d+)$")
 HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
@@ -83,7 +83,7 @@ def get_chat_counts_since_days(days):
                     (since_dt,),
                 )
                 rows = cur.fetchall()
-                log.info(f"DB: получено строк {len(rows)}")
+                log.info(f"DB: получено строк {len(rows)} (уникальных chat_id)")
                 return rows, since_str
     finally:
         conn.close()
@@ -101,6 +101,7 @@ def build_db_count_map(db_rows):
 
 def decrypt_cipher_hash(cipher_hash):
     if not DECRYPT_URL:
+        log.error("DECRYPT_URL пустой")
         return ""
     r = requests.post(
         url=DECRYPT_URL,
@@ -120,6 +121,21 @@ def parse_yaml_with_heal(text, project, path):
         return yaml.safe_load(text)
     except yaml.YAMLError as e:
         log.error(f"[{project}] {path} -> YAML PARSE ERROR: {type(e).__name__}: {e}")
+        snippet = text[:500].replace("\n", "\\n")
+        log.error(f"[{project}] {path} -> YAML SNIPPET: {snippet}")
+
+        healed = text.replace("\t", "  ")
+        try:
+            data = yaml.safe_load(healed)
+            log.warning(f"[{project}] {path} -> YAML healed (TAB->spaces)")
+            return data
+        except yaml.YAMLError as e2:
+            log.error(
+                f"[{project}] {path} -> YAML HEAL FAILED: {type(e2).__name__}: {e2}"
+            )
+            return None
+    except Exception as e:
+        log.error(f"[{project}] {path} -> YAML UNKNOWN ERROR: {type(e).__name__}: {e}")
         return None
 
 
@@ -163,6 +179,7 @@ def extract_chat_ids(text, project, path):
         if val.startswith("{cipher}"):
             cipher = val[len("{cipher}") :].strip()
             if not HEX_RE.fullmatch(cipher):
+                log.error(f"[{project}] {path} -> invalid cipher: {val}")
                 return
             real = decrypt_cipher_hash(cipher)
             real_id = normalize_chat_id(real)
@@ -219,10 +236,12 @@ def scan_gitlab(gl):
     for p in projects:
         proj = gl.projects.get(p.id)
         proj_name = proj.path_with_namespace
+        log.info(f"GitLab: проект {proj_name}")
 
         try:
             tree = proj.repository_tree(ref=GIT_REF, recursive=True, all=True)
-        except Exception:
+        except Exception as e:
+            log.error(f"[{proj_name}] repository_tree error: {e}")
             continue
 
         for item in tree:
@@ -251,7 +270,8 @@ def scan_gitlab(gl):
             try:
                 f = proj.files.get(file_path=file_path, ref=GIT_REF)
                 text = f.decode().decode("utf-8")
-            except Exception:
+            except Exception as e:
+                log.error(f"[{proj_name}] чтение {file_path}: {e}")
                 continue
 
             ids = extract_chat_ids(text, proj_name, file_path)
@@ -261,15 +281,32 @@ def scan_gitlab(gl):
             if need_zeus:
                 for cid in ids:
                     zeus_map[cid].add(proj_name)
+                log.info(
+                    f"[{proj_name}] {file_path} -> zeus found={len(ids)} ids={sorted(ids)[:20]}"
+                )
 
             if need_am:
                 for cid in ids:
                     am_map[cid].add(proj_name)
+                log.info(
+                    f"[{proj_name}] {file_path} -> alertmanager found={len(ids)} ids={sorted(ids)[:20]}"
+                )
 
     return zeus_map, am_map
 
 
-def build_rows_agg_by_service(chat_map, db_counts):
+def log_chat_id_sets(name, git_ids, db_ids):
+    git_sorted = sorted(git_ids)
+    db_sorted = sorted(db_ids)
+    log.info(f"[{name}] chat_id Git = {len(git_sorted)} sample={git_sorted[:50]}")
+    log.info(f"[{name}] chat_id DB  = {len(db_sorted)} sample={db_sorted[:50]}")
+    only_git = sorted(set(git_ids) - set(db_ids))
+    only_db = sorted(set(db_ids) - set(git_ids))
+    log.info(f"[{name}] Git-DB = {len(only_git)} sample={only_git[:50]}")
+    log.info(f"[{name}] DB-Git = {len(only_db)} sample={only_db[:50]}")
+
+
+def build_rows_agg_by_service(chat_map, db_counts, sheet_name):
     service_to_chat_ids = defaultdict(set)
 
     for chat_id, projects in chat_map.items():
@@ -281,9 +318,9 @@ def build_rows_agg_by_service(chat_map, db_counts):
 
     service_to_cnt = {}
     total = 0
+    skipped_zero = 0
 
-    for svc, chat_ids in service_to_chat_ids.items():
-        team, code = svc
+    for (team, code), chat_ids in service_to_chat_ids.items():
         if code in BAN_SERVICE_CODES:
             continue
 
@@ -292,22 +329,27 @@ def build_rows_agg_by_service(chat_map, db_counts):
             cnt += int(db_counts.get(cid, 0))
 
         if SKIP_ZERO_SERVICES and cnt == 0:
+            skipped_zero += 1
             continue
 
-        service_to_cnt[svc] = cnt
+        service_to_cnt[(team, code)] = cnt
         total += cnt
 
     rows = []
     for (team, code), chat_ids in service_to_chat_ids.items():
         if (team, code) not in service_to_cnt:
             continue
-
         cnt = service_to_cnt[(team, code)]
         pct = 0.0 if total <= 0 else (cnt * 100.0 / total)
         chat_list = ",".join(sorted(chat_ids))
         rows.append([team, code, chat_list, cnt, pct])
 
     rows.sort(key=lambda x: (x[0], x[1]))
+
+    log.info(f"[{sheet_name}] services_total_found={len(service_to_chat_ids)}")
+    log.info(f"[{sheet_name}] services_after_ban_and_zero={len(rows)} skipped_zero={skipped_zero}")
+    log.info(f"[{sheet_name}] total_messages={total} SKIP_ZERO_SERVICES={SKIP_ZERO_SERVICES} BAN_SERVICE_CODES={sorted(BAN_SERVICE_CODES)}")
+
     return rows, total
 
 
@@ -334,17 +376,24 @@ def write_excel(out_path, zeus_rows, am_rows):
         ws2.append(r)
 
     wb.save(out_path)
+    log.info(f"XLSX: saved {out_path}")
 
 
 def main():
-    db_rows, _ = get_chat_counts_since_days(SINCE_DAYS)
+    db_rows, since_str = get_chat_counts_since_days(SINCE_DAYS)
     db_counts = build_db_count_map(db_rows)
+    db_chat_ids = set(db_counts.keys())
 
     gl = gl_connect()
     zeus_map, am_map = scan_gitlab(gl)
 
-    zeus_rows, _ = build_rows_agg_by_service(zeus_map, db_counts)
-    am_rows, _ = build_rows_agg_by_service(am_map, db_counts)
+    log.info(f"since={since_str} days={SINCE_DAYS}")
+
+    log_chat_id_sets("zeus", set(zeus_map.keys()), db_chat_ids)
+    log_chat_id_sets("alertmanager", set(am_map.keys()), db_chat_ids)
+
+    zeus_rows, _ = build_rows_agg_by_service(zeus_map, db_counts, "zeus")
+    am_rows, _ = build_rows_agg_by_service(am_map, db_counts, "alertmanager")
 
     write_excel(OUT_XLSX, zeus_rows, am_rows)
 
