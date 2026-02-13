@@ -154,24 +154,30 @@ def extract_chat_ids(text, project, path):
     def walk(node):
         if isinstance(node, dict):
             for k, v in node.items():
-                if str(k).lower() == "chat_id":
+                kk = str(k).strip().lower()
+
+                if kk in {"chat_id", "chatid"}:  # chat_id и chatId
                     val = str(v).strip()
-                    if not val:
-                        pass
-                    elif val.startswith("{cipher}"):
-                        cipher = val[len("{cipher}") :].strip()
-                        if HEX_RE.fullmatch(cipher):
-                            real = decrypt_cipher_hash(cipher)
-                            if real:
-                                ids.add(str(real).strip())
+                    if val:
+                        if val.startswith("{cipher}"):
+                            cipher = val[len("{cipher}") :].strip()
+                            if HEX_RE.fullmatch(cipher):
+                                real = decrypt_cipher_hash(cipher)
+                                if real:
+                                    ids.add(str(real).strip())
+                            else:
+                                log.error(
+                                    f"[{project}] {path} -> invalid cipher: {val}"
+                                )
                         else:
-                            log.error(f"[{project}] {path} -> invalid cipher: {val}")
-                    else:
-                        ids.add(val)
+                            ids.add(val)
+
                 walk(v)
+
         elif isinstance(node, list):
             for x in node:
                 walk(x)
+
         elif isinstance(node, str):
             try:
                 parsed = json.loads(node)
@@ -252,12 +258,16 @@ def scan_gitlab(gl):
             if need_zeus:
                 for cid in ids:
                     zeus_map[str(cid).strip()].add(proj_name)
-                log.info(f"[{proj_name}] {file_path} -> zeus found={len(ids)} ids={sorted(ids)[:20]}")
+                log.info(
+                    f"[{proj_name}] {file_path} -> zeus found={len(ids)} ids={sorted(ids)[:20]}"
+                )
 
             if need_am:
                 for cid in ids:
                     am_map[str(cid).strip()].add(proj_name)
-                log.info(f"[{proj_name}] {file_path} -> alertmanager found={len(ids)} ids={sorted(ids)[:20]}")
+                log.info(
+                    f"[{proj_name}] {file_path} -> alertmanager found={len(ids)} ids={sorted(ids)[:20]}"
+                )
 
     return zeus_map, am_map
 
