@@ -12,7 +12,7 @@ import gitlab
 import yaml
 import urllib3
 
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 
 load_dotenv()
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -40,14 +40,31 @@ GIT_REF = os.getenv("GIT_REF", "main")
 DECRYPT_URL = os.getenv("DECRYPT_URL")
 
 OUT_XLSX = os.getenv("OUT_XLSX", "chat_project_report.xlsx")
+
+SD_FILE = os.getenv("SD_FILE", "sd.xlsx")
+BK_FILE = os.getenv("BK_FILE", "bk_all_users.xlsx")
+
 HTTP_TIMEOUT_SEC = 30
 
 SKIP_ZERO_SERVICES = True
 BAN_SERVICE_CODES = {"123", "5531"}
 
+SKIP_EMPTY_BUSINESS_TYPE = False
+
 PROJECT_CODE_RE = re.compile(r"^(?P<team>.+)-(?P<code>\d+)$")
 HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
 CHAT_ID_NUM_RE = re.compile(r"^-?\d+$")
+
+
+def clean_spaces(s):
+    s = (s or "").strip()
+    s = s.replace(",", " ")
+    s = " ".join(s.split())
+    return s
+
+
+def normalize_name_key(s):
+    return clean_spaces(s).lower()
 
 
 def gl_connect():
@@ -153,14 +170,11 @@ def normalize_chat_id(raw):
     s = str(raw or "").strip()
     if not s:
         return ""
-
     if not CHAT_ID_NUM_RE.fullmatch(s):
         return ""
-
     core = s[1:] if s.startswith("-") else s
     if core and set(core) == {"0"}:
         return ""
-
     return s
 
 
@@ -295,6 +309,81 @@ def scan_gitlab(gl):
     return zeus_map, am_map
 
 
+def read_sd_map(path):
+    if not path or not os.path.exists(path):
+        log.warning(f"SD_FILE не найден: {path}")
+        return {}
+
+    wb = load_workbook(path, data_only=True)
+    ws = wb.worksheets[0]
+
+    out = {}
+    rows = 0
+    ok = 0
+
+    for r in ws.iter_rows(values_only=True):
+        rows += 1
+        code_raw = r[1] if len(r) > 1 else ""
+        sd_name = r[3] if len(r) > 3 else ""
+        owner = r[7] if len(r) > 7 else ""
+
+        code = ""
+        m = re.search(r"(\d+)", str(code_raw or ""))
+        if m:
+            code = m.group(1)
+
+        if not code:
+            continue
+
+        out[str(code)] = {
+            "sd_name": clean_spaces(sd_name),
+            "owner": clean_spaces(owner),
+        }
+        ok += 1
+
+    log.info(f"SD: rows={rows} mapped_codes={len(out)} ok_rows={ok}")
+    return out
+
+
+def load_bk_business_type_map(path):
+    if not path or not os.path.exists(path):
+        log.warning(f"BK_FILE не найден: {path}")
+        return {}
+
+    wb = load_workbook(path, data_only=True)
+    ws = wb.worksheets[0]
+
+    out = {}
+    rows = 0
+    ok = 0
+
+    for r in ws.iter_rows(values_only=True):
+        rows += 1
+
+        c1 = r[0] if len(r) > 0 else ""
+        c2 = r[1] if len(r) > 1 else ""
+        c3 = r[2] if len(r) > 2 else ""
+
+        bt = ""
+        if len(r) > 44:
+            bt = r[44]
+        else:
+            continue
+
+        fio = clean_spaces(f"{c2} {c1} {c3}")
+        fio_key = normalize_name_key(fio)
+        bt = clean_spaces(bt)
+
+        if not fio_key:
+            continue
+
+        out[fio_key] = bt
+        ok += 1
+
+    log.info(f"BK: rows={rows} mapped_fio={len(out)} ok_rows={ok}")
+    return out
+
+
 def log_chat_id_sets(name, git_ids, db_ids):
     git_sorted = sorted(git_ids)
     db_sorted = sorted(db_ids)
@@ -306,7 +395,7 @@ def log_chat_id_sets(name, git_ids, db_ids):
     log.info(f"[{name}] DB-Git = {len(only_db)} sample={only_db[:50]}")
 
 
-def build_rows_agg_by_service(chat_map, db_counts, sheet_name):
+def build_rows_agg_by_service(chat_map, db_counts, sd_map, bk_map, sheet_name):
     service_to_chat_ids = defaultdict(set)
 
     for chat_id, projects in chat_map.items():
@@ -316,12 +405,18 @@ def build_rows_agg_by_service(chat_map, db_counts, sheet_name):
                 continue
             service_to_chat_ids[(team, code)].add(str(chat_id).strip())
 
+    service_info = {}
     service_to_cnt = {}
     total = 0
     skipped_zero = 0
+    skipped_ban = 0
+    missing_sd = 0
+    missing_owner = 0
+    missing_bt = 0
 
     for (team, code), chat_ids in service_to_chat_ids.items():
         if code in BAN_SERVICE_CODES:
+            skipped_ban += 1
             continue
 
         cnt = 0
@@ -332,6 +427,34 @@ def build_rows_agg_by_service(chat_map, db_counts, sheet_name):
             skipped_zero += 1
             continue
 
+        sd = sd_map.get(str(code), {})
+        sd_name = clean_spaces(sd.get("sd_name", ""))
+        owner = clean_spaces(sd.get("owner", ""))
+
+        if not sd_name:
+            missing_sd += 1
+            service_name = team
+        else:
+            service_name = sd_name
+
+        if not owner:
+            missing_owner += 1
+
+        bt = ""
+        if owner:
+            bt = clean_spaces(bk_map.get(normalize_name_key(owner), ""))
+        if owner and not bt:
+            missing_bt += 1
+
+        if SKIP_EMPTY_BUSINESS_TYPE and not bt:
+            continue
+
+        service_info[(team, code)] = {
+            "service_name": service_name,
+            "owner": owner,
+            "business_type": bt,
+        }
+
         service_to_cnt[(team, code)] = cnt
         total += cnt
 
@@ -339,16 +462,35 @@ def build_rows_agg_by_service(chat_map, db_counts, sheet_name):
     for (team, code), chat_ids in service_to_chat_ids.items():
         if (team, code) not in service_to_cnt:
             continue
+
         cnt = service_to_cnt[(team, code)]
         pct = 0.0 if total <= 0 else (cnt * 100.0 / total)
+
         chat_list = ",".join(sorted(chat_ids))
-        rows.append([team, code, chat_list, cnt, pct])
 
-    rows.sort(key=lambda x: (x[0], x[1]))
+        info = service_info.get((team, code), {})
+        bt = info.get("business_type", "")
+        service_name = info.get("service_name", team)
+        owner = info.get("owner", "")
 
-    log.info(f"[{sheet_name}] services_total_found={len(service_to_chat_ids)}")
-    log.info(f"[{sheet_name}] services_after_ban_and_zero={len(rows)} skipped_zero={skipped_zero}")
-    log.info(f"[{sheet_name}] total_messages={total} SKIP_ZERO_SERVICES={SKIP_ZERO_SERVICES} BAN_SERVICE_CODES={sorted(BAN_SERVICE_CODES)}")
+        rows.append([bt, service_name, code, owner, chat_list, cnt, pct])
+
+    rows.sort(key=lambda x: (clean_spaces(x[0]), clean_spaces(x[1]), x[2]))
+
+    log.info(f"[{sheet_name}] services_found={len(service_to_chat_ids)}")
+    log.info(f"[{sheet_name}] skipped_ban={skipped_ban} skipped_zero={skipped_zero}")
+    log.info(f"[{sheet_name}] missing_sd_name={missing_sd} missing_owner={missing_owner} missing_business_type={missing_bt}")
+    log.info(f"[{sheet_name}] total_messages={total} rows={len(rows)} SKIP_ZERO_SERVICES={SKIP_ZERO_SERVICES} BAN_SERVICE_CODES={sorted(BAN_SERVICE_CODES)}")
+
+    top = sorted(
+        [(service_to_cnt[k], k) for k in service_to_cnt.keys()],
+        reverse=True
+    )[:20]
+    for cnt, (team, code) in top:
+        info = service_info.get((team, code), {})
+        log.info(
+            f'[{sheet_name}] TOP code={code} team="{team}" service="{info.get("service_name","")}" owner="{info.get("owner","")}" type="{info.get("business_type","")}" msgs={cnt}'
+        )
 
     return rows, total
 
@@ -358,11 +500,13 @@ def write_excel(out_path, zeus_rows, am_rows):
     wb.remove(wb.active)
 
     headers = [
-        "Наименование команды",
-        "Код (номер команды)",
+        "Тип бизнеса",
+        "Наименование сервиса",
+        "КОД",
+        "Владелец сервиса",
         "Chat ID список",
         "Кол-во сообщений (сумма)",
-        "% от общего",
+        "% потребления",
     ]
 
     ws1 = wb.create_sheet("zeus")
@@ -380,9 +524,19 @@ def write_excel(out_path, zeus_rows, am_rows):
 
 
 def main():
+    log.info("==== START ====")
+    log.info(f"SINCE_DAYS={SINCE_DAYS}")
+    log.info(f"SKIP_ZERO_SERVICES={SKIP_ZERO_SERVICES}")
+    log.info(f"BAN_SERVICE_CODES={sorted(BAN_SERVICE_CODES)}")
+    log.info(f"SD_FILE={SD_FILE}")
+    log.info(f"BK_FILE={BK_FILE}")
+
     db_rows, since_str = get_chat_counts_since_days(SINCE_DAYS)
     db_counts = build_db_count_map(db_rows)
     db_chat_ids = set(db_counts.keys())
+
+    sd_map = read_sd_map(SD_FILE)
+    bk_map = load_bk_business_type_map(BK_FILE)
 
     gl = gl_connect()
     zeus_map, am_map = scan_gitlab(gl)
@@ -392,10 +546,12 @@ def main():
     log_chat_id_sets("zeus", set(zeus_map.keys()), db_chat_ids)
     log_chat_id_sets("alertmanager", set(am_map.keys()), db_chat_ids)
 
-    zeus_rows, _ = build_rows_agg_by_service(zeus_map, db_counts, "zeus")
-    am_rows, _ = build_rows_agg_by_service(am_map, db_counts, "alertmanager")
+    zeus_rows, _ = build_rows_agg_by_service(zeus_map, db_counts, sd_map, bk_map, "zeus")
+    am_rows, _ = build_rows_agg_by_service(am_map, db_counts, sd_map, bk_map, "alertmanager")
 
     write_excel(OUT_XLSX, zeus_rows, am_rows)
+
+    log.info("==== DONE ====")
 
 
 if __name__ == "__main__":
