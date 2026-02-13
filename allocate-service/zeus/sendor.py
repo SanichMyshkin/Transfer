@@ -44,6 +44,7 @@ HTTP_TIMEOUT_SEC = 30
 
 PROJECT_CODE_RE = re.compile(r"^(?P<team>.+)-(?P<code>\d+)$")
 HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
+CHAT_ID_NUM_RE = re.compile(r"^-?\d+$")
 
 
 def gl_connect():
@@ -144,14 +145,19 @@ def parse_team_and_code(project_path_with_namespace):
     return (m.group("team") or "").strip(), (m.group("code") or "").strip()
 
 
-def is_all_zeros(s):
-    s = str(s or "").strip()
+def normalize_chat_id(raw):
+    s = str(raw or "").strip()
     if not s:
-        return True
-    for ch in s:
-        if ch != "0":
-            return False
-    return True
+        return ""
+
+    if not CHAT_ID_NUM_RE.fullmatch(s):
+        return ""
+
+    core = s[1:] if s.startswith("-") else s
+    if core and set(core) == {"0"}:
+        return ""
+
+    return s
 
 
 def extract_chat_ids(text, project, path):
@@ -165,22 +171,21 @@ def extract_chat_ids(text, project, path):
         val = str(val or "").strip()
         if not val:
             return
+
         if val.startswith("{cipher}"):
             cipher = val[len("{cipher}") :].strip()
             if not HEX_RE.fullmatch(cipher):
                 log.error(f"[{project}] {path} -> invalid cipher: {val}")
                 return
             real = decrypt_cipher_hash(cipher)
-            real = str(real or "").strip()
-            if not real:
-                return
-            if is_all_zeros(real):
-                return
-            ids.add(real)
-        else:
-            if is_all_zeros(val):
-                return
-            ids.add(val)
+            real_id = normalize_chat_id(real)
+            if real_id:
+                ids.add(real_id)
+            return
+
+        real_id = normalize_chat_id(val)
+        if real_id:
+            ids.add(real_id)
 
     def walk(node):
         if isinstance(node, dict):
@@ -271,14 +276,14 @@ def scan_gitlab(gl):
 
             if need_zeus:
                 for cid in ids:
-                    zeus_map[str(cid).strip()].add(proj_name)
+                    zeus_map[cid].add(proj_name)
                 log.info(
                     f"[{proj_name}] {file_path} -> zeus found={len(ids)} ids={sorted(ids)[:20]}"
                 )
 
             if need_am:
                 for cid in ids:
-                    am_map[str(cid).strip()].add(proj_name)
+                    am_map[cid].add(proj_name)
                 log.info(
                     f"[{proj_name}] {file_path} -> alertmanager found={len(ids)} ids={sorted(ids)[:20]}"
                 )
@@ -295,7 +300,7 @@ def build_rows(chat_map, db_counts):
         total += cnt
         for proj in projects:
             team, code = parse_team_and_code(proj)
-            rows.append([team, code, str(chat_id).strip(), cnt])
+            rows.append([team, code, chat_id, cnt])
 
     for r in rows:
         cnt = int(r[3] or 0)
