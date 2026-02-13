@@ -116,7 +116,19 @@ def parse_yaml_with_heal(text, project, path):
         return yaml.safe_load(text)
     except yaml.YAMLError as e:
         log.error(f"[{project}] {path} -> YAML PARSE ERROR: {type(e).__name__}: {e}")
-        return None
+        snippet = text[:500].replace("\n", "\\n")
+        log.error(f"[{project}] {path} -> YAML SNIPPET: {snippet}")
+
+        healed = text.replace("\t", "  ")
+        try:
+            data = yaml.safe_load(healed)
+            log.warning(f"[{project}] {path} -> YAML healed")
+            return data
+        except yaml.YAMLError as e2:
+            log.error(
+                f"[{project}] {path} -> YAML HEAL FAILED: {type(e2).__name__}: {e2}"
+            )
+            return None
     except Exception as e:
         log.error(f"[{project}] {path} -> YAML UNKNOWN ERROR: {type(e).__name__}: {e}")
         return None
@@ -144,20 +156,22 @@ def extract_chat_ids(text, project, path):
             for k, v in node.items():
                 if str(k).lower() == "chat_id":
                     val = str(v).strip()
-                    if val.startswith("{cipher}"):
+                    if not val:
+                        pass
+                    elif val.startswith("{cipher}"):
                         cipher = val[len("{cipher}") :].strip()
                         if HEX_RE.fullmatch(cipher):
                             real = decrypt_cipher_hash(cipher)
                             if real:
                                 ids.add(str(real).strip())
+                        else:
+                            log.error(f"[{project}] {path} -> invalid cipher: {val}")
                     else:
                         ids.add(val)
                 walk(v)
-
         elif isinstance(node, list):
             for x in node:
                 walk(x)
-
         elif isinstance(node, str):
             try:
                 parsed = json.loads(node)
@@ -167,16 +181,6 @@ def extract_chat_ids(text, project, path):
 
     walk(data)
     return ids
-
-
-def is_zeus_file(path):
-    name = (path or "").lower().split("/")[-1]
-    return name.endswith("-monitors.yml") or name.endswith("-monitors.yaml")
-
-
-def is_alertmanager_file(path):
-    name = (path or "").lower().split("/")[-1]
-    return name in {"values.yml", "values.yaml", "alert.yml", "alert.yaml"}
 
 
 def scan_gitlab(gl):
@@ -202,26 +206,48 @@ def scan_gitlab(gl):
                 continue
 
             file_path = item.get("path") or ""
+            if not file_path:
+                continue
+
+            path_lower = file_path.lower()
+            parts = path_lower.split("/")
+            if not parts:
+                continue
+
+            root_dir = parts[0]
+            name = parts[-1]
+
+            need_zeus = root_dir.startswith("zeus") and (
+                name.endswith("-monitors.yml") or name.endswith("-monitors.yaml")
+            )
+
+            need_am = root_dir == "monitoring" and (
+                name in {"values.yml", "values.yaml", "alert.yml", "alert.yaml"}
+            )
+
+            if not (need_zeus or need_am):
+                continue
 
             try:
                 f = proj.files.get(file_path=file_path, ref=GIT_REF)
                 text = f.decode().decode("utf-8")
-            except Exception:
+            except Exception as e:
+                log.error(f"[{proj_name}] чтение {file_path}: {e}")
                 continue
 
-            if is_zeus_file(file_path):
-                ids = extract_chat_ids(text, proj_name, file_path)
+            ids = extract_chat_ids(text, proj_name, file_path)
+            if not ids:
+                continue
+
+            if need_zeus:
                 for cid in ids:
                     zeus_map[str(cid).strip()].add(proj_name)
-                if ids:
-                    log.info(f"[{proj_name}] {file_path} -> zeus ids={ids}")
+                log.info(f"[{proj_name}] {file_path} -> zeus found={len(ids)}")
 
-            if is_alertmanager_file(file_path):
-                ids = extract_chat_ids(text, proj_name, file_path)
+            if need_am:
                 for cid in ids:
                     am_map[str(cid).strip()].add(proj_name)
-                if ids:
-                    log.info(f"[{proj_name}] {file_path} -> alert ids={ids}")
+                log.info(f"[{proj_name}] {file_path} -> alertmanager found={len(ids)}")
 
     return zeus_map, am_map
 
@@ -232,16 +258,32 @@ def build_rows(chat_map, db_counts):
         cnt = int(db_counts.get(str(chat_id).strip(), 0))
         for proj in projects:
             team, code = parse_team_and_code(proj)
-            rows.append((team, code, chat_id, cnt))
+            rows.append((team, code, str(chat_id).strip(), cnt))
     rows.sort(key=lambda x: (x[0], x[1], x[2]))
     return rows
+
+
+def log_chat_id_sets(name, git_ids, db_ids):
+    git_sorted = sorted(git_ids)
+    db_sorted = sorted(db_ids)
+    log.info(f"[{name}] chat_id Git = {len(git_sorted)} sample={git_sorted[:50]}")
+    log.info(f"[{name}] chat_id DB  = {len(db_sorted)} sample={db_sorted[:50]}")
+    only_git = sorted(set(git_ids) - set(db_ids))
+    only_db = sorted(set(db_ids) - set(git_ids))
+    log.info(f"[{name}] Git-DB = {len(only_git)} sample={only_git[:50]}")
+    log.info(f"[{name}] DB-Git = {len(only_db)} sample={only_db[:50]}")
 
 
 def write_excel(out_path, zeus_rows, am_rows):
     wb = Workbook()
     wb.remove(wb.active)
 
-    headers = ["Наименование команды", "Код", "Chat ID", "Кол-во сообщений"]
+    headers = [
+        "Наименование команды",
+        "Код (номер команды)",
+        "Chat ID",
+        "Кол-во сообщений",
+    ]
 
     ws1 = wb.create_sheet("zeus")
     ws1.append(headers)
@@ -254,15 +296,21 @@ def write_excel(out_path, zeus_rows, am_rows):
         ws2.append(list(r))
 
     wb.save(out_path)
-    log.info(f"XLSX saved: {out_path}")
+    log.info(f"XLSX: saved {out_path}")
 
 
 def main():
     db_rows, since_str = get_chat_counts_since_days(SINCE_DAYS)
     db_counts = build_db_count_map(db_rows)
+    db_chat_ids = set(db_counts.keys())
 
     gl = gl_connect()
     zeus_map, am_map = scan_gitlab(gl)
+
+    log.info(f"since={since_str} days={SINCE_DAYS}")
+
+    log_chat_id_sets("zeus", set(zeus_map.keys()), db_chat_ids)
+    log_chat_id_sets("alertmanager", set(am_map.keys()), db_chat_ids)
 
     zeus_rows = build_rows(zeus_map, db_counts)
     am_rows = build_rows(am_map, db_counts)
