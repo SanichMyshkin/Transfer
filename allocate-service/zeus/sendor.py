@@ -144,6 +144,16 @@ def parse_team_and_code(project_path_with_namespace):
     return (m.group("team") or "").strip(), (m.group("code") or "").strip()
 
 
+def is_all_zeros(s):
+    s = str(s or "").strip()
+    if not s:
+        return True
+    for ch in s:
+        if ch != "0":
+            return False
+    return True
+
+
 def extract_chat_ids(text, project, path):
     data = parse_yaml_with_heal(text, project, path)
     if not data:
@@ -151,33 +161,37 @@ def extract_chat_ids(text, project, path):
 
     ids = set()
 
+    def add_id(val):
+        val = str(val or "").strip()
+        if not val:
+            return
+        if val.startswith("{cipher}"):
+            cipher = val[len("{cipher}") :].strip()
+            if not HEX_RE.fullmatch(cipher):
+                log.error(f"[{project}] {path} -> invalid cipher: {val}")
+                return
+            real = decrypt_cipher_hash(cipher)
+            real = str(real or "").strip()
+            if not real:
+                return
+            if is_all_zeros(real):
+                return
+            ids.add(real)
+        else:
+            if is_all_zeros(val):
+                return
+            ids.add(val)
+
     def walk(node):
         if isinstance(node, dict):
             for k, v in node.items():
                 kk = str(k).strip().lower()
-
-                if kk in {"chat_id", "chatid"}:  # chat_id и chatId
-                    val = str(v).strip()
-                    if val:
-                        if val.startswith("{cipher}"):
-                            cipher = val[len("{cipher}") :].strip()
-                            if HEX_RE.fullmatch(cipher):
-                                real = decrypt_cipher_hash(cipher)
-                                if real:
-                                    ids.add(str(real).strip())
-                            else:
-                                log.error(
-                                    f"[{project}] {path} -> invalid cipher: {val}"
-                                )
-                        else:
-                            ids.add(val)
-
+                if kk in {"chat_id", "chatid"}:
+                    add_id(v)
                 walk(v)
-
         elif isinstance(node, list):
             for x in node:
                 walk(x)
-
         elif isinstance(node, str):
             try:
                 parsed = json.loads(node)
@@ -274,13 +288,22 @@ def scan_gitlab(gl):
 
 def build_rows(chat_map, db_counts):
     rows = []
+    total = 0
+
     for chat_id, projects in chat_map.items():
         cnt = int(db_counts.get(str(chat_id).strip(), 0))
+        total += cnt
         for proj in projects:
             team, code = parse_team_and_code(proj)
-            rows.append((team, code, str(chat_id).strip(), cnt))
+            rows.append([team, code, str(chat_id).strip(), cnt])
+
+    for r in rows:
+        cnt = int(r[3] or 0)
+        pct = 0.0 if total <= 0 else (cnt * 100.0 / total)
+        r.append(pct)
+
     rows.sort(key=lambda x: (x[0], x[1], x[2]))
-    return rows
+    return rows, total
 
 
 def log_chat_id_sets(name, git_ids, db_ids):
@@ -303,17 +326,18 @@ def write_excel(out_path, zeus_rows, am_rows):
         "Код (номер команды)",
         "Chat ID",
         "Кол-во сообщений",
+        "% от общего",
     ]
 
     ws1 = wb.create_sheet("zeus")
     ws1.append(headers)
     for r in zeus_rows:
-        ws1.append(list(r))
+        ws1.append(r)
 
     ws2 = wb.create_sheet("alertmanager")
     ws2.append(headers)
     for r in am_rows:
-        ws2.append(list(r))
+        ws2.append(r)
 
     wb.save(out_path)
     log.info(f"XLSX: saved {out_path}")
@@ -332,8 +356,11 @@ def main():
     log_chat_id_sets("zeus", set(zeus_map.keys()), db_chat_ids)
     log_chat_id_sets("alertmanager", set(am_map.keys()), db_chat_ids)
 
-    zeus_rows = build_rows(zeus_map, db_counts)
-    am_rows = build_rows(am_map, db_counts)
+    zeus_rows, zeus_total = build_rows(zeus_map, db_counts)
+    am_rows, am_total = build_rows(am_map, db_counts)
+
+    log.info(f"[zeus] total_messages={zeus_total}")
+    log.info(f"[alertmanager] total_messages={am_total}")
 
     write_excel(OUT_XLSX, zeus_rows, am_rows)
 
