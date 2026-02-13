@@ -183,6 +183,20 @@ def extract_chat_ids(text, project, path):
     return ids
 
 
+def path_has_dir_startswith(parts, prefix):
+    for p in parts:
+        if p.startswith(prefix):
+            return True
+    return False
+
+
+def path_has_dir_equals(parts, name):
+    for p in parts:
+        if p == name:
+            return True
+    return False
+
+
 def scan_gitlab(gl):
     group = gl.groups.get(GROUP_ID)
     projects = group.projects.list(all=True, include_subgroups=True)
@@ -211,17 +225,13 @@ def scan_gitlab(gl):
 
             path_lower = file_path.lower()
             parts = path_lower.split("/")
-            if not parts:
-                continue
-
-            root_dir = parts[0]
             name = parts[-1]
 
-            need_zeus = root_dir.startswith("zeus") and (
+            need_zeus = path_has_dir_startswith(parts[:-1], "zeus") and (
                 name.endswith("-monitors.yml") or name.endswith("-monitors.yaml")
             )
 
-            need_am = root_dir == "monitoring" and (
+            need_am = path_has_dir_equals(parts[:-1], "monitoring") and (
                 name in {"values.yml", "values.yaml", "alert.yml", "alert.yaml"}
             )
 
@@ -242,12 +252,12 @@ def scan_gitlab(gl):
             if need_zeus:
                 for cid in ids:
                     zeus_map[str(cid).strip()].add(proj_name)
-                log.info(f"[{proj_name}] {file_path} -> zeus found={len(ids)}")
+                log.info(f"[{proj_name}] {file_path} -> zeus found={len(ids)} ids={sorted(ids)[:20]}")
 
             if need_am:
                 for cid in ids:
                     am_map[str(cid).strip()].add(proj_name)
-                log.info(f"[{proj_name}] {file_path} -> alertmanager found={len(ids)}")
+                log.info(f"[{proj_name}] {file_path} -> alertmanager found={len(ids)} ids={sorted(ids)[:20]}")
 
     return zeus_map, am_map
 
