@@ -93,32 +93,50 @@ def load_bk_login_business_type_map(path: str):
     return mp
 
 
-def resolve_business_type(creator_username, maintainers, bk_map):
+def resolve_business_type(project_name, creator_username, maintainers, bk_map):
     creator_key = normalize_login(creator_username)
 
     if creator_key:
         bt = bk_map.get(creator_key, "")
         if bt:
+            log.info(
+                f'BT project="{project_name}" source=creator login="{creator_username}" bt="{bt}"'
+            )
             return bt
+        else:
+            log.info(
+                f'BT project="{project_name}" creator="{creator_username}" not_found_in_bk'
+            )
 
     found = []
     for u in maintainers:
         k = normalize_login(u)
         t = bk_map.get(k, "")
         if t:
-            found.append(t)
+            found.append((u, t))
 
     if not found:
+        log.info(
+            f'BT project="{project_name}" source=none creator="{creator_username}" '
+            f'maintainers="{",".join(maintainers)}" bt=""'
+        )
         return ""
 
     counts = {}
-    for t in found:
+    for _, t in found:
         counts[t] = counts.get(t, 0) + 1
 
     max_cnt = max(counts.values())
     winners = [k for k, v in counts.items() if v == max_cnt]
     winners.sort()
-    return winners[0]
+    bt = winners[0]
+
+    log.info(
+        f'BT project="{project_name}" source=maintainers '
+        f'found={found} counts={counts} chosen="{bt}"'
+    )
+
+    return bt
 
 
 def main():
@@ -171,7 +189,9 @@ def main():
             maintainers_unique = sorted(set(maintainers))
             maintainers_str = ",".join(maintainers_unique)
 
-            bt = resolve_business_type(creator_username, maintainers_unique, bk_map)
+            bt = resolve_business_type(
+                proj_name, creator_username, maintainers_unique, bk_map
+            )
 
             stats = getattr(full, "statistics", {}) or {}
             size_bytes = int(stats.get("repository_size", 0) or 0)
@@ -182,6 +202,7 @@ def main():
         except Exception as e:
             errors += 1
             ws.append([proj_name, "", "", "", f"ERROR: {e}"])
+            log.warning(f'FAIL project="{proj_name}" err={e}')
 
         if LOG_EVERY and i % LOG_EVERY == 0:
             elapsed = time.time() - start_ts
