@@ -66,7 +66,7 @@ def main():
     errors = 0
     start_ts = time.time()
 
-    user_cache = {}  # user_id -> "username (Name)" or "username"
+    user_cache = {}
 
     log.info(f"Listing projects (limit={MAX_PROJECTS})...")
 
@@ -81,22 +81,17 @@ def main():
 
         try:
             full = gl.projects.get(proj_id, statistics=True)
-
-            # creator
-            creator_str = ""
+            creator_username = ""
             creator_id = getattr(full, "creator_id", None)
             if creator_id:
                 if creator_id in user_cache:
-                    creator_str = user_cache[creator_id]
+                    creator_username = user_cache[creator_id]
                 else:
                     u = gl.users.get(creator_id)
-                    username = (getattr(u, "username", "") or "").strip()
-                    name = (getattr(u, "name", "") or "").strip()
-                    creator_str = f"{username} ({name})" if username and name and name != username else (username or name or str(creator_id))
-                    user_cache[creator_id] = creator_str
+                    creator_username = (getattr(u, "username", "") or "").strip()
+                    user_cache[creator_id] = creator_username
 
-            # maintainers (and выше)
-            maint = []
+            maintainers = []
             try:
                 members = full.members_all.list(all=True)
             except Exception:
@@ -104,21 +99,18 @@ def main():
 
             for m in members:
                 lvl = int(getattr(m, "access_level", 0) or 0)
-                if lvl >= 40:  # Maintainer(40) и выше
+                if lvl >= 40:
                     uname = (getattr(m, "username", "") or "").strip()
-                    name = (getattr(m, "name", "") or "").strip()
-                    s = f"{uname} ({name})" if uname and name and name != uname else (uname or name)
-                    if s:
-                        maint.append(s)
+                    if uname:
+                        maintainers.append(uname)
 
-            maintainers_str = ", ".join(sorted(set(maint)))
+            maintainers_str = ",".join(sorted(set(maintainers)))
 
-            # size
             stats = getattr(full, "statistics", {}) or {}
             size_bytes = int(stats.get("repository_size", 0) or 0)
             size_human = humanize.naturalsize(size_bytes, binary=True)
 
-            ws.append([proj_name, creator_str, maintainers_str, size_human])
+            ws.append([proj_name, creator_username, maintainers_str, size_human])
 
         except Exception as e:
             errors += 1
