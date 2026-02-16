@@ -9,24 +9,23 @@ from dotenv import load_dotenv
 
 import humanize
 from openpyxl import Workbook
-from openpyxl.styles import Font
-from openpyxl.utils import get_column_letter
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 load_dotenv()
 
 GITLAB_URL = os.getenv("GITLAB_URL")
 GITLAB_TOKEN = os.getenv("GITLAB_TOKEN")
-OUTPUT_XLSX = os.getenv("OUTPUT_XLSX", "gitlab_projects.xlsx")
 
-SLEEP_SEC = float(os.getenv("SLEEP_SEC", "0.05"))
-SSL_VERIFY = False
+OUTPUT_XLSX = os.getenv("OUTPUT_XLSX", "gitlab_projects.xlsx")
+PROGRESS_EVERY = int(os.getenv("PROGRESS_EVERY", "100"))
+SLEEP_SEC = float(os.getenv("SLEEP_SEC", "0.02"))
+SSL_VERIFY = os.getenv("SSL_VERIFY", "false").lower() in ("1", "true", "yes")
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    format="%(asctime)s | %(levelname)s | %(message)s",
 )
-log = logging.getLogger("gitlab_projects_3cols")
+log = logging.getLogger("gitlab_projects")
 
 
 def die(msg: str, code: int = 2):
@@ -36,28 +35,18 @@ def die(msg: str, code: int = 2):
 
 def human_size(n: int) -> str:
     try:
-        n = int(n or 0)
+        return humanize.naturalsize(int(n or 0), binary=True)
     except Exception:
-        n = 0
-    return humanize.naturalsize(n, binary=True)
+        return "0 B"
 
 
-def autosize(ws):
-    for col in ws.columns:
-        max_len = 0
-        col_letter = get_column_letter(col[0].column)
-        for cell in col:
-            v = "" if cell.value is None else str(cell.value)
-            max_len = max(max_len, len(v))
-        ws.column_dimensions[col_letter].width = min(max_len + 2, 60)
-
-
-def get_gitlab_connection() -> gitlab.Gitlab:
+def connect() -> gitlab.Gitlab:
     if not GITLAB_URL:
-        die("Не задан GITLAB_URL")
+        die("GITLAB_URL не задан")
     if not GITLAB_TOKEN:
-        die("Не задан GITLAB_TOKEN")
+        die("GITLAB_TOKEN не задан")
 
+    log.info(f"Connect GitLab url={GITLAB_URL} ssl_verify={SSL_VERIFY}")
     gl = gitlab.Gitlab(
         GITLAB_URL,
         private_token=GITLAB_TOKEN,
@@ -65,65 +54,77 @@ def get_gitlab_connection() -> gitlab.Gitlab:
         timeout=60,
     )
     gl.auth()
+    log.info("Auth OK")
     return gl
 
 
-def collect_rows(gl: gitlab.Gitlab):
-    rows = []
-    projects = gl.projects.list(all=True, iterator=True)
+def fmt_eta(seconds: float) -> str:
+    if seconds is None or seconds < 0:
+        return "-"
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    if h:
+        return f"{h}h{m:02d}m"
+    if m:
+        return f"{m}m{s:02d}s"
+    return f"{s}s"
 
-    for idx, p in enumerate(projects, start=1):
+
+def main():
+    gl = connect()
+    log.info("Listing projects...")
+    projects = list(gl.projects.list(all=True, iterator=True))
+    total = len(projects)
+    log.info(f"Total projects: {total}")
+
+    out_path = str(Path(OUTPUT_XLSX).resolve())
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Projects"
+    ws.append(["project", "owner", "size"])
+
+    start = time.time()
+    errors = 0
+
+    for i, p in enumerate(projects, start=1):
+        t0 = time.time()
         try:
             full = gl.projects.get(p.id, statistics=True)
 
-            project_name = full.path_with_namespace or full.name
+            project_name = full.path_with_namespace or full.name or str(full.id)
 
             ns = getattr(full, "namespace", {}) or {}
             owner = (ns.get("full_path") or ns.get("name") or "").strip()
 
             stats = getattr(full, "statistics", {}) or {}
-            repo_size_bytes = stats.get("repository_size", 0)
+            size_bytes = stats.get("repository_size", 0)
 
-            rows.append((project_name, owner, human_size(repo_size_bytes)))
-
-            if idx % 200 == 0:
-                log.info(f"Обработано проектов: {idx}")
-
-            time.sleep(SLEEP_SEC)
+            ws.append([project_name, owner, human_size(size_bytes)])
 
         except Exception as e:
-            log.warning(f"Ошибка проекта {getattr(p, 'id', '?')}: {e}")
-            continue
+            errors += 1
+            ws.append([getattr(p, "path_with_namespace", "") or str(getattr(p, "id", "")), "", ""])
+            log.warning(f"FAIL project_id={getattr(p, 'id', '?')} err={e}")
 
-    return rows
+        if SLEEP_SEC > 0:
+            time.sleep(SLEEP_SEC)
 
+        if i == 1 or i % PROGRESS_EVERY == 0 or i == total:
+            elapsed = time.time() - start
+            rate = i / elapsed if elapsed > 0 else 0.0
+            remaining = (total - i) / rate if rate > 0 else None
+            last_ms = (time.time() - t0) * 1000.0
 
-def write_excel(rows, filename: str):
-    filename = str(Path(filename).resolve())
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Projects"
+            log.info(
+                "Progress %d/%d (%.1f%%) | ok=%d err=%d | %.2f proj/s | eta=%s | last=%.0fms",
+                i, total, (i / total * 100.0) if total else 0.0,
+                i - errors, errors,
+                rate, fmt_eta(remaining),
+                last_ms,
+            )
 
-    headers = ["project", "owner", "repo_size"]
-    ws.append(headers)
-    for c in range(1, 4):
-        ws.cell(row=1, column=c).font = Font(bold=True)
-
-    for row in rows:
-        ws.append(list(row))
-
-    ws.freeze_panes = "A2"
-    autosize(ws)
-    wb.save(filename)
-    log.info(f"Excel сохранён: {filename}")
-    return filename
-
-
-def main():
-    gl = get_gitlab_connection()
-    rows = collect_rows(gl)
-    write_excel(rows, OUTPUT_XLSX)
-    log.info("Готово.")
+    wb.save(out_path)
+    log.info(f"Saved: {out_path} | rows={total} errors={errors}")
 
 
 if __name__ == "__main__":
