@@ -5,8 +5,8 @@ from pathlib import Path
 
 import urllib3
 import gitlab
+import pandas as pd
 from dotenv import load_dotenv
-
 import humanize
 from openpyxl import Workbook
 
@@ -15,13 +15,14 @@ load_dotenv()
 
 GITLAB_URL = os.getenv("GITLAB_URL")
 GITLAB_TOKEN = os.getenv("GITLAB_TOKEN")
+BK_FILE = os.getenv("BK_FILE", "bk_all_users.xlsx")
 
 OUTPUT_XLSX = os.getenv("OUTPUT_XLSX", "gitlab_projects.xlsx")
-SLEEP_SEC = float(os.getenv("SLEEP_SEC", "0.02"))
-SSL_VERIFY = False
-LOG_EVERY = int(os.getenv("LOG_EVERY", "25"))
 
+SLEEP_SEC = 0.02
+SSL_VERIFY = False
 MAX_PROJECTS = 50
+LOG_EVERY = 25
 
 logging.basicConfig(
     level=logging.INFO,
@@ -35,13 +36,17 @@ def die(msg: str, code: int = 2):
     raise SystemExit(code)
 
 
-def connect() -> gitlab.Gitlab:
+def normalize_login(x: str) -> str:
+    return (x or "").strip().lower()
+
+
+def connect():
     if not GITLAB_URL:
         die("GITLAB_URL не задан")
     if not GITLAB_TOKEN:
         die("GITLAB_TOKEN не задан")
 
-    log.info(f"Connect GitLab url={GITLAB_URL} ssl_verify={SSL_VERIFY}")
+    log.info(f"Connect GitLab url={GITLAB_URL}")
     gl = gitlab.Gitlab(
         GITLAB_URL,
         private_token=GITLAB_TOKEN,
@@ -54,33 +59,89 @@ def connect() -> gitlab.Gitlab:
     return gl
 
 
+def load_bk_login_business_type_map(path: str):
+    if not path or not os.path.isfile(path):
+        die(f"BK_FILE не найден: {path}")
+
+    df = pd.read_excel(path, dtype=str, engine="openpyxl").fillna("")
+
+    # ВСТАВЬ ТОЧНЫЕ ИМЕНА КОЛОНОК ИЗ ТВОЕГО BK
+    login_col = "BD login"
+    business_col = "Тип бизнеса"
+
+    if login_col not in df.columns:
+        die(f"В BK нет колонки: {login_col}")
+
+    if business_col not in df.columns:
+        die(f"В BK нет колонки: {business_col}")
+
+    df["login_key"] = df[login_col].map(normalize_login)
+    df["business_type"] = df[business_col].astype(str).str.strip()
+
+    df = df[df["login_key"] != ""]
+    df = df.drop_duplicates("login_key", keep="last")
+
+    mp = dict(zip(df["login_key"], df["business_type"]))
+
+    log.info(f"BK: загружено login → тип бизнеса: {len(mp)}")
+    return mp
+
+
+def resolve_business_type(creator_username, maintainers, bk_map):
+    if creator_username:
+        bt = bk_map.get(normalize_login(creator_username), "")
+        if bt:
+            return bt
+
+    types = []
+    for u in maintainers:
+        t = bk_map.get(normalize_login(u), "")
+        if t:
+            types.append(t)
+
+    if not types:
+        return ""
+
+    counts = {}
+    for t in types:
+        counts[t] = counts.get(t, 0) + 1
+
+    max_cnt = max(counts.values())
+    winners = [k for k, v in counts.items() if v == max_cnt]
+    winners.sort()
+
+    return winners[0]
+
+
 def main():
     gl = connect()
+    bk_map = load_bk_login_business_type_map(BK_FILE)
 
     out_path = str(Path(OUTPUT_XLSX).resolve())
     wb = Workbook()
     ws = wb.active
     ws.title = "Projects"
-    ws.append(["project", "creator", "maintainers", "size"])
+    ws.append(["project", "creator", "maintainers", "business_type", "size"])
 
+    user_cache = {}
     errors = 0
     start_ts = time.time()
 
-    user_cache = {}
-
-    log.info(f"Listing projects (limit={MAX_PROJECTS})...")
+    log.info(f"Start listing projects (limit={MAX_PROJECTS})")
 
     for i, p in enumerate(gl.projects.list(all=True, iterator=True), start=1):
         if i > MAX_PROJECTS:
             break
 
         proj_id = getattr(p, "id", None)
-        proj_name = getattr(p, "path_with_namespace", None) or getattr(p, "name", None) or str(proj_id)
+        proj_name = getattr(p, "path_with_namespace", None) or getattr(p, "name", None)
 
         log.info(f"PROJECT i={i} id={proj_id} name={proj_name}")
 
         try:
             full = gl.projects.get(proj_id, statistics=True)
+
+            # creator
             creator_username = ""
             creator_id = getattr(full, "creator_id", None)
             if creator_id:
@@ -91,6 +152,7 @@ def main():
                     creator_username = (getattr(u, "username", "") or "").strip()
                     user_cache[creator_id] = creator_username
 
+            # maintainers
             maintainers = []
             try:
                 members = full.members_all.list(all=True)
@@ -104,20 +166,35 @@ def main():
                     if uname:
                         maintainers.append(uname)
 
-            maintainers_str = ",".join(sorted(set(maintainers)))
+            maintainers_unique = sorted(set(maintainers))
+            maintainers_str = ",".join(maintainers_unique)
 
+            # business type
+            bt = resolve_business_type(
+                creator_username,
+                maintainers_unique,
+                bk_map,
+            )
+
+            # size
             stats = getattr(full, "statistics", {}) or {}
             size_bytes = int(stats.get("repository_size", 0) or 0)
             size_human = humanize.naturalsize(size_bytes, binary=True)
 
-            ws.append([proj_name, creator_username, maintainers_str, size_human])
+            ws.append([
+                proj_name,
+                creator_username,
+                maintainers_str,
+                bt,
+                size_human,
+            ])
 
         except Exception as e:
             errors += 1
-            ws.append([proj_name, "", "", f"ERROR: {e}"])
+            ws.append([proj_name, "", "", "", f"ERROR: {e}"])
             log.warning(f"FAIL i={i} project_id={proj_id} err={e}")
 
-        if LOG_EVERY > 0 and i % LOG_EVERY == 0:
+        if LOG_EVERY and i % LOG_EVERY == 0:
             elapsed = time.time() - start_ts
             rate = i / elapsed if elapsed > 0 else 0
             log.info(f"PROGRESS i={i} rate={rate:.2f} proj/s errors={errors}")
