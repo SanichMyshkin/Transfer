@@ -21,6 +21,8 @@ SLEEP_SEC = float(os.getenv("SLEEP_SEC", "0.02"))
 SSL_VERIFY = False
 LOG_EVERY = int(os.getenv("LOG_EVERY", "25"))
 
+MAX_PROJECTS = 50
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -59,36 +61,68 @@ def main():
     wb = Workbook()
     ws = wb.active
     ws.title = "Projects"
-    ws.append(["project", "owner", "size"])
+    ws.append(["project", "creator", "maintainers", "size"])
 
     errors = 0
     start_ts = time.time()
 
-    log.info("Listing projects (stream)...")
+    user_cache = {}  # user_id -> "username (Name)" or "username"
+
+    log.info(f"Listing projects (limit={MAX_PROJECTS})...")
 
     for i, p in enumerate(gl.projects.list(all=True, iterator=True), start=1):
+        if i > MAX_PROJECTS:
+            break
+
         proj_id = getattr(p, "id", None)
         proj_name = getattr(p, "path_with_namespace", None) or getattr(p, "name", None) or str(proj_id)
 
         log.info(f"PROJECT i={i} id={proj_id} name={proj_name}")
 
         try:
-            stats = getattr(p, "statistics", None)
-            if stats:
-                ns = getattr(p, "namespace", {}) or {}
-            else:
-                full = gl.projects.get(proj_id, statistics=True)
-                ns = getattr(full, "namespace", {}) or {}
-                stats = getattr(full, "statistics", {}) or {}
+            full = gl.projects.get(proj_id, statistics=True)
 
-            owner = (ns.get("full_path") or ns.get("name") or "").strip()
+            # creator
+            creator_str = ""
+            creator_id = getattr(full, "creator_id", None)
+            if creator_id:
+                if creator_id in user_cache:
+                    creator_str = user_cache[creator_id]
+                else:
+                    u = gl.users.get(creator_id)
+                    username = (getattr(u, "username", "") or "").strip()
+                    name = (getattr(u, "name", "") or "").strip()
+                    creator_str = f"{username} ({name})" if username and name and name != username else (username or name or str(creator_id))
+                    user_cache[creator_id] = creator_str
 
-            size_bytes = int((stats or {}).get("repository_size", 0) or 0)
-            ws.append([proj_name, owner, humanize.naturalsize(size_bytes, binary=True)])
+            # maintainers (and выше)
+            maint = []
+            try:
+                members = full.members_all.list(all=True)
+            except Exception:
+                members = full.members.list(all=True)
+
+            for m in members:
+                lvl = int(getattr(m, "access_level", 0) or 0)
+                if lvl >= 40:  # Maintainer(40) и выше
+                    uname = (getattr(m, "username", "") or "").strip()
+                    name = (getattr(m, "name", "") or "").strip()
+                    s = f"{uname} ({name})" if uname and name and name != uname else (uname or name)
+                    if s:
+                        maint.append(s)
+
+            maintainers_str = ", ".join(sorted(set(maint)))
+
+            # size
+            stats = getattr(full, "statistics", {}) or {}
+            size_bytes = int(stats.get("repository_size", 0) or 0)
+            size_human = humanize.naturalsize(size_bytes, binary=True)
+
+            ws.append([proj_name, creator_str, maintainers_str, size_human])
 
         except Exception as e:
             errors += 1
-            ws.append([proj_name, "", f"ERROR: {e}"])
+            ws.append([proj_name, "", "", f"ERROR: {e}"])
             log.warning(f"FAIL i={i} project_id={proj_id} err={e}")
 
         if LOG_EVERY > 0 and i % LOG_EVERY == 0:
