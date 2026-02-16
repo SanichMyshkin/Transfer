@@ -24,8 +24,6 @@ SSL_VERIFY = False
 MAX_PROJECTS = 50
 LOG_EVERY = 25
 
-DEBUG_BT = os.getenv("DEBUG_BT", "0").strip() in ("1", "true", "yes", "y")
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -55,7 +53,6 @@ def connect():
     if not GITLAB_TOKEN:
         die("GITLAB_TOKEN не задан")
 
-    log.info(f"Connect GitLab url={GITLAB_URL} ssl_verify={SSL_VERIFY}")
     gl = gitlab.Gitlab(
         GITLAB_URL,
         private_token=GITLAB_TOKEN,
@@ -64,7 +61,6 @@ def connect():
         per_page=100,
     )
     gl.auth()
-    log.info("Auth OK")
     return gl
 
 
@@ -72,38 +68,37 @@ def load_bk_login_business_type_map(path: str):
     if not path or not os.path.isfile(path):
         die(f"BK_FILE не найден: {path}")
 
-    df = pd.read_excel(path, usecols="BD,AS", dtype=str, engine="openpyxl").fillna("")
-    df.columns = ["login", "business_type"]
+    LOGIN_COL_IDX = 55
+    BUSINESS_TYPE_COL_IDX = 44
 
-    df["login_key"] = df["login"].map(normalize_login)
-    df["business_type"] = df["business_type"].astype(str).map(clean_spaces)
+    df = pd.read_excel(path, dtype=str, engine="openpyxl", header=0).fillna("")
 
-    df = df[df["login_key"] != ""].drop_duplicates("login_key", keep="last")
-    mp = dict(zip(df["login_key"], df["business_type"]))
+    max_idx = max(LOGIN_COL_IDX, BUSINESS_TYPE_COL_IDX)
+    if df.shape[1] <= max_idx:
+        die(
+            f"BK_FILE: недостаточно колонок: cols={df.shape[1]}, "
+            f"нужен минимум индекс {max_idx}"
+        )
+
+    sub = df.iloc[:, [LOGIN_COL_IDX, BUSINESS_TYPE_COL_IDX]].copy()
+    sub.columns = ["login", "business_type"]
+
+    sub["login_key"] = sub["login"].map(normalize_login)
+    sub["business_type"] = sub["business_type"].astype(str).map(clean_spaces)
+
+    sub = sub[sub["login_key"] != ""].drop_duplicates("login_key", keep="last")
+    mp = dict(zip(sub["login_key"], sub["business_type"]))
 
     log.info(f"BK: загружено login → тип бизнеса: {len(mp)}")
-
-    if DEBUG_BT:
-        non_empty_bt = sum(1 for v in mp.values() if clean_spaces(v))
-        log.info(f"BK: непустых типов бизнеса: {non_empty_bt}")
-        sample = list(mp.items())[:5]
-        log.info(f"BK sample (first 5): {sample}")
-
     return mp
 
 
-def resolve_business_type(creator_username, maintainers, bk_map, project_name=""):
+def resolve_business_type(creator_username, maintainers, bk_map):
     creator_key = normalize_login(creator_username)
-    if DEBUG_BT:
-        log.info(f'BTDBG project="{project_name}" creator="{creator_username}" creator_key="{creator_key}"')
 
     if creator_key:
         bt = bk_map.get(creator_key, "")
-        if DEBUG_BT:
-            log.info(f'BTDBG project="{project_name}" creator_lookup found={"YES" if creator_key in bk_map else "NO"} bt="{bt}"')
         if bt:
-            if DEBUG_BT:
-                log.info(f'BTDBG project="{project_name}" RESULT source=creator bt="{bt}"')
             return bt
 
     found = []
@@ -111,31 +106,19 @@ def resolve_business_type(creator_username, maintainers, bk_map, project_name=""
         k = normalize_login(u)
         t = bk_map.get(k, "")
         if t:
-            found.append((u, t))
-
-    if DEBUG_BT:
-        log.info(f'BTDBG project="{project_name}" maintainers="{",".join(maintainers)}"')
-        log.info(f'BTDBG project="{project_name}" maint_found={found}')
+            found.append(t)
 
     if not found:
-        if DEBUG_BT:
-            log.info(f'BTDBG project="{project_name}" RESULT source=none bt=""')
         return ""
 
     counts = {}
-    for _, t in found:
+    for t in found:
         counts[t] = counts.get(t, 0) + 1
 
     max_cnt = max(counts.values())
     winners = [k for k, v in counts.items() if v == max_cnt]
     winners.sort()
-    bt = winners[0]
-
-    if DEBUG_BT:
-        log.info(f'BTDBG project="{project_name}" maint_counts={counts}')
-        log.info(f'BTDBG project="{project_name}" RESULT source=maint_majority bt="{bt}"')
-
-    return bt
+    return winners[0]
 
 
 def main():
@@ -152,16 +135,12 @@ def main():
     errors = 0
     start_ts = time.time()
 
-    log.info(f"Start listing projects (limit={MAX_PROJECTS})")
-
     for i, p in enumerate(gl.projects.list(all=True, iterator=True), start=1):
         if i > MAX_PROJECTS:
             break
 
         proj_id = getattr(p, "id", None)
         proj_name = getattr(p, "path_with_namespace", None) or getattr(p, "name", None) or str(proj_id)
-
-        log.info(f"PROJECT i={i} id={proj_id} name={proj_name}")
 
         try:
             full = gl.projects.get(proj_id, statistics=True)
@@ -192,7 +171,7 @@ def main():
             maintainers_unique = sorted(set(maintainers))
             maintainers_str = ",".join(maintainers_unique)
 
-            bt = resolve_business_type(creator_username, maintainers_unique, bk_map, project_name=proj_name)
+            bt = resolve_business_type(creator_username, maintainers_unique, bk_map)
 
             stats = getattr(full, "statistics", {}) or {}
             size_bytes = int(stats.get("repository_size", 0) or 0)
@@ -203,7 +182,6 @@ def main():
         except Exception as e:
             errors += 1
             ws.append([proj_name, "", "", "", f"ERROR: {e}"])
-            log.warning(f"FAIL i={i} project_id={proj_id} err={e}")
 
         if LOG_EVERY and i % LOG_EVERY == 0:
             elapsed = time.time() - start_ts
