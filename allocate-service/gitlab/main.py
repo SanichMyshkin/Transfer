@@ -24,6 +24,8 @@ SSL_VERIFY = False
 MAX_PROJECTS = 50
 LOG_EVERY = 25
 
+DEBUG_BT = os.getenv("DEBUG_BT", "0").strip() in ("1", "true", "yes", "y")
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -80,32 +82,60 @@ def load_bk_login_business_type_map(path: str):
     mp = dict(zip(df["login_key"], df["business_type"]))
 
     log.info(f"BK: загружено login → тип бизнеса: {len(mp)}")
+
+    if DEBUG_BT:
+        non_empty_bt = sum(1 for v in mp.values() if clean_spaces(v))
+        log.info(f"BK: непустых типов бизнеса: {non_empty_bt}")
+        sample = list(mp.items())[:5]
+        log.info(f"BK sample (first 5): {sample}")
+
     return mp
 
 
-def resolve_business_type(creator_username, maintainers, bk_map):
-    if creator_username:
-        bt = bk_map.get(normalize_login(creator_username), "")
+def resolve_business_type(creator_username, maintainers, bk_map, project_name=""):
+    creator_key = normalize_login(creator_username)
+    if DEBUG_BT:
+        log.info(f'BTDBG project="{project_name}" creator="{creator_username}" creator_key="{creator_key}"')
+
+    if creator_key:
+        bt = bk_map.get(creator_key, "")
+        if DEBUG_BT:
+            log.info(f'BTDBG project="{project_name}" creator_lookup found={"YES" if creator_key in bk_map else "NO"} bt="{bt}"')
         if bt:
+            if DEBUG_BT:
+                log.info(f'BTDBG project="{project_name}" RESULT source=creator bt="{bt}"')
             return bt
 
-    types = []
+    found = []
     for u in maintainers:
-        t = bk_map.get(normalize_login(u), "")
+        k = normalize_login(u)
+        t = bk_map.get(k, "")
         if t:
-            types.append(t)
+            found.append((u, t))
 
-    if not types:
+    if DEBUG_BT:
+        log.info(f'BTDBG project="{project_name}" maintainers="{",".join(maintainers)}"')
+        log.info(f'BTDBG project="{project_name}" maint_found={found}')
+
+    if not found:
+        if DEBUG_BT:
+            log.info(f'BTDBG project="{project_name}" RESULT source=none bt=""')
         return ""
 
     counts = {}
-    for t in types:
+    for _, t in found:
         counts[t] = counts.get(t, 0) + 1
 
     max_cnt = max(counts.values())
     winners = [k for k, v in counts.items() if v == max_cnt]
     winners.sort()
-    return winners[0]
+    bt = winners[0]
+
+    if DEBUG_BT:
+        log.info(f'BTDBG project="{project_name}" maint_counts={counts}')
+        log.info(f'BTDBG project="{project_name}" RESULT source=maint_majority bt="{bt}"')
+
+    return bt
 
 
 def main():
@@ -162,7 +192,7 @@ def main():
             maintainers_unique = sorted(set(maintainers))
             maintainers_str = ",".join(maintainers_unique)
 
-            bt = resolve_business_type(creator_username, maintainers_unique, bk_map)
+            bt = resolve_business_type(creator_username, maintainers_unique, bk_map, project_name=proj_name)
 
             stats = getattr(full, "statistics", {}) or {}
             size_bytes = int(stats.get("repository_size", 0) or 0)
