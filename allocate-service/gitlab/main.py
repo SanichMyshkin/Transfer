@@ -147,12 +147,7 @@ def main():
     log.info("Получение данных из файла бк")
     bk_map = load_bk_login_business_type_map(BK_FILE)
 
-    out_path = str(Path(OUTPUT_XLSX).resolve())
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Projects"
-    ws.append(["project", "creator", "maintainers", "business_type", "size", "job_artifacts_size"])
-
+    totals = {}
     user_cache = {}
     errors = 0
     start_ts = time.time()
@@ -195,29 +190,28 @@ def main():
                         maintainers.append(uname)
 
             maintainers_unique = sorted(set(maintainers))
-            maintainers_str = ",".join(maintainers_unique)
 
             bt = resolve_business_type(
                 proj_name, creator_username, maintainers_unique, bk_map
             )
 
             stats = getattr(full, "statistics", {}) or {}
+            repo_bytes = int(stats.get("repository_size", 0) or 0)
+            job_bytes = int(stats.get("job_artifacts_size", 0) or 0)
 
-            size_bytes = int(stats.get("repository_size", 0) or 0)
-            size_human = humanize.naturalsize(size_bytes, binary=True)
+            if bt not in totals:
+                totals[bt] = {"repo_bytes": 0, "job_bytes": 0, "projects": 0}
 
-            ja_bytes = int(stats.get("job_artifacts_size", 0) or 0)
-            ja_human = humanize.naturalsize(ja_bytes, binary=True) if ja_bytes > 0 else ""
+            totals[bt]["repo_bytes"] += repo_bytes
+            totals[bt]["job_bytes"] += job_bytes
+            totals[bt]["projects"] += 1
 
             log.info(
-                f'PROJECT done name="{proj_name}" repo_size="{size_human}" job_artifacts_size="{ja_human or 0}"'
+                f'PROJECT done name="{proj_name}" bt="{bt}" repo="{humanize.naturalsize(repo_bytes, binary=True)}" job="{humanize.naturalsize(job_bytes, binary=True) if job_bytes > 0 else 0}"'
             )
-
-            ws.append([proj_name, creator_username, maintainers_str, bt, size_human, ja_human])
 
         except Exception as e:
             errors += 1
-            ws.append([proj_name, "", "", "", f"ERROR: {e}", ""])
             log.warning(f'FAIL project="{proj_name}" err={e}')
 
         if LOG_EVERY and i % LOG_EVERY == 0:
@@ -227,6 +221,37 @@ def main():
 
         if SLEEP_SEC > 0:
             time.sleep(SLEEP_SEC)
+
+    out_path = str(Path(OUTPUT_XLSX).resolve())
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "BusinessTypes"
+    ws.append(["business_type", "repo_size", "job_artifacts_size", "total_size", "percent_of_total"])
+
+    grand_total = 0
+    for v in totals.values():
+        grand_total += int(v["repo_bytes"]) + int(v["job_bytes"])
+
+    rows = []
+    for bt, v in totals.items():
+        repo_b = int(v["repo_bytes"])
+        job_b = int(v["job_bytes"])
+        total_b = repo_b + job_b
+        pct = (total_b / grand_total * 100.0) if grand_total > 0 else 0.0
+        rows.append((bt, repo_b, job_b, total_b, pct))
+
+    rows.sort(key=lambda x: x[3], reverse=True)
+
+    for bt, repo_b, job_b, total_b, pct in rows:
+        ws.append(
+            [
+                bt,
+                humanize.naturalsize(repo_b, binary=True),
+                (humanize.naturalsize(job_b, binary=True) if job_b > 0 else ""),
+                humanize.naturalsize(total_b, binary=True),
+                round(pct, 2),
+            ]
+        )
 
     wb.save(out_path)
     log.info(f"Saved: {out_path} | rows={ws.max_row - 1} errors={errors}")
