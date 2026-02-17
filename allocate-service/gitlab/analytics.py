@@ -26,7 +26,7 @@ MAX_PROJECTS = 50
 LOG_EVERY = 25
 
 BAN_BUSINESS_TYPE = {
-    "пуп",
+    "Блок розничного бизнеса",
 }
 
 logging.basicConfig(

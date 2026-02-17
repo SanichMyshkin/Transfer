@@ -9,6 +9,7 @@ import pandas as pd
 from dotenv import load_dotenv
 import humanize
 from openpyxl import Workbook
+from openpyxl.styles import Font
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 load_dotenv()
@@ -25,7 +26,7 @@ MAX_PROJECTS = 50
 LOG_EVERY = 25
 
 BAN_BUSINESS_TYPE = {
-    "Пока ничего",
+    "пуп",
 }
 
 logging.basicConfig(
@@ -78,6 +79,13 @@ def load_bk_login_business_type_map(path: str):
 
     df = pd.read_excel(path, dtype=str, engine="openpyxl", header=0).fillna("")
 
+    max_idx = max(LOGIN_COL_IDX, BUSINESS_TYPE_COL_IDX)
+    if df.shape[1] <= max_idx:
+        die(
+            f"BK_FILE: недостаточно колонок: cols={df.shape[1]}, "
+            f"нужен минимум индекс {max_idx}"
+        )
+
     sub = df.iloc[:, [LOGIN_COL_IDX, BUSINESS_TYPE_COL_IDX]].copy()
     sub.columns = ["login", "business_type"]
 
@@ -129,6 +137,7 @@ def resolve_business_type(project_name, creator_username, maintainers, bk_map):
 def main():
     log.info("Старт отчета GitLab проектов")
     gl = connect()
+    log.info("Получение данных из файла бк")
     bk_map = load_bk_login_business_type_map(BK_FILE)
 
     totals = {}
@@ -196,10 +205,11 @@ def main():
             )
 
             if bt not in totals:
-                totals[bt] = {"repo_bytes": 0, "job_bytes": 0}
+                totals[bt] = {"repo_bytes": 0, "job_bytes": 0, "projects": 0}
 
             totals[bt]["repo_bytes"] += repo_bytes
             totals[bt]["job_bytes"] += job_bytes
+            totals[bt]["projects"] += 1
 
         except Exception as e:
             errors += 1
@@ -216,22 +226,33 @@ def main():
     out_path = str(Path(OUTPUT_XLSX).resolve())
     wb = Workbook()
     ws = wb.active
-    ws.title = "BusinessTypes"
-    ws.append(["business_type", "repo_size", "job_artifacts_size", "total_size", "percent_of_total"])
+    ws.title = "Report"
+
+    headers = [
+        "Тип бизнеса",
+        "Объем репозиториев",
+        "Объем Артефактов",
+        "Сумарный",
+        "% потребления",
+        "Кол-во проектов",
+    ]
+    ws.append(headers)
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
 
     grand_total = sum(v["repo_bytes"] + v["job_bytes"] for v in totals.values())
 
     rows = []
     for bt, v in totals.items():
-        repo_b = v["repo_bytes"]
-        job_b = v["job_bytes"]
+        repo_b = int(v["repo_bytes"])
+        job_b = int(v["job_bytes"])
         total_b = repo_b + job_b
         pct = (total_b / grand_total * 100.0) if grand_total else 0.0
-        rows.append((bt, repo_b, job_b, total_b, pct))
+        rows.append((bt, repo_b, job_b, total_b, pct, int(v["projects"])))
 
     rows.sort(key=lambda x: x[3], reverse=True)
 
-    for bt, repo_b, job_b, total_b, pct in rows:
+    for bt, repo_b, job_b, total_b, pct, proj_cnt in rows:
         ws.append(
             [
                 bt,
@@ -239,6 +260,7 @@ def main():
                 humanize.naturalsize(job_b, binary=True) if job_b else "",
                 humanize.naturalsize(total_b, binary=True),
                 round(pct, 2),
+                proj_cnt,
             ]
         )
 
