@@ -24,6 +24,10 @@ SSL_VERIFY = False
 MAX_PROJECTS = 50
 LOG_EVERY = 25
 
+BAN_BUSINESS_TYPE = {
+    "бан бизнес",
+}
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -100,44 +104,26 @@ def resolve_business_type(project_name, creator_username, maintainers, bk_map):
     if creator_key:
         bt = bk_map.get(creator_key, "")
         if bt:
-            log.info(
-                f'BT project="{project_name}" source=creator login="{creator_username}" bt="{bt}"'
-            )
             return bt
-        else:
-            log.info(
-                f'BT project="{project_name}" creator="{creator_username}" not_found_in_bk'
-            )
 
     found = []
     for u in maintainers:
         k = normalize_login(u)
         t = bk_map.get(k, "")
         if t:
-            found.append((u, t))
+            found.append(t)
 
     if not found:
-        log.info(
-            f'BT project="{project_name}" source=none creator="{creator_username}" '
-            f'maintainers="{",".join(maintainers)}" bt=""'
-        )
         return ""
 
     counts = {}
-    for _, t in found:
+    for t in found:
         counts[t] = counts.get(t, 0) + 1
 
     max_cnt = max(counts.values())
     winners = [k for k, v in counts.items() if v == max_cnt]
     winners.sort()
-    bt = winners[0]
-
-    log.info(
-        f'BT project="{project_name}" source=maintainers '
-        f'found={found} counts={counts} chosen="{bt}"'
-    )
-
-    return bt
+    return winners[0]
 
 
 def main():
@@ -160,8 +146,6 @@ def main():
 
         proj_id = getattr(p, "id", None)
         proj_name = getattr(p, "path_with_namespace", None) or getattr(p, "name", None) or str(proj_id)
-
-        log.info(f'PROJECT start id={proj_id} name="{proj_name}"')
 
         try:
             full = gl.projects.get(proj_id, statistics=True)
@@ -195,20 +179,21 @@ def main():
                 proj_name, creator_username, maintainers_unique, bk_map
             )
 
+            bt = clean_spaces(bt)
+
+            if bt in BAN_BUSINESS_TYPE:
+                log.info(f'PROJECT skip by banlist name="{proj_name}" bt="{bt}"')
+                continue
+
             stats = getattr(full, "statistics", {}) or {}
             repo_bytes = int(stats.get("repository_size", 0) or 0)
             job_bytes = int(stats.get("job_artifacts_size", 0) or 0)
 
             if bt not in totals:
-                totals[bt] = {"repo_bytes": 0, "job_bytes": 0, "projects": 0}
+                totals[bt] = {"repo_bytes": 0, "job_bytes": 0}
 
             totals[bt]["repo_bytes"] += repo_bytes
             totals[bt]["job_bytes"] += job_bytes
-            totals[bt]["projects"] += 1
-
-            log.info(
-                f'PROJECT done name="{proj_name}" bt="{bt}" repo="{humanize.naturalsize(repo_bytes, binary=True)}" job="{humanize.naturalsize(job_bytes, binary=True) if job_bytes > 0 else 0}"'
-            )
 
         except Exception as e:
             errors += 1
