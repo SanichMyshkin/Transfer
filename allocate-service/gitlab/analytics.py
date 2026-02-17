@@ -9,6 +9,7 @@ import pandas as pd
 from dotenv import load_dotenv
 import humanize
 from openpyxl import Workbook
+from openpyxl.styles import Font
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 load_dotenv()
@@ -17,20 +18,22 @@ GITLAB_URL = os.getenv("GITLAB_URL")
 GITLAB_TOKEN = os.getenv("GITLAB_TOKEN")
 BK_FILE = os.getenv("BK_FILE", "bk_all_users.xlsx")
 
-OUTPUT_XLSX = os.getenv("OUTPUT_XLSX", "gitlab_projects_bt.xlsx")
+OUTPUT_XLSX = os.getenv("OUTPUT_XLSX", "gitlab_projects.xlsx")
 
 SLEEP_SEC = 0.02
 SSL_VERIFY = False
-MAX_PROJECTS = 200
+MAX_PROJECTS = 50
 LOG_EVERY = 25
 
-TARGET_BUSINESS_TYPE = "пуп"
+BAN_BUSINESS_TYPE = {
+    "пуп",
+}
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
-log = logging.getLogger("gitlab_projects_bt")
+log = logging.getLogger("gitlab_projects")
 
 
 def die(msg: str, code: int = 2):
@@ -75,6 +78,13 @@ def load_bk_login_business_type_map(path: str):
     BUSINESS_TYPE_COL_IDX = 44
 
     df = pd.read_excel(path, dtype=str, engine="openpyxl", header=0).fillna("")
+
+    max_idx = max(LOGIN_COL_IDX, BUSINESS_TYPE_COL_IDX)
+    if df.shape[1] <= max_idx:
+        die(
+            f"BK_FILE: недостаточно колонок: cols={df.shape[1]}, "
+            f"нужен минимум индекс {max_idx}"
+        )
 
     sub = df.iloc[:, [LOGIN_COL_IDX, BUSINESS_TYPE_COL_IDX]].copy()
     sub.columns = ["login", "business_type"]
@@ -125,35 +135,16 @@ def resolve_business_type(project_name, creator_username, maintainers, bk_map):
 
 
 def main():
-    log.info("Старт отчета по одному типу бизнеса")
+    log.info("Старт отчета GitLab проектов")
     gl = connect()
+    log.info("Получение данных из файла бк")
     bk_map = load_bk_login_business_type_map(BK_FILE)
 
-    target = clean_spaces(TARGET_BUSINESS_TYPE)
-
-    out_path = str(Path(OUTPUT_XLSX).resolve())
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Projects"
-    ws.append(
-        [
-            "project",
-            "creator",
-            "maintainers",
-            "bt_resolved",
-            "bt_source",
-            "repo_size",
-            "job_artifacts_size",
-            "total_size",
-        ]
-    )
-
+    totals = {}
     user_cache = {}
     errors = 0
-    matched = 0
     start_ts = time.time()
 
-    log.info(f'Фильтр: TARGET_BUSINESS_TYPE="{target}"')
     log.info(f"Начинаем обход проектов (limit={MAX_PROJECTS})")
 
     for i, p in enumerate(gl.projects.list(all=True, iterator=True), start=1):
@@ -162,6 +153,8 @@ def main():
 
         proj_id = getattr(p, "id", None)
         proj_name = getattr(p, "path_with_namespace", None) or getattr(p, "name", None) or str(proj_id)
+
+        log.info(f'PROJECT start id={proj_id} name="{proj_name}"')
 
         try:
             full = gl.projects.get(proj_id, statistics=True)
@@ -190,70 +183,33 @@ def main():
                         maintainers.append(uname)
 
             maintainers_unique = sorted(set(maintainers))
-            maintainers_str = ",".join(maintainers_unique)
 
-            creator_key = normalize_login(creator_username)
-            bt = ""
-            bt_source = "none"
+            bt = clean_spaces(
+                resolve_business_type(
+                    proj_name, creator_username, maintainers_unique, bk_map
+                )
+            )
 
-            if creator_key:
-                bt = bk_map.get(creator_key, "")
-                if bt:
-                    bt_source = "creator"
-                else:
-                    bt = ""
-
-            if not bt:
-                found = []
-                for u in maintainers_unique:
-                    k = normalize_login(u)
-                    t = bk_map.get(k, "")
-                    if t:
-                        found.append(t)
-
-                if found:
-                    counts = {}
-                    for t in found:
-                        counts[t] = counts.get(t, 0) + 1
-                    max_cnt = max(counts.values())
-                    winners = [k for k, v in counts.items() if v == max_cnt]
-                    winners.sort()
-                    bt = winners[0]
-                    bt_source = "maintainers"
-
-            bt = clean_spaces(bt)
-
-            if bt != target:
+            if bt in BAN_BUSINESS_TYPE:
+                log.info(f'PROJECT skip (banlist) name="{proj_name}" bt="{bt}"')
                 continue
 
             stats = getattr(full, "statistics", {}) or {}
             repo_bytes = int(stats.get("repository_size", 0) or 0)
             job_bytes = int(stats.get("job_artifacts_size", 0) or 0)
-            total_bytes = repo_bytes + job_bytes
-
-            repo_h = humanize.naturalsize(repo_bytes, binary=True)
-            job_h = humanize.naturalsize(job_bytes, binary=True) if job_bytes else ""
-            total_h = humanize.naturalsize(total_bytes, binary=True)
 
             log.info(
-                f'INCLUDE project="{proj_name}" bt="{bt}" source={bt_source} '
-                f'creator="{creator_username}" maintainers="{maintainers_str}" '
-                f'repo="{repo_h}" job="{job_h or 0}" total="{total_h}"'
+                f'PROJECT map name="{proj_name}" bt="{bt}" '
+                f'repo="{humanize.naturalsize(repo_bytes, binary=True)}" '
+                f'job="{humanize.naturalsize(job_bytes, binary=True) if job_bytes else 0}"'
             )
 
-            ws.append(
-                [
-                    proj_name,
-                    creator_username,
-                    maintainers_str,
-                    bt,
-                    bt_source,
-                    repo_h,
-                    job_h,
-                    total_h,
-                ]
-            )
-            matched += 1
+            if bt not in totals:
+                totals[bt] = {"repo_bytes": 0, "job_bytes": 0, "projects": 0}
+
+            totals[bt]["repo_bytes"] += repo_bytes
+            totals[bt]["job_bytes"] += job_bytes
+            totals[bt]["projects"] += 1
 
         except Exception as e:
             errors += 1
@@ -262,13 +218,55 @@ def main():
         if LOG_EVERY and i % LOG_EVERY == 0:
             elapsed = time.time() - start_ts
             rate = i / elapsed if elapsed > 0 else 0
-            log.info(f"PROGRESS i={i} rate={rate:.2f} proj/s matched={matched} errors={errors}")
+            log.info(f"PROGRESS i={i} rate={rate:.2f} proj/s errors={errors}")
 
         if SLEEP_SEC > 0:
             time.sleep(SLEEP_SEC)
 
+    out_path = str(Path(OUTPUT_XLSX).resolve())
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Report"
+
+    headers = [
+        "Тип бизнеса",
+        "Объем репозиториев",
+        "Объем Артефактов",
+        "Сумарный",
+        "% потребления",
+        "Кол-во проектов",
+    ]
+    ws.append(headers)
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+
+    grand_total = sum(v["repo_bytes"] + v["job_bytes"] for v in totals.values())
+
+    rows = []
+    for bt, v in totals.items():
+        repo_b = int(v["repo_bytes"])
+        job_b = int(v["job_bytes"])
+        total_b = repo_b + job_b
+        pct = (total_b / grand_total * 100.0) if grand_total else 0.0
+        rows.append((bt, repo_b, job_b, total_b, pct, int(v["projects"])))
+
+    rows.sort(key=lambda x: x[3], reverse=True)
+
+    for bt, repo_b, job_b, total_b, pct, proj_cnt in rows:
+        ws.append(
+            [
+                bt,
+                humanize.naturalsize(repo_b, binary=True),
+                humanize.naturalsize(job_b, binary=True) if job_b else "",
+                humanize.naturalsize(total_b, binary=True),
+                round(pct, 2),
+                proj_cnt,
+            ]
+        )
+
     wb.save(out_path)
-    log.info(f"Saved: {out_path} | rows={ws.max_row - 1} matched={matched} errors={errors}")
+    log.info(f"Saved: {out_path} | rows={ws.max_row - 1} errors={errors}")
+    log.info("Отчет завершен")
 
 
 if __name__ == "__main__":
