@@ -25,7 +25,7 @@ MAX_PROJECTS = 50
 LOG_EVERY = 25
 
 BAN_BUSINESS_TYPE = {
-    "бан бизнес",
+    "Пока ничего",
 }
 
 logging.basicConfig(
@@ -78,13 +78,6 @@ def load_bk_login_business_type_map(path: str):
 
     df = pd.read_excel(path, dtype=str, engine="openpyxl", header=0).fillna("")
 
-    max_idx = max(LOGIN_COL_IDX, BUSINESS_TYPE_COL_IDX)
-    if df.shape[1] <= max_idx:
-        die(
-            f"BK_FILE: недостаточно колонок: cols={df.shape[1]}, "
-            f"нужен минимум индекс {max_idx}"
-        )
-
     sub = df.iloc[:, [LOGIN_COL_IDX, BUSINESS_TYPE_COL_IDX]].copy()
     sub.columns = ["login", "business_type"]
 
@@ -104,33 +97,38 @@ def resolve_business_type(project_name, creator_username, maintainers, bk_map):
     if creator_key:
         bt = bk_map.get(creator_key, "")
         if bt:
+            log.info(f'BT project="{project_name}" source=creator bt="{bt}"')
             return bt
+        else:
+            log.info(f'BT project="{project_name}" creator="{creator_username}" not_found')
 
     found = []
     for u in maintainers:
         k = normalize_login(u)
         t = bk_map.get(k, "")
         if t:
-            found.append(t)
+            found.append((u, t))
 
     if not found:
+        log.info(f'BT project="{project_name}" source=none bt=""')
         return ""
 
     counts = {}
-    for t in found:
+    for _, t in found:
         counts[t] = counts.get(t, 0) + 1
 
     max_cnt = max(counts.values())
     winners = [k for k, v in counts.items() if v == max_cnt]
     winners.sort()
-    return winners[0]
+    bt = winners[0]
+
+    log.info(f'BT project="{project_name}" source=maintainers chosen="{bt}"')
+    return bt
 
 
 def main():
     log.info("Старт отчета GitLab проектов")
     gl = connect()
-
-    log.info("Получение данных из файла бк")
     bk_map = load_bk_login_business_type_map(BK_FILE)
 
     totals = {}
@@ -146,6 +144,8 @@ def main():
 
         proj_id = getattr(p, "id", None)
         proj_name = getattr(p, "path_with_namespace", None) or getattr(p, "name", None) or str(proj_id)
+
+        log.info(f'PROJECT start id={proj_id} name="{proj_name}"')
 
         try:
             full = gl.projects.get(proj_id, statistics=True)
@@ -175,19 +175,25 @@ def main():
 
             maintainers_unique = sorted(set(maintainers))
 
-            bt = resolve_business_type(
-                proj_name, creator_username, maintainers_unique, bk_map
+            bt = clean_spaces(
+                resolve_business_type(
+                    proj_name, creator_username, maintainers_unique, bk_map
+                )
             )
 
-            bt = clean_spaces(bt)
-
             if bt in BAN_BUSINESS_TYPE:
-                log.info(f'PROJECT skip by banlist name="{proj_name}" bt="{bt}"')
+                log.info(f'PROJECT skip (banlist) name="{proj_name}" bt="{bt}"')
                 continue
 
             stats = getattr(full, "statistics", {}) or {}
             repo_bytes = int(stats.get("repository_size", 0) or 0)
             job_bytes = int(stats.get("job_artifacts_size", 0) or 0)
+
+            log.info(
+                f'PROJECT map name="{proj_name}" bt="{bt}" '
+                f'repo="{humanize.naturalsize(repo_bytes, binary=True)}" '
+                f'job="{humanize.naturalsize(job_bytes, binary=True) if job_bytes else 0}"'
+            )
 
             if bt not in totals:
                 totals[bt] = {"repo_bytes": 0, "job_bytes": 0}
@@ -213,16 +219,14 @@ def main():
     ws.title = "BusinessTypes"
     ws.append(["business_type", "repo_size", "job_artifacts_size", "total_size", "percent_of_total"])
 
-    grand_total = 0
-    for v in totals.values():
-        grand_total += int(v["repo_bytes"]) + int(v["job_bytes"])
+    grand_total = sum(v["repo_bytes"] + v["job_bytes"] for v in totals.values())
 
     rows = []
     for bt, v in totals.items():
-        repo_b = int(v["repo_bytes"])
-        job_b = int(v["job_bytes"])
+        repo_b = v["repo_bytes"]
+        job_b = v["job_bytes"]
         total_b = repo_b + job_b
-        pct = (total_b / grand_total * 100.0) if grand_total > 0 else 0.0
+        pct = (total_b / grand_total * 100.0) if grand_total else 0.0
         rows.append((bt, repo_b, job_b, total_b, pct))
 
     rows.sort(key=lambda x: x[3], reverse=True)
@@ -232,7 +236,7 @@ def main():
             [
                 bt,
                 humanize.naturalsize(repo_b, binary=True),
-                (humanize.naturalsize(job_b, binary=True) if job_b > 0 else ""),
+                humanize.naturalsize(job_b, binary=True) if job_b else "",
                 humanize.naturalsize(total_b, binary=True),
                 round(pct, 2),
             ]
