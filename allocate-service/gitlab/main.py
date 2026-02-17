@@ -52,7 +52,7 @@ def connect():
         die("GITLAB_URL не задан")
     if not GITLAB_TOKEN:
         die("GITLAB_TOKEN не задан")
-
+    log.info("Подключение к GitLab api...")
     gl = gitlab.Gitlab(
         GITLAB_URL,
         private_token=GITLAB_TOKEN,
@@ -61,6 +61,7 @@ def connect():
         per_page=100,
     )
     gl.auth()
+    log.info("Подключение успешно")
     return gl
 
 
@@ -140,7 +141,10 @@ def resolve_business_type(project_name, creator_username, maintainers, bk_map):
 
 
 def main():
+    log.info("Старт отчета GitLab проектов")
     gl = connect()
+
+    log.info("Получение данных из файла бк")
     bk_map = load_bk_login_business_type_map(BK_FILE)
 
     out_path = str(Path(OUTPUT_XLSX).resolve())
@@ -153,12 +157,16 @@ def main():
     errors = 0
     start_ts = time.time()
 
+    log.info(f"Начинаем обход проектов (limit={MAX_PROJECTS})")
+
     for i, p in enumerate(gl.projects.list(all=True, iterator=True), start=1):
         if i > MAX_PROJECTS:
             break
 
         proj_id = getattr(p, "id", None)
         proj_name = getattr(p, "path_with_namespace", None) or getattr(p, "name", None) or str(proj_id)
+
+        log.info(f'PROJECT start id={proj_id} name="{proj_name}"')
 
         try:
             full = gl.projects.get(proj_id, statistics=True)
@@ -201,6 +209,10 @@ def main():
             ja_bytes = int(stats.get("job_artifacts_size", 0) or 0)
             ja_human = humanize.naturalsize(ja_bytes, binary=True) if ja_bytes > 0 else ""
 
+            log.info(
+                f'PROJECT done name="{proj_name}" repo_size="{size_human}" job_artifacts_size="{ja_human or 0}"'
+            )
+
             ws.append([proj_name, creator_username, maintainers_str, bt, size_human, ja_human])
 
         except Exception as e:
@@ -218,6 +230,7 @@ def main():
 
     wb.save(out_path)
     log.info(f"Saved: {out_path} | rows={ws.max_row - 1} errors={errors}")
+    log.info("Отчет завершен")
 
 
 if __name__ == "__main__":
