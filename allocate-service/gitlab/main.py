@@ -147,7 +147,7 @@ def main():
     wb = Workbook()
     ws = wb.active
     ws.title = "Projects"
-    ws.append(["project", "creator", "maintainers", "business_type", "size"])
+    ws.append(["project", "creator", "maintainers", "business_type", "size", "job_artifacts_size"])
 
     user_cache = {}
     errors = 0
@@ -194,14 +194,18 @@ def main():
             )
 
             stats = getattr(full, "statistics", {}) or {}
+
             size_bytes = int(stats.get("repository_size", 0) or 0)
             size_human = humanize.naturalsize(size_bytes, binary=True)
 
-            ws.append([proj_name, creator_username, maintainers_str, bt, size_human])
+            ja_bytes = int(stats.get("job_artifacts_size", 0) or 0)
+            ja_human = humanize.naturalsize(ja_bytes, binary=True) if ja_bytes > 0 else ""
+
+            ws.append([proj_name, creator_username, maintainers_str, bt, size_human, ja_human])
 
         except Exception as e:
             errors += 1
-            ws.append([proj_name, "", "", "", f"ERROR: {e}"])
+            ws.append([proj_name, "", "", "", f"ERROR: {e}", ""])
             log.warning(f'FAIL project="{proj_name}" err={e}')
 
         if LOG_EVERY and i % LOG_EVERY == 0:
