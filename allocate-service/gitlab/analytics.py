@@ -22,12 +22,7 @@ OUTPUT_XLSX = os.getenv("OUTPUT_XLSX", "gitlab_projects.xlsx")
 
 SLEEP_SEC = 0.02
 SSL_VERIFY = False
-MAX_PROJECTS = 50
 LOG_EVERY = 25
-
-BAN_BUSINESS_TYPE = {
-    "Блок розничного бизнеса",
-}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -57,6 +52,7 @@ def connect():
         die("GITLAB_URL не задан")
     if not GITLAB_TOKEN:
         die("GITLAB_TOKEN не задан")
+
     log.info("Подключение к GitLab api...")
     gl = gitlab.Gitlab(
         GITLAB_URL,
@@ -137,6 +133,7 @@ def resolve_business_type(project_name, creator_username, maintainers, bk_map):
 def main():
     log.info("Старт отчета GitLab проектов")
     gl = connect()
+
     log.info("Получение данных из файла бк")
     bk_map = load_bk_login_business_type_map(BK_FILE)
 
@@ -145,14 +142,16 @@ def main():
     errors = 0
     start_ts = time.time()
 
-    log.info(f"Начинаем обход проектов (limit={MAX_PROJECTS})")
+    log.info("Начинаем обход ВСЕХ проектов (без лимита)")
 
     for i, p in enumerate(gl.projects.list(all=True, iterator=True), start=1):
-        if i > MAX_PROJECTS:
-            break
 
         proj_id = getattr(p, "id", None)
-        proj_name = getattr(p, "path_with_namespace", None) or getattr(p, "name", None) or str(proj_id)
+        proj_name = (
+            getattr(p, "path_with_namespace", None)
+            or getattr(p, "name", None)
+            or str(proj_id)
+        )
 
         log.info(f'PROJECT start id={proj_id} name="{proj_name}"')
 
@@ -189,10 +188,6 @@ def main():
                     proj_name, creator_username, maintainers_unique, bk_map
                 )
             )
-
-            if bt in BAN_BUSINESS_TYPE:
-                log.info(f'PROJECT skip (banlist) name="{proj_name}" bt="{bt}"')
-                continue
 
             stats = getattr(full, "statistics", {}) or {}
             repo_bytes = int(stats.get("repository_size", 0) or 0)
@@ -237,6 +232,7 @@ def main():
         "Кол-во проектов",
     ]
     ws.append(headers)
+
     for cell in ws[1]:
         cell.font = Font(bold=True)
 
