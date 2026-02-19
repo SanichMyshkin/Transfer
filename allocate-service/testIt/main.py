@@ -23,7 +23,6 @@ PG_DB = os.getenv("PG_DB")
 
 OUT_XLSX = os.getenv("OUT_XLSX", "testIt_projects_by_pfp.xlsx")
 
-# "ПФП - 111111", "ПФП111111", "ПФП:111111", "ПФП–111111"
 PFP_RE = re.compile(r"пфп\s*[-–—:]?\s*(\d+)", re.IGNORECASE)
 
 QUERY_PROJECTS = """
@@ -109,7 +108,6 @@ def main():
 
     logging.info("Projects loaded: %d", len(projects))
 
-    # Группировка по PFP
     agg = defaultdict(lambda: {"ProjectsCount": 0, "TestCasesCount": 0, "AutotestsCount": 0})
 
     for p in projects:
@@ -135,7 +133,6 @@ def main():
             }
         )
 
-    # Сортировка: сначала числовые PFP по возрастанию, потом NO_PFP
     def sort_key(r):
         if r["PFP"] == "NO_PFP":
             return (1, 0)
