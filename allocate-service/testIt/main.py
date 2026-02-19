@@ -1,6 +1,7 @@
 import os
 import logging
 import re
+from collections import defaultdict
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -20,10 +21,10 @@ PG_USER = os.getenv("PG_USER")
 PG_PASSWORD = os.getenv("PG_PASSWORD")
 PG_DB = os.getenv("PG_DB")
 
-OUT_XLSX = os.getenv("OUT_XLSX", "testIt_projects.xlsx")
+OUT_XLSX = os.getenv("OUT_XLSX", "testIt_projects_by_pfp.xlsx")
 
+# "ПФП - 111111", "ПФП111111", "ПФП:111111", "ПФП–111111"
 PFP_RE = re.compile(r"пфп\s*[-–—:]?\s*(\d+)", re.IGNORECASE)
-
 
 QUERY_PROJECTS = """
 SELECT
@@ -64,6 +65,13 @@ def extract_pfp(description: str):
     return m.group(1) if m else None
 
 
+def to_int(v):
+    try:
+        return int(v or 0)
+    except Exception:
+        return 0
+
+
 def write_sheet(wb: Workbook, sheet_name: str, rows):
     ws = wb.active
     ws.title = sheet_name
@@ -100,24 +108,46 @@ def main():
         projects = exec_query(conn, QUERY_PROJECTS)
 
     logging.info("Projects loaded: %d", len(projects))
-    for p in projects:
-        p["PFP"] = extract_pfp(p.get("Description"))
 
-    ordered = []
+    # Группировка по PFP
+    agg = defaultdict(lambda: {"ProjectsCount": 0, "TestCasesCount": 0, "AutotestsCount": 0})
+
     for p in projects:
-        ordered.append(
+        pfp = extract_pfp(p.get("Description")) or "NO_PFP"
+        tc = to_int(p.get("TestCasesCount"))
+        at = to_int(p.get("AutotestsCount"))
+
+        agg[pfp]["ProjectsCount"] += 1
+        agg[pfp]["TestCasesCount"] += tc
+        agg[pfp]["AutotestsCount"] += at
+
+    # Результат в таблицу
+    rows = []
+    for pfp, v in agg.items():
+        total_tests = v["TestCasesCount"] + v["AutotestsCount"]
+        rows.append(
             {
-                "Id": p.get("Id"),
-                "Name": p.get("Name"),
-                "Description": p.get("Description"),
-                "PFP": p.get("PFP"),
-                "TestCasesCount": p.get("TestCasesCount"),
-                "AutotestsCount": p.get("AutotestsCount"),
+                "PFP": pfp,
+                "ProjectsCount": v["ProjectsCount"],
+                "TestCasesCount": v["TestCasesCount"],
+                "AutotestsCount": v["AutotestsCount"],
+                "TotalTests": total_tests,
             }
         )
 
+    # Сортировка: сначала числовые PFP по возрастанию, потом NO_PFP
+    def sort_key(r):
+        if r["PFP"] == "NO_PFP":
+            return (1, 0)
+        try:
+            return (0, int(r["PFP"]))
+        except Exception:
+            return (0, 10**18)
+
+    rows.sort(key=sort_key)
+
     wb = Workbook()
-    write_sheet(wb, "Projects", ordered)
+    write_sheet(wb, "By_PFP", rows)
     wb.save(OUT_XLSX)
 
     logging.info("Excel saved: %s", OUT_XLSX)
