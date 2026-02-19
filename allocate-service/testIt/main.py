@@ -1,5 +1,6 @@
 import os
 import logging
+import re
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -21,74 +22,23 @@ PG_DB = os.getenv("PG_DB")
 
 OUT_XLSX = os.getenv("OUT_XLSX", "testIt_projects.xlsx")
 
+PFP_RE = re.compile(r"пфп\s*[-–—:]?\s*(\d+)", re.IGNORECASE)
+
 
 QUERY_PROJECTS = """
 SELECT
     p."Id",
     p."Name",
     p."Description",
-    COUNT(at."Id") AS "AutotestsCount",
-
-    (SELECT COALESCE(SUM(jsonb_array_length(d2."Widgets")), 0)
-     FROM "Dashboards" d2
-     WHERE d2."ProjectId" = p."Id") AS "WidgetsCount",
-
-    (SELECT COALESCE(SUM(tr."RunCount"), 0)
-     FROM "TestRuns" tr
-     WHERE tr."ProjectId" = p."Id"
-       AND tr."IsAutomated" = TRUE
-       AND (tr."IsDeleted" = FALSE OR tr."IsDeleted" IS NULL)) AS "AutoTestRunsCount",
-
-    (SELECT COUNT(wi."Id")
-     FROM "WorkItems" wi
-     WHERE wi."ProjectId" = p."Id"
-       AND wi."EntityTypeName" = 'TestCases'
-       AND (wi."IsDeleted" = FALSE OR wi."IsDeleted" IS NULL)
-       AND (wi."IsActual" = TRUE OR wi."IsActual" IS NULL)) AS "TestCasesCount",
-
-    (SELECT COUNT(wi."Id")
-     FROM "WorkItems" wi
-     WHERE wi."ProjectId" = p."Id"
-       AND wi."EntityTypeName" = 'CheckLists'
-       AND (wi."IsDeleted" = FALSE OR wi."IsDeleted" IS NULL)
-       AND (wi."IsActual" = TRUE OR wi."IsActual" IS NULL)) AS "CheckListsCount",
-
-    (SELECT COUNT(wi."Id")
-     FROM "WorkItems" wi
-     WHERE wi."ProjectId" = p."Id"
-       AND wi."EntityTypeName" = 'SharedSteps'
-       AND (wi."IsDeleted" = FALSE OR wi."IsDeleted" IS NULL)
-       AND (wi."IsActual" = TRUE OR wi."IsActual" IS NULL)) AS "SharedStepsCount",
-
-    (SELECT COUNT(DISTINCT wi."Id")
-     FROM "WorkItems" wi
-     LEFT JOIN "WorkItemVersions" wiv ON wiv."WorkItemId" = wi."Id"
-     LEFT JOIN "TestSuitesWorkItems" tswi
-        ON tswi."WorkItemVersionId" = wiv."VersionId"
-       AND (tswi."IsDeleted" = FALSE OR tswi."IsDeleted" IS NULL)
-     WHERE wi."ProjectId" = p."Id"
-       AND wi."IsDeleted" = FALSE
-       AND wiv."VersionId" IS NOT NULL
-       AND tswi."WorkItemVersionId" IS NOT NULL) AS "LibraryTestsCount",
-
-    (SELECT COUNT(tp."Id")
-     FROM "TestPlans" tp
-     WHERE tp."ProjectId" = p."Id"
-       AND (tp."IsDeleted" = FALSE OR tp."IsDeleted" IS NULL)) AS "TestPlansCount",
-
-    (SELECT COUNT(wh."Id")
-     FROM "WebHooks" wh
-     WHERE wh."ProjectId" = p."Id"
-       AND (wh."IsDeleted" = FALSE OR wh."IsDeleted" IS NULL)) AS "WebHooksCount",
-
-    (SELECT COUNT(wl."Id")
-     FROM "WebHookLogs" wl
-     JOIN "WebHooks" wh ON wh."Id" = wl."WebHookId"
-     WHERE wh."ProjectId" = p."Id"
-       AND (wh."IsDeleted" = FALSE OR wh."IsDeleted" IS NULL)
-       AND (wl."IsDeleted" = FALSE OR wl."IsDeleted" IS NULL))
-       AS "WebHookLogsCount"
-
+    COUNT(DISTINCT at."Id") AS "AutotestsCount",
+    (
+        SELECT COUNT(wi."Id")
+        FROM "WorkItems" wi
+        WHERE wi."ProjectId" = p."Id"
+          AND wi."EntityTypeName" = 'TestCases'
+          AND (wi."IsDeleted" = FALSE OR wi."IsDeleted" IS NULL)
+          AND (wi."IsActual" = TRUE OR wi."IsActual" IS NULL)
+    ) AS "TestCasesCount"
 FROM "Projects" p
 LEFT JOIN "AutoTests" at ON at."ProjectId" = p."Id"
 GROUP BY p."Id", p."Name", p."Description"
@@ -107,6 +57,13 @@ def exec_query(conn, query: str):
         return cur.fetchall()
 
 
+def extract_pfp(description: str):
+    if not description:
+        return None
+    m = PFP_RE.search(description)
+    return m.group(1) if m else None
+
+
 def write_sheet(wb: Workbook, sheet_name: str, rows):
     ws = wb.active
     ws.title = sheet_name
@@ -116,13 +73,12 @@ def write_sheet(wb: Workbook, sheet_name: str, rows):
         return
 
     headers = list(rows[0].keys())
+    header_font = Font(bold=True)
 
-    # Заголовки
     for col, header in enumerate(headers, start=1):
-        cell = ws.cell(row=1, column=col, value=header)
-        cell.font = Font(bold=True)
+        c = ws.cell(row=1, column=col, value=header)
+        c.font = header_font
 
-    # Данные
     for row_idx, row_data in enumerate(rows, start=2):
         for col_idx, header in enumerate(headers, start=1):
             ws.cell(row=row_idx, column=col_idx, value=row_data.get(header))
@@ -140,13 +96,28 @@ def main():
         dbname=PG_DB,
         user=PG_USER,
         password=PG_PASSWORD,
-    ) as conn_proj:
-        projects = exec_query(conn_proj, QUERY_PROJECTS)
+    ) as conn:
+        projects = exec_query(conn, QUERY_PROJECTS)
 
     logging.info("Projects loaded: %d", len(projects))
+    for p in projects:
+        p["PFP"] = extract_pfp(p.get("Description"))
+
+    ordered = []
+    for p in projects:
+        ordered.append(
+            {
+                "Id": p.get("Id"),
+                "Name": p.get("Name"),
+                "Description": p.get("Description"),
+                "PFP": p.get("PFP"),
+                "TestCasesCount": p.get("TestCasesCount"),
+                "AutotestsCount": p.get("AutotestsCount"),
+            }
+        )
 
     wb = Workbook()
-    write_sheet(wb, "Projects", projects)
+    write_sheet(wb, "Projects", ordered)
     wb.save(OUT_XLSX)
 
     logging.info("Excel saved: %s", OUT_XLSX)
