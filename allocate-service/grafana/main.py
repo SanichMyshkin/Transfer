@@ -25,7 +25,10 @@ GRAFANA_REPORT_FILE = os.getenv("GRAFANA_REPORT_FILE", "grafana_report.xlsx")
 SLEEP_AFTER_SWITCH = 1
 SLEEP_BETWEEN_CALLS = 0.2
 
-EXCLUDE_ALL_ZERO_NUMBERS = True
+# Новая переменная:
+# True  -> "0000", "00", "0" и т.п. включаем в отчёт построчно, без SD/BK маппинга
+# False -> как раньше: нули пропускаем
+INCLUDE_ALL_ZERO_NUMBERS = False
 
 BAN_SERVICE_IDS = [15473]
 
@@ -93,6 +96,7 @@ def validate_env_and_files():
         die(f"BK_FILE не найден: {BK_FILE}")
 
     logger.info(f"Бан-лист (КОД): {sorted(ban_set) if ban_set else 'пусто'}")
+    logger.info(f"INCLUDE_ALL_ZERO_NUMBERS={INCLUDE_ALL_ZERO_NUMBERS}")
 
 
 def normalize_name_key(s: str) -> str:
@@ -279,41 +283,51 @@ def main():
         norm_number = normalize_number(org_number)
         norm_name = normalize_name(org_name)
 
-        if EXCLUDE_ALL_ZERO_NUMBERS and is_all_zeros_number(norm_number):
+        is_zero = is_all_zeros_number(norm_number)
+
+        # Нули: либо скипаем, либо включаем "как есть" (без SD/BK)
+        if is_zero and not INCLUDE_ALL_ZERO_NUMBERS:
             skipped_zero += 1
             logger.info(f'ORG {org_id}: "{org_name}" ({org_number}) — skip (нули)')
             continue
 
-        if norm_number and norm_number in ban_set:
+        # Бан по КОД (применяем только если это НЕ "нули")
+        if (not is_zero) and norm_number and norm_number in ban_set:
             skipped_ban += 1
             logger.info(f'ORG {org_id}: "{org_name}" ({org_number}) — skip (бан)')
             continue
 
-        sd = None
-        if norm_number and norm_number in map_by_number:
-            sd = map_by_number[norm_number]
-        elif norm_name and norm_name in map_by_name:
-            sd = map_by_name[norm_name]
+        # SD/BK маппинг делаем только для НЕ-нулевых
+        sd_name = ""
+        owner = ""
+        business_type = ""
 
-        sd_name = (sd or {}).get("sd_name") or ""
-        owner = (sd or {}).get("owner") or ""
+        if not is_zero:
+            sd = None
+            if norm_number and norm_number in map_by_number:
+                sd = map_by_number[norm_number]
+            elif norm_name and norm_name in map_by_name:
+                sd = map_by_name[norm_name]
 
-        business_type = bk_type_map.get(normalize_name_key(owner), "") if owner else ""
+            sd_name = (sd or {}).get("sd_name") or ""
+            owner = (sd or {}).get("owner") or ""
+            business_type = bk_type_map.get(normalize_name_key(owner), "") if owner else ""
 
-        if SKIP_EMPTY_BUSINESS_TYPE and not clean_spaces(business_type):
-            continue
+            # Фильтры по типу бизнеса применяем только к НЕ-нулевым
+            if SKIP_EMPTY_BUSINESS_TYPE and not clean_spaces(business_type):
+                continue
 
-        if (
-            ban_business_types_set
-            and clean_spaces(business_type) in ban_business_types_set
-        ):
-            continue
+            if ban_business_types_set and clean_spaces(business_type) in ban_business_types_set:
+                continue
+
+        # Для "нулей": имя сервиса берём из org_name, владелец/тип пустые
+        display_service_name = sd_name if sd_name else org_name
 
         if not switch_org(org_id):
             no_access += 1
             logger.warning(
                 f'ORG {org_id}: "{org_name}" — NO ACCESS | '
-                f'сервис="{sd_name or org_name}" | '
+                f'сервис="{display_service_name}" | '
                 f'владелец="{owner or "—"}" | '
                 f'тип="{business_type or "—"}"'
             )
@@ -328,7 +342,7 @@ def main():
 
         logger.info(
             f'ORG {org_id}: "{org_name}" ({org_number}) | '
-            f'сервис="{sd_name if sd_name else org_name}" | '
+            f'сервис="{display_service_name}" | '
             f'владелец="{owner or "—"}" | '
             f'тип="{business_type or "—"}" | '
             f"панелей={panels_total}"
@@ -336,10 +350,10 @@ def main():
 
         rows_orgs.append(
             {
-                "Тип бизнеса": business_type,
-                "Наименование сервиса": sd_name if sd_name else org_name,
+                "Тип бизнеса": business_type,  # для нулей будет ""
+                "Наименование сервиса": display_service_name,
                 "КОД": org_number,
-                "Владелец сервиса": owner,
+                "Владелец сервиса": owner,  # для нулей будет ""
                 "Кол-во панелей": panels_total,
                 "Потребление в %": None,
             }
