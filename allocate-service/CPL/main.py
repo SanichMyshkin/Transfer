@@ -24,7 +24,6 @@ PASS = os.getenv("PASS")
 
 BAN_SERVICE_IDS = {15473}
 
-
 BAN_BUSINESS_TYPES: set[str] = {
     # "Розница",
 }
@@ -148,7 +147,7 @@ def fetch_and_aggregate(client: OpenSearch) -> list[dict[str, Any]]:
             continue
 
         size_b = int(idx.get("store.size", 0))
-        acc[(team, service_id)] += size_b
+        acc[service_id] += size_b
         parsed_cnt += 1
 
         log.info(
@@ -158,11 +157,10 @@ def fetch_and_aggregate(client: OpenSearch) -> list[dict[str, Any]]:
 
     rows = [
         {
-            "team": team,
             "service_id": service_id,
             "total_bytes": total,
         }
-        for (team, service_id), total in acc.items()
+        for service_id, total in acc.items()
     ]
 
     log.info(
@@ -189,11 +187,6 @@ def enrich(
 
 
 def apply_unknown_service_filter(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """
-    Если SKIP_UNKNOWN_SERVICE_IDS=True, выкидываем:
-      - service_id == 0
-      - сервисы, которых нет в SD (service_name пустой)
-    """
     if not SKIP_UNKNOWN_SERVICE_IDS:
         return rows
 
@@ -205,7 +198,7 @@ def apply_unknown_service_filter(rows: list[dict[str, Any]]) -> list[dict[str, A
         if service_id == 0 or not clean_spaces(r.get("service_name", "")):
             skipped += 1
             log.info(
-                f"SKIP_UNKNOWN | service_id={service_id} team={r.get('team')} "
+                f"SKIP_UNKNOWN | service_id={service_id} "
                 f"size={int(r.get('total_bytes') or 0)}B"
             )
             continue
@@ -227,7 +220,8 @@ def apply_business_type_ban(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if bt in BAN_BUSINESS_TYPES:
             banned += 1
             log.info(
-                f"BAN_BT | business_type={bt!r} | service_id={r.get('service_id')} "
+                f"BAN_BT | business_type={bt!r} | "
+                f"service_id={r.get('service_id')} "
                 f"service_name={r.get('service_name')!r}"
             )
             continue
@@ -304,10 +298,9 @@ def main():
 
     rows = enrich(rows, sd, bk)
     rows = apply_unknown_service_filter(rows)
-    
     rows = apply_business_type_ban(rows)
-
     rows = finalize(rows)
+
     write_to_excel("CPL_report.xlsx", rows)
 
 
