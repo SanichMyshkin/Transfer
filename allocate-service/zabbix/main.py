@@ -25,7 +25,7 @@ BAN_BUSINESS_TYPES = [
 ]
 SKIP_EMPTY_BUSINESS_TYPE = True
 
-ZBX_CHUNK = 500  # чтобы не улетать в лимиты API
+ZBX_CHUNK = 500
 
 logger = logging.getLogger("zabbix_report")
 logger.setLevel(logging.INFO)
@@ -124,7 +124,6 @@ def fetch_hosts(api):
             {
                 "hostid": str(h.get("hostid", "")).strip(),
                 "host": (h.get("host") or "").strip(),
-                "name": (h.get("name") or "").strip(),
                 "ip": clean_ip_only_32(iface.get("ip")),
                 "dns": clean_dns(iface.get("dns")),
             }
@@ -133,11 +132,6 @@ def fetch_hosts(api):
 
 
 def fetch_items_triggers_counts(api, hostids):
-    """
-    Возвращает:
-      items_cnt[hostid]    = кол-во ENABLED items на хосте
-      triggers_cnt[hostid] = кол-во ENABLED triggers на хосте
-    """
     items_cnt = defaultdict(int)
     triggers_cnt = defaultdict(int)
 
@@ -145,7 +139,6 @@ def fetch_items_triggers_counts(api, hostids):
     if not hostids:
         return dict(items_cnt), dict(triggers_cnt)
 
-    # Items: считаем только status=0 (enabled)
     for part in chunks(hostids, ZBX_CHUNK):
         try:
             items = api.item.get(
@@ -163,8 +156,6 @@ def fetch_items_triggers_counts(api, hostids):
             if hid:
                 items_cnt[hid] += 1
 
-    # Triggers: считаем только status=0 (enabled)
-    # Важно: trigger может быть связан с несколькими host'ами, поэтому добавляем всем hostid из selectHosts
     for part in chunks(hostids, ZBX_CHUNK):
         try:
             trigs = api.trigger.get(
@@ -249,6 +240,8 @@ def build_map(df, keys):
 
 
 def main():
+    logger.info("Старт формирования отчета Zabbix (hosts/items/triggers)")
+
     validate_env_and_files()
 
     ban_set = build_ban_set(BAN_SERVICE_IDS)
@@ -286,14 +279,12 @@ def main():
     map_ip, dup_ip = build_map(df_db[df_db["ip"] != ""], ["ip"])
     map_dns, dup_dns = build_map(df_db[df_db["dns"] != ""], ["dns"])
 
-    per_service = {}  # (service, service_id) -> {"hosts":..,"items":..,"triggers":..}
+    per_service = {}
     matched_hosts = 0
     ambiguous = 0
     banned_hits = 0
     skipped_empty = 0
-    total_hosts_after_serviceid_filters = 0
-
-    failed_rows = []  # хосты, которые "не смогли установить/определить" (не попали в per_service)
+    failed_rows = []
 
     for r in df_hosts.to_dict("records"):
         ip = r.get("ip", "")
@@ -314,11 +305,11 @@ def main():
         if not svc_key:
             failed_rows.append(
                 {
-                    "host": r.get("host", ""),
-                    "ip": ip,
-                    "dns": dns,
-                    "items": int(r.get("items", 0)),
-                    "triggers": int(r.get("triggers", 0)),
+                    "Хост": r.get("host", ""),
+                    "IP": ip,
+                    "DNS": dns,
+                    "Айтемы": int(r.get("items", 0)),
+                    "Триггеры": int(r.get("triggers", 0)),
                 }
             )
             continue
@@ -327,33 +318,13 @@ def main():
 
         if SKIP_EMPTY_SERVICE_ID and not service_id:
             skipped_empty += 1
-            failed_rows.append(
-                {
-                    "host": r.get("host", ""),
-                    "ip": ip,
-                    "dns": dns,
-                    "items": int(r.get("items", 0)),
-                    "triggers": int(r.get("triggers", 0)),
-                }
-            )
             continue
 
         if service_id in ban_set:
             banned_hits += 1
-            failed_rows.append(
-                {
-                    "host": r.get("host", ""),
-                    "ip": ip,
-                    "dns": dns,
-                    "items": int(r.get("items", 0)),
-                    "triggers": int(r.get("triggers", 0)),
-                }
-            )
             continue
 
         matched_hosts += 1
-        total_hosts_after_serviceid_filters += 1
-
         if amb:
             ambiguous += 1
 
@@ -365,96 +336,47 @@ def main():
         per_service[key]["triggers"] += int(r.get("triggers", 0))
 
     candidates = []
-    skipped_empty_bt = 0
-    skipped_ban_bt = 0
-    hosts_skipped_empty_bt = 0
-    hosts_skipped_ban_bt = 0
-
     for (service, service_id), cnts in per_service.items():
         people = sd_people_map.get(service_id, {"owner": ""})
         owner = people.get("owner", "")
-
         business_type = bk_type_map.get(normalize_name_key(owner), "") if owner else ""
         business_type = clean_spaces(business_type)
 
         if SKIP_EMPTY_BUSINESS_TYPE and not business_type:
-            skipped_empty_bt += 1
-            hosts_skipped_empty_bt += cnts["hosts"]
             continue
-
         if ban_business_set and business_type in ban_business_set:
-            skipped_ban_bt += 1
-            hosts_skipped_ban_bt += cnts["hosts"]
             continue
 
         candidates.append(
             {
-                "business_type": business_type,
-                "service": service,
-                "service_id": service_id,
-                "owner": owner,
-                "hosts_found": int(cnts["hosts"]),
-                "items_found": int(cnts["items"]),
-                "triggers_found": int(cnts["triggers"]),
+                "Тип бизнеса": business_type,
+                "Наименование сервиса": service,
+                "КОД": service_id,
+                "Владелец сервиса": owner,
+                "Кол-во хостов": int(cnts["hosts"]),
+                "Кол-во айтемов": int(cnts["items"]),
+                "Кол-во триггеров": int(cnts["triggers"]),
             }
         )
 
-    eligible_hosts_total = sum(x["hosts_found"] for x in candidates)
-    eligible_items_total = sum(x["items_found"] for x in candidates)
+    eligible_items_total = sum(x["Кол-во айтемов"] for x in candidates)
 
-    candidates_sorted = sorted(
-        candidates,
-        key=lambda d: (d["items_found"], d["hosts_found"], d["service"], d["service_id"]),
-        reverse=True,
-    )
-
-    rows = []
-    for x in candidates_sorted:
-        items = x["items_found"]
-        pct_items = (items / eligible_items_total) * 100 if eligible_items_total else 0.0
-        rows.append(
-            {
-                "Тип бизнеса": x["business_type"],
-                "Наименование сервиса": x["service"],
-                "КОД": x["service_id"],
-                "Владелец сервиса": x["owner"],
-                "Кол-во хостов": x["hosts_found"],
-                "Кол-во айтемов": x["items_found"],
-                "Кол-во триггеров": x["triggers_found"],
-                "% потребления (items)": round(pct_items, 2),
-            }
+    for x in candidates:
+        pct = (
+            (x["Кол-во айтемов"] / eligible_items_total) * 100
+            if eligible_items_total
+            else 0.0
         )
+        x["% потребления (items)"] = round(pct, 2)
 
-    df_report = pd.DataFrame(rows)
-
-    df_failed = pd.DataFrame(failed_rows).rename(
-        columns={
-            "host": "Хост",
-            "ip": "IP",
-            "dns": "DNS",
-            "items": "Айтемы",
-            "triggers": "Триггеры",
-        }
+    df_report = pd.DataFrame(candidates).sort_values(
+        ["Кол-во айтемов", "Кол-во хостов"],
+        ascending=[False, False],
     )
-    if not df_failed.empty:
-        df_failed = df_failed.sort_values(["Хост", "IP", "DNS"], ascending=[True, True, True])
+
+    df_failed = pd.DataFrame(failed_rows)
 
     installed_pct = (matched_hosts / total_active * 100) if total_active else 0.0
-    summary_rows = [
-        {"Метрика": "Активных хостов (Zabbix status=0)", "Значение": int(total_active)},
-        {"Метрика": "Определено/установлено хостов (после service_id фильтров)", "Значение": int(matched_hosts)},
-        {"Метрика": "% удалось установить хостов", "Значение": round(installed_pct, 2)},
-        {"Метрика": "Сомнительных совпадений (ambiguous)", "Значение": int(ambiguous)},
-        {"Метрика": "Скип по бан-листу (service_id)", "Значение": int(banned_hits)},
-        {"Метрика": "Скип пустых service_id", "Значение": int(skipped_empty)},
-        {"Метрика": "Скип пустого business_type (сервисов)", "Значение": int(skipped_empty_bt)},
-        {"Метрика": "Скип бана business_type (сервисов)", "Значение": int(skipped_ban_bt)},
-        {"Метрика": "Хостов для процентов (eligible, после business_type фильтров)", "Значение": int(eligible_hosts_total)},
-        {"Метрика": "Айтемов для процентов (eligible)", "Значение": int(eligible_items_total)},
-        {"Метрика": "Сервисов в отчёте", "Значение": int(len(df_report))},
-        {"Метрика": "Хостов не установлено/не определено (лист 'Не установлены')", "Значение": int(len(df_failed))},
-    ]
-    df_summary = pd.DataFrame(summary_rows)
 
     logger.info(f"Активных хостов: {total_active}")
     logger.info(
@@ -463,17 +385,11 @@ def main():
     logger.info(f"Сомнительных совпадений: {ambiguous}")
     logger.info(f"Скип по бан-листу (service_id): {banned_hits}")
     logger.info(f"Скип пустых service_id: {skipped_empty}")
-
-    logger.info(f"После фильтров service_id (зачётные хосты): {total_hosts_after_serviceid_filters}")
-    logger.info(f"Скип пустого business_type: {skipped_empty_bt} (hosts: {hosts_skipped_empty_bt})")
-    logger.info(f"Скип бана business_type: {skipped_ban_bt} (hosts: {hosts_skipped_ban_bt})")
-    logger.info(f"Итого хостов для процентов (eligible): {eligible_hosts_total}")
-    logger.info(f"Итого айтемов для процентов (eligible): {eligible_items_total}")
+    logger.info(f"Итого айтемов (eligible): {eligible_items_total}")
     logger.info(f"Сервисов в отчёте: {len(df_report)}")
     logger.info(f"Хостов в 'Не установлены': {len(df_failed)}")
 
     with pd.ExcelWriter(OUTPUT_XLSX, engine="openpyxl") as writer:
-        df_summary.to_excel(writer, index=False, sheet_name="Сводка")
         df_report.to_excel(writer, index=False, sheet_name="Отчет Zabbix")
         df_failed.to_excel(writer, index=False, sheet_name="Не установлены")
 
