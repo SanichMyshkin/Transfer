@@ -25,9 +25,6 @@ GRAFANA_REPORT_FILE = os.getenv("GRAFANA_REPORT_FILE", "grafana_report.xlsx")
 SLEEP_AFTER_SWITCH = 1
 SLEEP_BETWEEN_CALLS = 0.2
 
-# Новая переменная:
-# True  -> "0000", "00", "0" и т.п. включаем в отчёт построчно, без SD/BK маппинга
-# False -> как раньше: нули пропускаем
 INCLUDE_ALL_ZERO_NUMBERS = False
 
 BAN_SERVICE_IDS = [15473]
@@ -161,19 +158,44 @@ def get_root_dashboards():
 
 
 def get_dashboard_panels(uid):
+    """
+    Правильный подсчёт панелей для современных Grafana:
+    - row-панель (type=="row") НЕ считаем как панель
+    - панели внутри row считаем рекурсивно через panel["panels"]
+    - старое поле dashboard["rows"] не используем (даёт кашу/дубли/недосчёт)
+    """
     r = session.get(f"{GRAFANA_URL}/api/dashboards/uid/{uid}")
     if r.status_code in (401, 404):
         return 0
     r.raise_for_status()
     time.sleep(SLEEP_BETWEEN_CALLS)
-    dash = r.json().get("dashboard", {})
-    count = 0
-    if "panels" in dash:
-        count += len(dash["panels"])
-    if "rows" in dash:
-        for row in dash["rows"]:
-            count += len(row.get("panels", []))
-    return count
+
+    dash = r.json().get("dashboard", {}) or {}
+
+    def walk(panels) -> int:
+        if not panels:
+            return 0
+        cnt = 0
+        for p in panels:
+            if not isinstance(p, dict):
+                continue
+
+            p_type = (p.get("type") or "").lower()
+
+            # Row: не считаем сам row, но считаем вложенные
+            if p_type == "row":
+                cnt += walk(p.get("panels"))
+                continue
+
+            # Обычная панель
+            cnt += 1
+
+            # На всякий случай: если у панели есть вложенные panels (редко)
+            cnt += walk(p.get("panels"))
+
+        return cnt
+
+    return walk(dash.get("panels"))
 
 
 def split_org_name(raw: str):
