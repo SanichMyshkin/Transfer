@@ -133,37 +133,55 @@ def get_folders():
     return r.json()
 
 
-def get_dashboards_in_folder(fid):
+def get_dashboards_in_folder(folder_uid: str):
+    out = []
+    page = 1
+    while True:
+        r = session.get(
+            f"{GRAFANA_URL}/api/search",
+            params={
+                "folderUIDs": folder_uid,
+                "type": "dash-db",
+                "limit": 5000,
+                "page": page,
+            },
+        )
+        r.raise_for_status()
+        time.sleep(SLEEP_BETWEEN_CALLS)
+
+        batch = r.json() or []
+        if not batch:
+            break
+
+        out.extend(batch)
+        page += 1
+
+    return out
+
+
+def get_all_dashboards(page: int):
     r = session.get(
         f"{GRAFANA_URL}/api/search",
-        params={"folderIds": fid, "type": "dash-db", "limit": 5000},
+        params={"type": "dash-db", "limit": 5000, "page": page},
     )
     r.raise_for_status()
     time.sleep(SLEEP_BETWEEN_CALLS)
-    return r.json()
-
-
-def get_all_dashboards():
-    r = session.get(
-        f"{GRAFANA_URL}/api/search",
-        params={"type": "dash-db", "limit": 5000},
-    )
-    r.raise_for_status()
-    time.sleep(SLEEP_BETWEEN_CALLS)
-    return r.json()
+    return r.json() or []
 
 
 def get_root_dashboards():
-    return [d for d in get_all_dashboards() if d.get("folderId") in (0, None)]
+    out = []
+    page = 1
+    while True:
+        batch = get_all_dashboards(page)
+        if not batch:
+            break
+        out.extend([d for d in batch if d.get("folderId") in (0, None)])
+        page += 1
+    return out
 
 
 def get_dashboard_panels(uid):
-    """
-    Правильный подсчёт панелей для современных Grafana:
-    - row-панель (type=="row") НЕ считаем как панель
-    - панели внутри row считаем рекурсивно через panel["panels"]
-    - старое поле dashboard["rows"] не используем (даёт кашу/дубли/недосчёт)
-    """
     r = session.get(f"{GRAFANA_URL}/api/dashboards/uid/{uid}")
     if r.status_code in (401, 404):
         return 0
@@ -182,17 +200,12 @@ def get_dashboard_panels(uid):
 
             p_type = (p.get("type") or "").lower()
 
-            # Row: не считаем сам row, но считаем вложенные
             if p_type == "row":
                 cnt += walk(p.get("panels"))
                 continue
 
-            # Обычная панель
             cnt += 1
-
-            # На всякий случай: если у панели есть вложенные panels (редко)
             cnt += walk(p.get("panels"))
-
         return cnt
 
     return walk(dash.get("panels"))
@@ -307,19 +320,16 @@ def main():
 
         is_zero = is_all_zeros_number(norm_number)
 
-        # Нули: либо скипаем, либо включаем "как есть" (без SD/BK)
         if is_zero and not INCLUDE_ALL_ZERO_NUMBERS:
             skipped_zero += 1
             logger.info(f'ORG {org_id}: "{org_name}" ({org_number}) — skip (нули)')
             continue
 
-        # Бан по КОД (применяем только если это НЕ "нули")
         if (not is_zero) and norm_number and norm_number in ban_set:
             skipped_ban += 1
             logger.info(f'ORG {org_id}: "{org_name}" ({org_number}) — skip (бан)')
             continue
 
-        # SD/BK маппинг делаем только для НЕ-нулевых
         sd_name = ""
         owner = ""
         business_type = ""
@@ -335,14 +345,12 @@ def main():
             owner = (sd or {}).get("owner") or ""
             business_type = bk_type_map.get(normalize_name_key(owner), "") if owner else ""
 
-            # Фильтры по типу бизнеса применяем только к НЕ-нулевым
             if SKIP_EMPTY_BUSINESS_TYPE and not clean_spaces(business_type):
                 continue
 
             if ban_business_types_set and clean_spaces(business_type) in ban_business_types_set:
                 continue
 
-        # Для "нулей": имя сервиса берём из org_name, владелец/тип пустые
         display_service_name = sd_name if sd_name else org_name
 
         if not switch_org(org_id):
@@ -356,9 +364,16 @@ def main():
             continue
 
         panels_total = 0
-        for f in get_folders():
-            for d in get_dashboards_in_folder(f["id"]):
+
+        folders = get_folders()
+        for f in folders:
+            folder_uid = f.get("uid")
+            if not folder_uid:
+                continue
+            dashboards = get_dashboards_in_folder(folder_uid)
+            for d in dashboards:
                 panels_total += get_dashboard_panels(d["uid"])
+
         for d in get_root_dashboards():
             panels_total += get_dashboard_panels(d["uid"])
 
@@ -372,10 +387,10 @@ def main():
 
         rows_orgs.append(
             {
-                "Тип бизнеса": business_type,  # для нулей будет ""
+                "Тип бизнеса": business_type,
                 "Наименование сервиса": display_service_name,
                 "КОД": org_number,
-                "Владелец сервиса": owner,  # для нулей будет ""
+                "Владелец сервиса": owner,
                 "Кол-во панелей": panels_total,
                 "Потребление в %": None,
             }
