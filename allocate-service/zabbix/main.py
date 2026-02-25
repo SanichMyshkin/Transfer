@@ -21,7 +21,6 @@ BAN_SERVICE_IDS = [15473]
 SKIP_EMPTY_SERVICE_ID = True
 
 BAN_BUSINESS_TYPES = [
-    "Блок банковских технологий",
 ]
 SKIP_EMPTY_BUSINESS_TYPE = True
 
