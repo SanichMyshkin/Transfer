@@ -10,7 +10,7 @@ from openpyxl.styles import Font
 from openpyxl.utils import get_column_letter
 from humanfriendly import format_size
 
-from nexus_sizes import get_repository_data, get_repository_sizes
+from nexus_sizes import get_repository_data, get_repository_sizes, get_raw_top_folder_sizes
 from confluence_names import confluence_table_as_dicts, repo_to_service_map
 
 
@@ -25,6 +25,8 @@ BAN_SERVICE_CODES = [
 BAN_BUSINESS_TYPES = []
 
 SKIP_EMPTY_BUSINESS_TYPE = True
+
+KIMB_REPO = "kimb-dependencies"
 
 
 def clean_spaces(s):
@@ -222,6 +224,47 @@ def main():
         hosted_total += 1
         repo_name = r["repository_name"]
 
+        if repo_name == KIMB_REPO:
+            logging.info("special-case repo=%s: split by top-level folders (treat as pseudo-repos)", repo_name)
+            folder_sizes = get_raw_top_folder_sizes(repo_name)
+            logging.info("special-case repo=%s: folders=%d", repo_name, len(folder_sizes))
+
+            for folder, size_bytes in folder_sizes.items():
+                base_name, code = split_service_and_code(folder)
+
+                logging.info(
+                    "special-case map: repo=%s -> folder=%s -> base=%s code=%s bytes=%d",
+                    repo_name,
+                    folder,
+                    base_name,
+                    code,
+                    int(size_bytes or 0),
+                )
+
+                if SKIP_EMPTY_SERVICE and (not base_name):
+                    skipped_no_service += 1
+                    logging.info("special-case skip: folder=%s reason=no_service", folder)
+                    continue
+
+                if not code:
+                    skipped_no_code += 1
+                    logging.info("special-case skip: folder=%s reason=no_code", folder)
+                    continue
+
+                if code in BAN_SET:
+                    skipped_ban_service_code += 1
+                    logging.info("special-case skip: folder=%s reason=ban_service_code code=%s", folder, code)
+                    continue
+
+                if code not in totals:
+                    totals[code] = {"size_bytes": 0, "base_name": base_name}
+                totals[code]["size_bytes"] += to_int_bytes(size_bytes)
+
+                if base_name and len(base_name) > len(totals[code]["base_name"] or ""):
+                    totals[code]["base_name"] = base_name
+
+            continue
+
         raw_service = repo_service.get(repo_name, "")
         base_name, code = split_service_and_code(raw_service)
 
@@ -243,7 +286,6 @@ def main():
             totals[code] = {"size_bytes": 0, "base_name": base_name}
         totals[code]["size_bytes"] += size_bytes
 
-        # на всякий: если в confluence разные base_name для одного code, оставим более длинное
         if base_name and len(base_name) > len(totals[code]["base_name"] or ""):
             totals[code]["base_name"] = base_name
 

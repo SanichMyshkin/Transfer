@@ -1,4 +1,4 @@
-# nexus_size.py
+# nexus_sizes.py
 import os
 import psycopg2
 from psycopg2 import sql
@@ -89,5 +89,29 @@ def get_repository_sizes():
             res = _exec(cur)
         conn.commit()
         return res
+    finally:
+        conn.close()
+
+
+def get_raw_top_folder_sizes(repo_name: str):
+    q = """
+        SELECT
+            split_part(ltrim(a.path, '/'), '/', 1) AS folder,
+            SUM(b.blob_size)::bigint AS bytes
+        FROM raw_asset_blob b
+        JOIN raw_asset a ON b.asset_blob_id = a.asset_blob_id
+        JOIN raw_content_repository cr ON cr.repository_id = a.repository_id
+        JOIN repository r ON cr.config_repository_id = r.id
+        WHERE r.name = %s
+        GROUP BY folder
+        ORDER BY bytes DESC;
+    """
+
+    conn = _conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(q, (repo_name,))
+            rows = cur.fetchall()
+            return {str(folder or ""): int(size or 0) for folder, size in rows if str(folder or "").strip()}
     finally:
         conn.close()
