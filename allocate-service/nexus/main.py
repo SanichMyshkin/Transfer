@@ -1,3 +1,4 @@
+# main.py
 import os
 import logging
 import re
@@ -9,24 +10,23 @@ from openpyxl.styles import Font
 from openpyxl.utils import get_column_letter
 from humanfriendly import format_size
 
-from nexus_sizes import get_repository_data, get_repository_sizes
+from nexus_sizes import get_repository_data, get_repository_sizes, get_kimb_top_folder_sizes
 from confluence_names import confluence_table_as_dicts, repo_to_service_map
 
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# если True — репы без кода выкидываем (агрегация ТОЛЬКО по коду)
 SKIP_EMPTY_SERVICE = True
 
 BAN_SERVICE_CODES = [
     15473,
 ]
 
-BAN_BUSINESS_TYPES = [
-    "Блок банковских технологий",
-]
+BAN_BUSINESS_TYPES = []
 
 SKIP_EMPTY_BUSINESS_TYPE = True
+
+KIMB_REPO_NAME = "kimb-dependencies"
 
 
 def clean_spaces(s):
@@ -166,6 +166,77 @@ def write_excel(path, rows):
     wb.save(path)
 
 
+def _merge_kimb_into_totals(log, totals):
+    folder_sizes = get_kimb_top_folder_sizes(KIMB_REPO_NAME)
+
+    kimb_folders_total = len(folder_sizes)
+
+    groups = {}
+    for folder, size_bytes in folder_sizes.items():
+        base, code = split_service_and_code(folder)
+        base = clean_spaces(base)
+        name_key = normalize_name_key(base) if base else normalize_name_key(folder)
+
+        if not name_key:
+            continue
+
+        g = groups.get(name_key)
+        if not g:
+            g = {
+                "size_bytes": 0,
+                "codes": set(),
+                "code_bytes": {},
+                "display_name": base or folder,
+            }
+            groups[name_key] = g
+
+        g["size_bytes"] += to_int_bytes(size_bytes)
+
+        if base and len(base) > len(g["display_name"] or ""):
+            g["display_name"] = base
+
+        if code:
+            g["codes"].add(code)
+            g["code_bytes"][code] = g["code_bytes"].get(code, 0) + to_int_bytes(size_bytes)
+
+    kimb_groups_total = len(groups)
+    kimb_without_code = 0
+    kimb_conflicts = 0
+
+    for name_key, g in groups.items():
+        codes = sorted(g["codes"])
+        chosen_code = ""
+        if len(codes) == 1:
+            chosen_code = codes[0]
+        elif len(codes) == 0:
+            kimb_without_code += 1
+            continue
+        else:
+            kimb_conflicts += 1
+            chosen_code = max(g["code_bytes"].items(), key=lambda kv: kv[1])[0]
+            log.warning(
+                "KIMB conflict: service=%s codes=%s chosen=%s",
+                g["display_name"],
+                ",".join(codes),
+                chosen_code,
+            )
+
+        if chosen_code in BAN_SET:
+            continue
+
+        if chosen_code not in totals:
+            totals[chosen_code] = {"size_bytes": 0, "base_name": g["display_name"]}
+        totals[chosen_code]["size_bytes"] += g["size_bytes"]
+
+        if g["display_name"] and len(g["display_name"]) > len(totals[chosen_code]["base_name"] or ""):
+            totals[chosen_code]["base_name"] = g["display_name"]
+
+    log.info("kimb folders: %d", kimb_folders_total)
+    log.info("kimb groups: %d", kimb_groups_total)
+    log.info("kimb groups without code: %d", kimb_without_code)
+    log.info("kimb code conflicts: %d", kimb_conflicts)
+
+
 def main():
     load_dotenv()
 
@@ -174,6 +245,7 @@ def main():
         format="%(asctime)s | %(levelname)s | %(message)s",
         datefmt="%H:%M:%S",
     )
+    log = logging.getLogger("nexus_report")
 
     conf_url = os.getenv("CONF_URL", "").strip()
     conf_page_id = os.getenv("CONF_PAGE_ID", "").strip()
@@ -182,24 +254,23 @@ def main():
 
     sd_file = os.getenv("SD_FILE", "sd.xlsx").strip()
     bk_file = os.getenv("BK_FILE", "bk_all_users.xlsx").strip()
-
     out_file = os.getenv("OUT_FILE", "nexus_service_consumption.xlsx").strip()
 
     if not conf_url or not conf_page_id or not conf_user or not conf_pass:
         raise RuntimeError("Нужны CONF_URL, CONF_PAGE_ID, CONF_USER, CONF_PASS")
 
-    logging.info("Читаю таблицу из Confluence")
+    log.info("Читаю таблицу из Confluence")
     conf_rows = confluence_table_as_dicts(conf_url, conf_page_id, conf_user, conf_pass)
     repo_service = repo_to_service_map(conf_rows)
 
-    logging.info("Читаю SD и BK")
+    log.info("Читаю SD и BK")
     sd_map = read_sd_map(sd_file)
     bk_map = load_bk_business_type_map(bk_file)
 
-    logging.info("Читаю репозитории из БД")
+    log.info("Читаю репозитории из БД")
     repo_data = get_repository_data()
 
-    logging.info("Считаю размеры репозиториев из БД")
+    log.info("Считаю размеры репозиториев из БД")
     repo_sizes = get_repository_sizes()
 
     totals = {}
@@ -207,13 +278,18 @@ def main():
     skipped_no_service = 0
     skipped_no_code = 0
     skipped_ban_service_code = 0
+    skipped_kimb_repo_in_regular_flow = 0
 
     for r in repo_data:
         if (r.get("repository_type") or "").strip().lower() != "hosted":
             continue
 
-        hosted_total += 1
         repo_name = r["repository_name"]
+        hosted_total += 1
+
+        if repo_name == KIMB_REPO_NAME:
+            skipped_kimb_repo_in_regular_flow += 1
+            continue
 
         raw_service = repo_service.get(repo_name, "")
         base_name, code = split_service_and_code(raw_service)
@@ -221,7 +297,7 @@ def main():
         if SKIP_EMPTY_SERVICE and (not base_name):
             skipped_no_service += 1
             continue
-        
+
         if not code:
             skipped_no_code += 1
             continue
@@ -236,9 +312,11 @@ def main():
             totals[code] = {"size_bytes": 0, "base_name": base_name}
         totals[code]["size_bytes"] += size_bytes
 
-        # на всякий: если в confluence разные base_name для одного code, оставим более длинное
         if base_name and len(base_name) > len(totals[code]["base_name"] or ""):
             totals[code]["base_name"] = base_name
+
+    log.info("Считаю kimb-dependencies по верхним папкам")
+    _merge_kimb_into_totals(log, totals)
 
     candidates = []
     skipped_empty_business_type = 0
@@ -298,19 +376,20 @@ def main():
 
     rows.sort(key=lambda x: x["size_bytes"], reverse=True)
 
-    logging.info(f"hosted repos: {hosted_total}")
-    logging.info(f"skipped without service: {skipped_no_service}")
-    logging.info(f"skipped without code: {skipped_no_code}")
-    logging.info(f"skipped by service code ban: {skipped_ban_service_code}")
-    logging.info(f"skipped empty business type: {skipped_empty_business_type}")
-    logging.info(f"skipped by business type ban: {skipped_ban_business_type}")
-    logging.info(f"services in report: {len(rows)}")
-    logging.info(f"eligible_total: {format_size(eligible_total, binary=True)}")
-    logging.info(f"write excel: {out_file}")
+    log.info("hosted repos: %d", hosted_total)
+    log.info("kimb hosted repo skipped in regular flow: %d", skipped_kimb_repo_in_regular_flow)
+    log.info("skipped without service: %d", skipped_no_service)
+    log.info("skipped without code: %d", skipped_no_code)
+    log.info("skipped by service code ban: %d", skipped_ban_service_code)
+    log.info("skipped empty business type: %d", skipped_empty_business_type)
+    log.info("skipped by business type ban: %d", skipped_ban_business_type)
+    log.info("services in report: %d", len(rows))
+    log.info("eligible_total: %s", format_size(eligible_total, binary=True))
+    log.info("write excel: %s", out_file)
 
     write_excel(out_file, rows)
 
-    logging.info("done")
+    log.info("done")
 
 
 if __name__ == "__main__":
