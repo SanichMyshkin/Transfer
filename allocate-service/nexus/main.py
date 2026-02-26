@@ -175,6 +175,14 @@ def write_excel(path, rows):
     wb.save(path)
 
 
+def _add_to_totals(totals, code, base_name, size_bytes):
+    if code not in totals:
+        totals[code] = {"size_bytes": 0, "base_name": base_name}
+    totals[code]["size_bytes"] += to_int_bytes(size_bytes)
+    if base_name and len(base_name) > len(totals[code]["base_name"] or ""):
+        totals[code]["base_name"] = base_name
+
+
 def main():
     load_dotenv()
 
@@ -225,69 +233,109 @@ def main():
         repo_name = r["repository_name"]
 
         if repo_name == KIMB_REPO:
-            logging.info("special-case repo=%s: split by top-level folders (treat as pseudo-repos)", repo_name)
+            logging.info("map repo=%s -> SPECIAL (split by top-level folders; treat as pseudo-repos)", repo_name)
+
             folder_sizes = get_raw_top_folder_sizes(repo_name)
             logging.info("special-case repo=%s: folders=%d", repo_name, len(folder_sizes))
 
+            base_to_codes = {}
+            for folder in folder_sizes.keys():
+                base_name, code = split_service_and_code(folder)
+                base_key = clean_spaces(base_name).lower()
+                if base_key and code:
+                    base_to_codes.setdefault(base_key, set()).add(code)
+
+            # 1) Сначала папки с кодом
             for folder, size_bytes in folder_sizes.items():
                 base_name, code = split_service_and_code(folder)
+                if not code:
+                    continue
 
                 logging.info(
-                    "special-case map: repo=%s -> folder=%s -> base=%s code=%s bytes=%d",
-                    repo_name,
-                    folder,
-                    base_name,
-                    code,
-                    int(size_bytes or 0),
+                    "map special: repo=%s -> folder=%s -> base=%s code=%s bytes=%d action=ADD",
+                    repo_name, folder, base_name, code, int(size_bytes or 0)
                 )
 
                 if SKIP_EMPTY_SERVICE and (not base_name):
                     skipped_no_service += 1
-                    logging.info("special-case skip: folder=%s reason=no_service", folder)
-                    continue
-
-                if not code:
-                    skipped_no_code += 1
-                    logging.info("special-case skip: folder=%s reason=no_code", folder)
+                    logging.info("map special: folder=%s action=SKIP reason=no_service", folder)
                     continue
 
                 if code in BAN_SET:
                     skipped_ban_service_code += 1
-                    logging.info("special-case skip: folder=%s reason=ban_service_code code=%s", folder, code)
+                    logging.info("map special: folder=%s action=SKIP reason=ban_service_code code=%s", folder, code)
                     continue
 
-                if code not in totals:
-                    totals[code] = {"size_bytes": 0, "base_name": base_name}
-                totals[code]["size_bytes"] += to_int_bytes(size_bytes)
+                _add_to_totals(totals, code, base_name, size_bytes)
 
-                if base_name and len(base_name) > len(totals[code]["base_name"] or ""):
-                    totals[code]["base_name"] = base_name
+            # 2) Потом папки без кода (алиасы)
+            for folder, size_bytes in folder_sizes.items():
+                base_name, code = split_service_and_code(folder)
+                if code:
+                    continue
+
+                base_key = clean_spaces(base_name).lower()
+                codes = list(base_to_codes.get(base_key, set()))
+
+                if len(codes) == 1:
+                    alias_code = codes[0]
+                    logging.info(
+                        "map special: repo=%s -> folder=%s -> base=%s code=%s bytes=%d action=ALIAS_ADD",
+                        repo_name, folder, base_name, alias_code, int(size_bytes or 0)
+                    )
+                    _add_to_totals(totals, alias_code, base_name, size_bytes)
+                    continue
+
+                if len(codes) > 1:
+                    skipped_no_code += 1
+                    logging.info(
+                        "map special: repo=%s -> folder=%s -> base=%s bytes=%d action=SKIP reason=ambiguous_alias codes=%s",
+                        repo_name, folder, base_name, int(size_bytes or 0), ",".join(sorted(codes))
+                    )
+                    continue
+
+                skipped_no_code += 1
+                logging.info(
+                    "map special: repo=%s -> folder=%s -> base=%s bytes=%d action=SKIP reason=no_code",
+                    repo_name, folder, base_name, int(size_bytes or 0)
+                )
 
             continue
 
+        # NORMAL CASE
         raw_service = repo_service.get(repo_name, "")
         base_name, code = split_service_and_code(raw_service)
+        size_bytes = to_int_bytes(repo_sizes.get(repo_name))
 
         if SKIP_EMPTY_SERVICE and (not base_name):
             skipped_no_service += 1
+            logging.info(
+                "map repo=%s -> raw_service=%s -> base=%s code=%s bytes=%d action=SKIP reason=no_service",
+                repo_name, raw_service, base_name, code, size_bytes
+            )
             continue
 
         if not code:
             skipped_no_code += 1
+            logging.info(
+                "map repo=%s -> raw_service=%s -> base=%s code=%s bytes=%d action=SKIP reason=no_code",
+                repo_name, raw_service, base_name, code, size_bytes
+            )
             continue
 
         if code in BAN_SET:
             skipped_ban_service_code += 1
+            logging.info(
+                "map repo=%s -> raw_service=%s -> base=%s code=%s bytes=%d action=SKIP reason=ban_service_code",
+                repo_name, raw_service, base_name, code, size_bytes
+            )
             continue
 
-        size_bytes = to_int_bytes(repo_sizes.get(repo_name))
-
-        if code not in totals:
-            totals[code] = {"size_bytes": 0, "base_name": base_name}
-        totals[code]["size_bytes"] += size_bytes
-
-        if base_name and len(base_name) > len(totals[code]["base_name"] or ""):
-            totals[code]["base_name"] = base_name
+        logging.info(
+            "map repo=%s -> raw_service=%s -> base=%s code=%s bytes=%d action=ADD",
+            repo_name, raw_service, base_name, code, size_bytes
+        )
+        _add_to_totals(totals, code, base_name, size_bytes)
 
     candidates = []
     skipped_empty_business_type = 0
