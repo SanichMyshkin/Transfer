@@ -72,8 +72,11 @@ def get_repository_sizes():
                 sql.Identifier(f"{repo_type}_content_repository"),
             )
 
-            cur.execute(q)
-            repo_sizes.update(dict(cur.fetchall()))
+            try:
+                cur.execute(q)
+                repo_sizes.update(dict(cur.fetchall()))
+            except psycopg2.Error:
+                continue
 
         return repo_sizes
 
@@ -87,7 +90,29 @@ def get_repository_sizes():
         conn.close()
 
 
-def get_kimb_top_folder_sizes(repo_name: str):
+def _table_exists(cur, table_name: str) -> bool:
+    cur.execute(
+        "SELECT 1 FROM pg_catalog.pg_tables WHERE tablename = %s;",
+        (table_name,),
+    )
+    return cur.fetchone() is not None
+
+
+def _column_exists(cur, table_name: str, column_name: str) -> bool:
+    cur.execute(
+        """
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = %s
+          AND column_name = %s;
+        """,
+        (table_name, column_name),
+    )
+    return cur.fetchone() is not None
+
+
+def get_kimb_top_folder_sizes(repo_name: str, log=None):
     repo_name = (repo_name or "").strip()
     if not repo_name:
         return {}
@@ -101,8 +126,35 @@ def get_kimb_top_folder_sizes(repo_name: str):
 
         out = {}
 
+        if log:
+            log.info("KIMB DB scan: try content tables=%d", len(table_names))
+
         for table in table_names:
             repo_type = table.replace("_content_repository", "")
+
+            blob_tbl = f"{repo_type}_asset_blob"
+            asset_tbl = f"{repo_type}_asset"
+            cr_tbl = f"{repo_type}_content_repository"
+
+            if not _table_exists(cur, blob_tbl) or not _table_exists(cur, asset_tbl) or not _table_exists(cur, cr_tbl):
+                if log:
+                    log.warning(
+                        "KIMB DB skip repo_type=%s reason=missing_tables blob=%s asset=%s cr=%s",
+                        repo_type,
+                        blob_tbl,
+                        asset_tbl,
+                        cr_tbl,
+                    )
+                continue
+
+            if not _column_exists(cur, asset_tbl, "path"):
+                if log:
+                    log.warning(
+                        "KIMB DB skip repo_type=%s reason=no_asset_path_column asset_tbl=%s",
+                        repo_type,
+                        asset_tbl,
+                    )
+                continue
 
             q = sql.SQL("""
                 SELECT
@@ -118,21 +170,31 @@ def get_kimb_top_folder_sizes(repo_name: str):
                 WHERE r.name = %s
                 GROUP BY top_folder;
             """).format(
-                blob_tbl=sql.Identifier(f"{repo_type}_asset_blob"),
-                asset_tbl=sql.Identifier(f"{repo_type}_asset"),
-                cr_tbl=sql.Identifier(f"{repo_type}_content_repository"),
+                blob_tbl=sql.Identifier(blob_tbl),
+                asset_tbl=sql.Identifier(asset_tbl),
+                cr_tbl=sql.Identifier(cr_tbl),
             )
 
             try:
                 cur.execute(q, (repo_name,))
                 rows = cur.fetchall()
-            except psycopg2.Error:
+            except psycopg2.Error as e:
+                if log:
+                    log.warning(
+                        "KIMB DB query failed repo_type=%s error=%s",
+                        repo_type,
+                        str(e).strip().replace("\n", " "),
+                    )
                 continue
+
+            if log:
+                log.info("KIMB DB repo_type=%s rows=%d", repo_type, len(rows))
 
             for top_folder, total_bytes in rows:
                 if not top_folder:
                     continue
-                out[str(top_folder)] = out.get(str(top_folder), 0) + int(total_bytes or 0)
+                key = str(top_folder)
+                out[key] = out.get(key, 0) + int(total_bytes or 0)
 
         return out
 

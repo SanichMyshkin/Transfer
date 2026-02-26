@@ -11,7 +11,11 @@ from openpyxl.styles import Font
 from openpyxl.utils import get_column_letter
 from humanfriendly import format_size
 
-from nexus_sizes import get_repository_data, get_repository_sizes, get_kimb_top_folder_sizes
+from nexus_sizes import (
+    get_repository_data,
+    get_repository_sizes,
+    get_kimb_top_folder_sizes,
+)
 from confluence_names import confluence_table_as_dicts, repo_to_service_map
 
 
@@ -167,15 +171,17 @@ def write_excel(path, rows):
     wb.save(path)
 
 
-def _merge_kimb_into_totals(log, totals, service_to_repos, kimb_details, not_counted, banned_repos):
-    folder_sizes = get_kimb_top_folder_sizes(KIMB_REPO_NAME)
+def _merge_kimb_into_totals(log, totals, service_to_repos, not_counted, banned_units):
+    folder_sizes = get_kimb_top_folder_sizes(KIMB_REPO_NAME, log=log)
+
+    log.info("KIMB scan: folders=%d", len(folder_sizes))
 
     groups = {}
     for folder, size_bytes in folder_sizes.items():
         base, code = split_service_and_code(folder)
         base = clean_spaces(base)
         display = base or folder
-        name_key = normalize_name_key(base) if base else normalize_name_key(folder)
+        name_key = normalize_name_key(display)
         if not name_key:
             continue
 
@@ -201,19 +207,17 @@ def _merge_kimb_into_totals(log, totals, service_to_repos, kimb_details, not_cou
             g["codes"].add(code)
             g["code_bytes"][code] = g["code_bytes"].get(code, 0) + b
 
-    log.info("KIMB scan: folders=%d groups=%d", len(folder_sizes), len(groups))
+    log.info("KIMB groups: %d", len(groups))
 
-    kimb_groups_without_code = 0
-    kimb_conflicts = 0
-    kimb_mapped = 0
-    kimb_banned = 0
+    mapped = 0
+    without_code = 0
+    conflicts = 0
+    banned = 0
 
-    for _, g in groups.items():
+    for g in groups.values():
         codes = sorted(g["codes"])
-        chosen_code = ""
-
         if len(codes) == 0:
-            kimb_groups_without_code += 1
+            without_code += 1
             not_counted.append(
                 {
                     "repo": KIMB_REPO_NAME,
@@ -223,17 +227,16 @@ def _merge_kimb_into_totals(log, totals, service_to_repos, kimb_details, not_cou
                 }
             )
             log.warning(
-                "KIMB NOT_COUNTED group=%s size=%s reason=without_code folders=%s",
+                "KIMB NOT_COUNTED group=%s size=%s reason=without_code",
                 g["display_name"],
                 format_size(g["size_bytes"], binary=True),
-                ", ".join([f"{f}:{format_size(b, binary=True)}" for f, b in g["folders"][:20]]) + (" ..." if len(g["folders"]) > 20 else ""),
             )
             continue
 
         if len(codes) == 1:
             chosen_code = codes[0]
         else:
-            kimb_conflicts += 1
+            conflicts += 1
             chosen_code = max(g["code_bytes"].items(), key=lambda kv: kv[1])[0]
             log.warning(
                 "KIMB CONFLICT group=%s codes=%s chosen=%s",
@@ -243,8 +246,8 @@ def _merge_kimb_into_totals(log, totals, service_to_repos, kimb_details, not_cou
             )
 
         if chosen_code in BAN_SET:
-            kimb_banned += 1
-            banned_repos.append(
+            banned += 1
+            banned_units.append(
                 {
                     "repo": KIMB_REPO_NAME,
                     "unit": g["display_name"],
@@ -269,25 +272,16 @@ def _merge_kimb_into_totals(log, totals, service_to_repos, kimb_details, not_cou
             totals[chosen_code]["base_name"] = g["display_name"]
 
         service_to_repos[chosen_code].add(f"{KIMB_REPO_NAME}:{g['display_name']}")
-        kimb_details.append(
-            {
-                "service_key": g["display_name"],
-                "code": chosen_code,
-                "size_bytes": g["size_bytes"],
-                "folders": g["folders"],
-            }
-        )
 
-        kimb_mapped += 1
+        mapped += 1
         log.info(
-            "KIMB MAP service=%s code=%s size=%s folders=%s",
+            "KIMB MAP service=%s code=%s size=%s",
             g["display_name"],
             chosen_code,
             format_size(g["size_bytes"], binary=True),
-            ", ".join([f"{f}:{format_size(b, binary=True)}" for f, b in g["folders"][:20]]) + (" ..." if len(g["folders"]) > 20 else ""),
         )
 
-    log.info("KIMB summary: mapped=%d without_code=%d conflicts=%d banned=%d", kimb_mapped, kimb_groups_without_code, kimb_conflicts, kimb_banned)
+    log.info("KIMB summary: mapped=%d without_code=%d conflicts=%d banned=%d", mapped, without_code, conflicts, banned)
 
 
 def main():
@@ -323,14 +317,30 @@ def main():
     log.info("Читаю репозитории из БД")
     repo_data = get_repository_data()
 
+    kimb_rows = [x for x in repo_data if (x.get("repository_name") or "") == KIMB_REPO_NAME]
+    if not kimb_rows:
+        log.warning("KIMB repo not found in repository table: %s", KIMB_REPO_NAME)
+    else:
+        for x in kimb_rows:
+            log.info(
+                "KIMB repo in DB: name=%s format=%s type=%s blob_store=%s cleanup=%s",
+                x.get("repository_name"),
+                x.get("format"),
+                x.get("repository_type"),
+                x.get("blob_store_name"),
+                x.get("cleanup_policy"),
+            )
+
     log.info("Считаю размеры репозиториев из БД")
     repo_sizes = get_repository_sizes()
+
+    log.info("Repo sizes contains kimb: %s", KIMB_REPO_NAME in repo_sizes)
 
     totals = {}
     service_to_repos = defaultdict(set)
 
     not_counted = []
-    banned_repos = []
+    banned_units = []
 
     hosted_total = 0
     non_hosted_total = 0
@@ -338,8 +348,6 @@ def main():
     skipped_no_service = 0
     skipped_no_code = 0
     skipped_ban_service_code = 0
-
-    kimb_details = []
 
     log.info("=== DETAILED MAPPING (repo -> service) ===")
 
@@ -350,7 +358,12 @@ def main():
         if repo_type != "hosted":
             non_hosted_total += 1
             not_counted.append(
-                {"repo": repo_name, "unit": repo_name, "reason": f"non_hosted:{repo_type}", "size_bytes": to_int_bytes(repo_sizes.get(repo_name))}
+                {
+                    "repo": repo_name,
+                    "unit": repo_name,
+                    "reason": f"non_hosted:{repo_type}",
+                    "size_bytes": to_int_bytes(repo_sizes.get(repo_name)),
+                }
             )
             continue
 
@@ -365,7 +378,12 @@ def main():
         if SKIP_EMPTY_SERVICE and not base_name:
             skipped_no_service += 1
             not_counted.append(
-                {"repo": repo_name, "unit": repo_name, "reason": "no_service_mapping", "size_bytes": to_int_bytes(repo_sizes.get(repo_name))}
+                {
+                    "repo": repo_name,
+                    "unit": repo_name,
+                    "reason": "no_service_mapping",
+                    "size_bytes": to_int_bytes(repo_sizes.get(repo_name)),
+                }
             )
             log.warning(
                 "NOT_COUNTED repo=%s reason=no_service_mapping size=%s",
@@ -377,7 +395,12 @@ def main():
         if not code:
             skipped_no_code += 1
             not_counted.append(
-                {"repo": repo_name, "unit": repo_name, "reason": "no_service_code", "size_bytes": to_int_bytes(repo_sizes.get(repo_name))}
+                {
+                    "repo": repo_name,
+                    "unit": repo_name,
+                    "reason": "no_service_code",
+                    "size_bytes": to_int_bytes(repo_sizes.get(repo_name)),
+                }
             )
             log.warning(
                 "NOT_COUNTED repo=%s service=%s reason=no_code size=%s",
@@ -390,8 +413,14 @@ def main():
         if code in BAN_SET:
             skipped_ban_service_code += 1
             size_bytes = to_int_bytes(repo_sizes.get(repo_name))
-            banned_repos.append(
-                {"repo": repo_name, "unit": repo_name, "code": code, "reason": "banned_service_code", "size_bytes": size_bytes}
+            banned_units.append(
+                {
+                    "repo": repo_name,
+                    "unit": repo_name,
+                    "code": code,
+                    "reason": "banned_service_code",
+                    "size_bytes": size_bytes,
+                }
             )
             log.info(
                 "BANNED repo=%s service=%s code=%s size=%s",
@@ -421,13 +450,13 @@ def main():
         )
 
     log.info("Считаю kimb-dependencies по верхним папкам")
-    _merge_kimb_into_totals(log, totals, service_to_repos, kimb_details, not_counted, banned_repos)
+    _merge_kimb_into_totals(log, totals, service_to_repos, not_counted, banned_units)
 
     candidates = []
     skipped_empty_business_type = 0
     skipped_ban_business_type = 0
 
-    skipped_by_business = []
+    skipped_by_business_empty = []
     skipped_by_business_ban = []
 
     for code, v in totals.items():
@@ -445,15 +474,28 @@ def main():
 
         if SKIP_EMPTY_BUSINESS_TYPE and not business_type:
             skipped_empty_business_type += 1
-            skipped_by_business.append(
-                {"code": code, "service_name": service_name, "owner": owner, "size_bytes": size_bytes, "repos": sorted(service_to_repos.get(code, []))}
+            skipped_by_business_empty.append(
+                {
+                    "code": code,
+                    "service_name": service_name,
+                    "owner": owner,
+                    "size_bytes": size_bytes,
+                    "repos": sorted(service_to_repos.get(code, [])),
+                }
             )
             continue
 
         if BAN_BUSINESS_SET and business_type in BAN_BUSINESS_SET:
             skipped_ban_business_type += 1
             skipped_by_business_ban.append(
-                {"code": code, "service_name": service_name, "business_type": business_type, "owner": owner, "size_bytes": size_bytes, "repos": sorted(service_to_repos.get(code, []))}
+                {
+                    "code": code,
+                    "service_name": service_name,
+                    "business_type": business_type,
+                    "owner": owner,
+                    "size_bytes": size_bytes,
+                    "repos": sorted(service_to_repos.get(code, [])),
+                }
             )
             continue
 
@@ -504,16 +546,6 @@ def main():
             ", ".join(repos) if repos else "-",
         )
 
-    log.info("=== KIMB SUMMARY (group -> code -> size) ===")
-    for x in sorted(kimb_details, key=lambda z: z["size_bytes"], reverse=True):
-        log.info(
-            "KIMB_SERVICE name=%s code=%s size=%s folders=%s",
-            x["service_key"],
-            x["code"],
-            format_size(x["size_bytes"], binary=True),
-            ", ".join([f"{f}:{format_size(b, binary=True)}" for f, b in x["folders"][:20]]) + (" ..." if len(x["folders"]) > 20 else ""),
-        )
-
     log.info("=== NOT COUNTED REPOS/UNITS ===")
     for x in sorted(not_counted, key=lambda z: z.get("size_bytes", 0), reverse=True):
         log.info(
@@ -525,7 +557,7 @@ def main():
         )
 
     log.info("=== BANNED REPOS/UNITS ===")
-    for x in sorted(banned_repos, key=lambda z: z.get("size_bytes", 0), reverse=True):
+    for x in sorted(banned_units, key=lambda z: z.get("size_bytes", 0), reverse=True):
         log.info(
             "BANNED repo=%s unit=%s code=%s reason=%s size=%s",
             x.get("repo"),
@@ -536,7 +568,7 @@ def main():
         )
 
     log.info("=== SKIPPED BY BUSINESS TYPE (empty) ===")
-    for x in sorted(skipped_by_business, key=lambda z: z.get("size_bytes", 0), reverse=True):
+    for x in sorted(skipped_by_business_empty, key=lambda z: z.get("size_bytes", 0), reverse=True):
         log.info(
             "SKIP_BUSINESS_EMPTY code=%s service=%s owner=%s size=%s repos=%s",
             x["code"],
