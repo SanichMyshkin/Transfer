@@ -18,7 +18,7 @@ BK_FILE = os.getenv("BK_FILE")
 
 OUTPUT_XLSX = os.getenv("OUTPUT_XLSX", "zabbix_events_report.xlsx")
 
-EVENT_TAGS = [
+TRIGGER_TAGS = [
     "service",
     "billing",
 ]
@@ -111,7 +111,7 @@ def fetch_triggers_by_tags(api, hostids):
     host_trigger_ids = defaultdict(set)
     host_tags_found = defaultdict(set)
 
-    for tag in EVENT_TAGS:
+    for tag in TRIGGER_TAGS:
         logger.info(f"Получаем триггеры по тегу: {tag}")
 
         for part in chunks(hostids, ZBX_CHUNK):
@@ -226,8 +226,8 @@ def main():
         die(f"SD_FILE не найден: {SD_FILE}")
     if not BK_FILE or not os.path.isfile(BK_FILE):
         die(f"BK_FILE не найден: {BK_FILE}")
-    if not EVENT_TAGS:
-        die("EVENT_TAGS пуст")
+    if not TRIGGER_TAGS:
+        die("TRIGGER_TAGS пуст")
 
     now = int(time.time())
     time_from = now - EVENT_DAYS * 86400
@@ -366,7 +366,7 @@ def main():
         )
 
     logger.info(f"Период: последние {EVENT_DAYS} дней")
-    logger.info(f"Теги (OR): {EVENT_TAGS}")
+    logger.info(f"Теги (OR): {TRIGGER_TAGS}")
     logger.info(f"Хостов с tagged-триггерами: {len(df_tagged_hosts)}")
     logger.info(f"Итого событий (в отчете): {total_events}")
     logger.info(f"Сервисов в отчете: {len(df_report)}")
