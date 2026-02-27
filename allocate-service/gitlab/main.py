@@ -62,17 +62,15 @@ def connect():
 
 
 def extract_service_id_info(topics):
-    matched = []
     ids = []
 
     for t in (topics or []):
         s = (t or "").strip()
         m = SERVICE_ID_RE.match(s)
         if m:
-            matched.append(s)
             ids.append(m.group(1))
 
-    if not matched:
+    if not ids:
         return "", "MISSING"
 
     uniq = sorted(set(ids))
@@ -94,8 +92,9 @@ def main():
     out_path = str(Path(OUT_XLSX).resolve())
     wb = Workbook()
 
+    # Лист 1 — агрегация
     ws_sum = wb.active
-    ws_sum.title = "Отчет Gitlab"
+    ws_sum.title = "ByServiceId"
 
     ws_sum.append(
         [
@@ -104,15 +103,13 @@ def main():
             "repo_size_h_sum",
             "job_artifacts_h_sum",
             "total_h_sum",
-            "repo_bytes_sum",
-            "job_bytes_sum",
-            "total_bytes_sum",
             "percent_of_all_total",
         ]
     )
     for c in ws_sum[1]:
         c.font = Font(bold=True)
 
+    # Лист 2 — не сматчилось
     ws_unmapped = wb.create_sheet("Unmapped")
     ws_unmapped.append(
         [
@@ -208,9 +205,6 @@ def main():
                 humanize.naturalsize(repo_b, binary=True),
                 humanize.naturalsize(job_b, binary=True) if job_b else "",
                 humanize.naturalsize(total_b, binary=True),
-                repo_b,
-                job_b,
-                total_b,
                 round(pct(total_b, total_all), 4),
             ]
         )
