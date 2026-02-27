@@ -132,7 +132,7 @@ def load_bk_business_type_map(path):
 def write_excel(path, rows):
     wb = Workbook()
     ws = wb.active
-    ws.title = "report"
+    ws.title = "Отчет Nexus"
 
     header = [
         "Тип бизнеса",
@@ -200,7 +200,7 @@ def main():
     sd_file = os.getenv("SD_FILE", "sd.xlsx").strip()
     bk_file = os.getenv("BK_FILE", "bk_all_users.xlsx").strip()
 
-    out_file = os.getenv("OUT_FILE", "nexus_service_consumption.xlsx").strip()
+    out_file = os.getenv("OUT_FILE", "nexus_report.xlsx").strip()
 
     if not conf_url or not conf_page_id or not conf_user or not conf_pass:
         raise RuntimeError("Нужны CONF_URL, CONF_PAGE_ID, CONF_USER, CONF_PASS")

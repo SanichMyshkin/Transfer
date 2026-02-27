@@ -3,6 +3,7 @@ import re
 import time
 import logging
 from pathlib import Path
+from collections import defaultdict
 
 import urllib3
 import gitlab
@@ -24,7 +25,8 @@ SSL_VERIFY = False
 SLEEP_SEC = 0.02
 LOG_EVERY = 100
 
-SERVICE_ID_RE = re.compile(r"^service_id:\s*(\d+)\s*$", re.IGNORECASE)
+# более терпимая регулярка: допускает пробелы, дефисы, разный регистр
+SERVICE_ID_RE = re.compile(r"^service[_-]?id\s*:\s*(\d+)\s*$", re.IGNORECASE)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("gitlab_sizes")
@@ -53,13 +55,35 @@ def connect():
     return gl
 
 
-def extract_service_id(topics) -> str:
+def extract_service_id_info(topics):
+    """
+    Возвращает:
+      service_id: str
+      status: str  -> OK | MISSING | CONFLICT
+      matched_topics: list[str] -> какие топики совпали с маской service_id:*
+    """
+    matched = []
     for t in (topics or []):
         s = (t or "").strip()
         m = SERVICE_ID_RE.match(s)
         if m:
-            return m.group(1)
-    return ""
+            matched.append(s)
+
+    if not matched:
+        return "", "MISSING", []
+
+    # если нашли несколько разных service_id — конфликт
+    ids = []
+    for s in matched:
+        m = SERVICE_ID_RE.match(s.strip())
+        if m:
+            ids.append(m.group(1))
+
+    uniq = sorted(set(ids))
+    if len(uniq) == 1:
+        return uniq[0], "OK", matched
+
+    return "", "CONFLICT", matched
 
 
 def autosize_columns(ws, max_width=80):
@@ -74,29 +98,66 @@ def autosize_columns(ws, max_width=80):
         ws.column_dimensions[letter].width = min(max(10, best + 2), max_width)
 
 
+def bold_header(ws):
+    for c in ws[1]:
+        c.font = Font(bold=True)
+
+
 def main():
     gl = connect()
 
     out_path = str(Path(OUT_XLSX).resolve())
     wb = Workbook()
+
     ws = wb.active
     ws.title = "Projects"
 
-    headers = [
+    ws_no = wb.create_sheet("NoServiceId")
+    ws_sum = wb.create_sheet("ByServiceId")
+
+    headers_projects = [
         "project_id",
         "project",
         "web_url",
         "service_id",
+        "service_id_status",
+        "service_id_topics",
         "repo_size_h",
         "job_artifacts_h",
         "total_h",
     ]
-    ws.append(headers)
-    for c in ws[1]:
-        c.font = Font(bold=True)
+    ws.append(headers_projects)
+    bold_header(ws)
+
+    headers_no = [
+        "project_id",
+        "project",
+        "web_url",
+        "service_id_status",
+        "service_id_topics",
+        "topics_all",
+    ]
+    ws_no.append(headers_no)
+    bold_header(ws_no)
+
+    headers_sum = [
+        "service_id",
+        "projects_count",
+        "repo_size_h_sum",
+        "job_artifacts_h_sum",
+        "total_h_sum",
+        "repo_bytes_sum",
+        "job_bytes_sum",
+        "total_bytes_sum",
+    ]
+    ws_sum.append(headers_sum)
+    bold_header(ws_sum)
 
     errors = 0
     start_ts = time.time()
+
+    # для агрегации по service_id
+    agg = defaultdict(lambda: {"projects": 0, "repo": 0, "job": 0})
 
     log.info("Начинаем обход всех проектов...")
 
@@ -109,7 +170,7 @@ def main():
             web_url = getattr(full, "web_url", "") or ""
 
             topics = list(getattr(full, "topics", []) or [])
-            service_id = extract_service_id(topics)
+            service_id, sid_status, sid_topics = extract_service_id_info(topics)
 
             stats = getattr(full, "statistics", {}) or {}
             repo_bytes = int(stats.get("repository_size", 0) or 0)
@@ -122,11 +183,30 @@ def main():
                     name,
                     web_url,
                     service_id,
+                    sid_status,
+                    ",".join(sid_topics),
                     humanize.naturalsize(repo_bytes, binary=True),
                     humanize.naturalsize(job_bytes, binary=True) if job_bytes else "",
                     humanize.naturalsize(total_bytes, binary=True),
                 ]
             )
+
+            if sid_status != "OK":
+                ws_no.append(
+                    [
+                        proj_id,
+                        name,
+                        web_url,
+                        sid_status,
+                        ",".join(sid_topics),
+                        ",".join(topics),
+                    ]
+                )
+            else:
+                a = agg[service_id]
+                a["projects"] += 1
+                a["repo"] += repo_bytes
+                a["job"] += job_bytes
 
         except Exception as e:
             errors += 1
@@ -141,7 +221,28 @@ def main():
         if SLEEP_SEC:
             time.sleep(SLEEP_SEC)
 
+    # выгрузка агрегации
+    for service_id in sorted(agg.keys(), key=lambda x: int(x) if x.isdigit() else x):
+        repo_b = agg[service_id]["repo"]
+        job_b = agg[service_id]["job"]
+        total_b = repo_b + job_b
+        ws_sum.append(
+            [
+                service_id,
+                agg[service_id]["projects"],
+                humanize.naturalsize(repo_b, binary=True),
+                humanize.naturalsize(job_b, binary=True) if job_b else "",
+                humanize.naturalsize(total_b, binary=True),
+                repo_b,
+                job_b,
+                total_b,
+            ]
+        )
+
     autosize_columns(ws)
+    autosize_columns(ws_no)
+    autosize_columns(ws_sum)
+
     wb.save(out_path)
     log.info(f"Saved: {out_path} | rows={ws.max_row - 1} errors={errors}")
     log.info("Готово")
