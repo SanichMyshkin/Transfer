@@ -2,6 +2,7 @@ import os
 import logging
 import requests
 import urllib3
+
 from dotenv import load_dotenv
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font
@@ -27,9 +28,7 @@ SKIP_IF_CODE_NOT_IN_SD = True
 SKIP_EMPTY_SERVICES = True
 
 BAN_SERVICE_IDS = [15473]
-
 BAN_BUSINESS_TYPES = []
-
 SKIP_EMPTY_BUSINESS_TYPE = True
 
 
@@ -45,7 +44,11 @@ def build_ban_set(v):
 
 
 ban_set = build_ban_set(BAN_SERVICE_IDS)
-ban_business_set = {" ".join(str(x).replace(",", " ").split()) for x in BAN_BUSINESS_TYPES if " ".join(str(x).replace(",", " ").split())}
+ban_business_set = {
+    " ".join(str(x).replace(",", " ").split())
+    for x in BAN_BUSINESS_TYPES
+    if " ".join(str(x).replace(",", " ").split())
+}
 
 
 def clean(s):
@@ -162,10 +165,29 @@ def load_bk(path):
 
 
 def pick_bt(bk, owner):
-    return bk.get(norm_key(owner)) if owner else ""
+    return clean(bk.get(norm_key(owner)) if owner else "")
 
 
-def process_sonar(url, token, sd, bk, acc):
+def calc_project_tasks_lines(s, url, key, tasks, ncloc_cache, new_cache):
+    tcnt, lines = 0, 0
+    for t in tasks:
+        tcnt += 1
+        pr, br = t.get("pullRequest"), t.get("branch")
+        if pr:
+            ck = (key, pr)
+            if ck not in new_cache:
+                new_cache[ck] = measure(s, url, key, "new_lines", pr=pr)
+            lines += new_cache[ck]
+        else:
+            b = br or "__main__"
+            ck = (key, b)
+            if ck not in ncloc_cache:
+                ncloc_cache[ck] = measure(s, url, key, "ncloc", branch=None if b == "__main__" else b)
+            lines += ncloc_cache[ck]
+    return tcnt, lines
+
+
+def process_sonar(url, token, sd, bk, acc, unaccounted):
     if not url or not token:
         return
 
@@ -177,50 +199,136 @@ def process_sonar(url, token, sd, bk, acc):
 
     ncloc_cache, new_cache = {}, {}
 
+    def add_unacc(reason, detail, project_key, prefix, svc_guess, code, owner, bt, tasks_total, total_lines):
+        unaccounted.append({
+            "instance": label,
+            "project_key": project_key or "",
+            "prefix": prefix or "",
+            "svc_guess": svc_guess or "",
+            "code": code or "",
+            "owner": owner or "",
+            "business_type": bt or "",
+            "tasks_total": int(tasks_total or 0),
+            "total_lines": int(total_lines or 0),
+            "reason": reason,
+            "detail": detail,
+        })
+
     for p in projects:
         key = p.get("key")
         if not key:
             continue
 
-        svc, code = split_service_name_code(key.split(":", 1)[0])
-        if not code or code in ban_set:
+        prefix = key.split(":", 1)[0]
+        svc_guess, code = split_service_name_code(prefix)
+
+        # По дефолту tasks/lines неизвестны (не тратим API), но для некоторых причин считаем (чтобы “неучтенные тоже посчитать”)
+        tasks_total = 0
+        total_lines = 0
+
+        if not code:
+            add_unacc(
+                reason="no_code_in_key",
+                detail=f"cannot parse code from prefix={prefix!r} (expected ...-<digits>)",
+                project_key=key,
+                prefix=prefix,
+                svc_guess=svc_guess,
+                code="",
+                owner="",
+                bt="",
+                tasks_total=0,
+                total_lines=0,
+            )
             continue
+
+        if code in ban_set:
+            add_unacc(
+                reason="banned_service_id",
+                detail=f"code={code} in BAN_SERVICE_IDS",
+                project_key=key,
+                prefix=prefix,
+                svc_guess=svc_guess,
+                code=code,
+                owner="",
+                bt="",
+                tasks_total=0,
+                total_lines=0,
+            )
+            continue
+
         if SKIP_IF_CODE_NOT_IN_SD and code not in sd:
+            add_unacc(
+                reason="code_not_in_sd",
+                detail=f"SKIP_IF_CODE_NOT_IN_SD=True and code={code} not found in SD",
+                project_key=key,
+                prefix=prefix,
+                svc_guess=svc_guess,
+                code=code,
+                owner="",
+                bt="",
+                tasks_total=0,
+                total_lines=0,
+            )
             continue
 
         sd_row = sd.get(code, {})
-        svc = sd_row.get("name") or svc
+        svc = sd_row.get("name") or svc_guess
         owner = sd_row.get("owner") or ""
-        bt = pick_bt(bk, sd_row.get("owner") or "")
+        bt = pick_bt(bk, owner)
 
-        if SKIP_EMPTY_BUSINESS_TYPE and not clean(bt):
-            continue
-        if ban_business_set and clean(bt) in ban_business_set:
-            continue
-
+        # Здесь уже считаем usage (tasks/lines) один раз — и для accounted, и для unaccounted
         tasks = get_tasks(s, url, key)
-        tcnt, lines = 0, 0
+        tasks_total, total_lines = calc_project_tasks_lines(s, url, key, tasks, ncloc_cache, new_cache)
 
-        for t in tasks:
-            tcnt += 1
-            pr, br = t.get("pullRequest"), t.get("branch")
-            if pr:
-                ck = (key, pr)
-                new_cache.setdefault(ck, measure(s, url, key, "new_lines", pr=pr))
-                lines += new_cache[ck]
-            else:
-                b = br or "__main__"
-                ck = (key, b)
-                if ck not in ncloc_cache:
-                    ncloc_cache[ck] = measure(s, url, key, "ncloc", branch=None if b == "__main__" else b)
-                lines += ncloc_cache[ck]
+        if SKIP_EMPTY_SERVICES and not tasks_total and not total_lines:
+            add_unacc(
+                reason="empty_service_usage",
+                detail="SKIP_EMPTY_SERVICES=True and tasks_total=0 and total_lines=0",
+                project_key=key,
+                prefix=prefix,
+                svc_guess=svc,
+                code=code,
+                owner=owner,
+                bt=bt,
+                tasks_total=tasks_total,
+                total_lines=total_lines,
+            )
+            continue
 
-        if SKIP_EMPTY_SERVICES and not tcnt and not lines:
+        if SKIP_EMPTY_BUSINESS_TYPE and not bt:
+            det = "owner empty in SD" if not owner else "owner not found in BK or BK business_type empty"
+            add_unacc(
+                reason="empty_business_type",
+                detail=f"SKIP_EMPTY_BUSINESS_TYPE=True and business_type empty ({det})",
+                project_key=key,
+                prefix=prefix,
+                svc_guess=svc,
+                code=code,
+                owner=owner,
+                bt=bt,
+                tasks_total=tasks_total,
+                total_lines=total_lines,
+            )
+            continue
+
+        if ban_business_set and bt in ban_business_set:
+            add_unacc(
+                reason="banned_business_type",
+                detail=f"business_type={bt!r} in BAN_BUSINESS_TYPES",
+                project_key=key,
+                prefix=prefix,
+                svc_guess=svc,
+                code=code,
+                owner=owner,
+                bt=bt,
+                tasks_total=tasks_total,
+                total_lines=total_lines,
+            )
             continue
 
         logger.info(
             '[%s] %s (%s) owner="%s" type="%s" tasks=%d lines=%d',
-            label, svc, code, owner, bt, tcnt, lines
+            label, svc, code, owner, bt, tasks_total, total_lines
         )
 
         acc.setdefault(code, {
@@ -232,12 +340,13 @@ def process_sonar(url, token, sd, bk, acc):
             "total_lines": 0,
         })
 
-        acc[code]["tasks_total"] += tcnt
-        acc[code]["total_lines"] += lines
+        acc[code]["tasks_total"] += tasks_total
+        acc[code]["total_lines"] += total_lines
 
 
-def write_xlsx(rows):
+def write_xlsx(rows, unaccounted_rows):
     wb = Workbook()
+
     ws = wb.active
     ws.title = "Отчет SonarQube"
 
@@ -251,24 +360,80 @@ def write_xlsx(rows):
         "% потребления",
     ]
     ws.append(headers)
-
     for c in ws[1]:
         c.font = Font(bold=True)
 
-    total = sum(r["total_lines"] for r in rows) or 1
+    total_accounted_lines = sum(r["total_lines"] for r in rows) or 0
+    total_unaccounted_lines = sum(r.get("total_lines", 0) for r in unaccounted_rows) or 0
+    total_all_lines = total_accounted_lines + total_unaccounted_lines
+    if total_all_lines <= 0:
+        total_all_lines = 1
+
     for r in rows:
+        pct = (r["total_lines"] / total_all_lines) if total_all_lines else 0.0
         ws.append([
             r["business_type"],
             r["service"],
             r["code"],
             r["owner"],
-            r["tasks_total"],
-            r["total_lines"],
-            round(r["total_lines"] / total * 100, 2),
+            int(r["tasks_total"]),
+            int(r["total_lines"]),
+            pct,  # доля, форматируем как %
         ])
+
+    # percent format (0.3% etc)
+    pct_col = headers.index("% потребления") + 1
+    for rr in range(2, ws.max_row + 1):
+        ws.cell(row=rr, column=pct_col).number_format = "0.0%"
+
+    ws2 = wb.create_sheet("Unaccounted")
+    headers2 = [
+        "instance",
+        "project_key",
+        "prefix",
+        "svc_guess",
+        "code",
+        "owner",
+        "business_type",
+        "tasks_total",
+        "total_lines",
+        "% от total_lines_all",
+        "reason",
+        "detail",
+    ]
+    ws2.append(headers2)
+    for c in ws2[1]:
+        c.font = Font(bold=True)
+
+    pct2_col = headers2.index("% от total_lines_all") + 1
+
+    for r in unaccounted_rows:
+        lines = int(r.get("total_lines", 0) or 0)
+        pct_all = (lines / total_all_lines) if total_all_lines else 0.0
+        ws2.append([
+            r.get("instance", ""),
+            r.get("project_key", ""),
+            r.get("prefix", ""),
+            r.get("svc_guess", ""),
+            r.get("code", ""),
+            r.get("owner", ""),
+            r.get("business_type", ""),
+            int(r.get("tasks_total", 0) or 0),
+            lines,
+            pct_all,  # доля
+            r.get("reason", ""),
+            r.get("detail", ""),
+        ])
+
+    for rr in range(2, ws2.max_row + 1):
+        ws2.cell(row=rr, column=pct2_col).number_format = "0.0%"
 
     wb.save(OUT_FILE)
     logger.info("Файл сохранён: %s", OUT_FILE)
+    logger.info(
+        "Totals: accounted_lines=%d unaccounted_lines=%d total_lines_all=%d",
+        total_accounted_lines, total_unaccounted_lines, total_all_lines
+    )
 
 
 def main():
@@ -279,12 +444,15 @@ def main():
     bk = load_bk(BK_FILE)
 
     services = {}
+    unaccounted = []
 
-    process_sonar(SONAR_URL, SONAR_TOKEN, sd, bk, services)
-    process_sonar(SONAR2_URL, SONAR2_TOKEN, sd, bk, services)
+    process_sonar(SONAR_URL, SONAR_TOKEN, sd, bk, services, unaccounted)
+    process_sonar(SONAR2_URL, SONAR2_TOKEN, sd, bk, services, unaccounted)
 
     rows = sorted(services.values(), key=lambda x: x["total_lines"], reverse=True)
-    write_xlsx(rows)
+    unaccounted_sorted = sorted(unaccounted, key=lambda x: int(x.get("total_lines", 0) or 0), reverse=True)
+
+    write_xlsx(rows, unaccounted_sorted)
 
 
 if __name__ == "__main__":

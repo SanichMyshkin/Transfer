@@ -10,7 +10,11 @@ from openpyxl.styles import Font
 from openpyxl.utils import get_column_letter
 from humanfriendly import format_size
 
-from nexus_sizes import get_repository_data, get_repository_sizes, get_raw_top_folder_sizes
+from nexus_sizes import (
+    get_repository_data,
+    get_repository_sizes,
+    get_raw_top_folder_sizes,
+)
 from confluence_names import confluence_table_as_dicts, repo_to_service_map
 
 
@@ -177,7 +181,7 @@ def write_excel(path, rows, unaccounted_rows):
     # Sheet 2: unaccounted
     ws2 = wb.create_sheet("Unaccounted")
     header2 = [
-        "scope",         # repo / folder / service
+        "scope",  # repo / folder / service
         "repo",
         "folder",
         "raw_service",
@@ -223,8 +227,17 @@ def write_excel(path, rows, unaccounted_rows):
         widths2[3] = max(widths2[3], len(str(u.get("raw_service", ""))))
         widths2[4] = max(widths2[4], len(str(u.get("base_name", ""))))
         widths2[5] = max(widths2[5], len(str(u.get("code", ""))))
-        widths2[6] = max(widths2[6], len(str(int(u.get("bytes") or 0)))))
-        widths2[7] = max(widths2[7], len(str(format_size(int(u.get("bytes") or 0), binary=True) if int(u.get("bytes") or 0) else "")))
+        widths2[6] = max(widths2[6], len(str(int(u.get("bytes") or 0))))
+        widths2[7] = max(
+            widths2[7],
+            len(
+                str(
+                    format_size(int(u.get("bytes") or 0), binary=True)
+                    if int(u.get("bytes") or 0)
+                    else ""
+                )
+            ),
+        )
         widths2[8] = max(widths2[8], len(str(u.get("reason", ""))))
         widths2[9] = max(widths2[9], len(str(u.get("detail", ""))))
         widths2[10] = max(widths2[10], len(str(u.get("sd_name", ""))))
@@ -267,7 +280,20 @@ def main():
     if not conf_url or not conf_page_id or not conf_user or not conf_pass:
         raise RuntimeError("Нужны CONF_URL, CONF_PAGE_ID, CONF_USER, CONF_PASS")
 
-    def add_unaccounted(scope, repo, folder, raw_service, base_name, code, bytes_, reason, detail, sd_name="", owner="", business_type=""):
+    def add_unaccounted(
+        scope,
+        repo,
+        folder,
+        raw_service,
+        base_name,
+        code,
+        bytes_,
+        reason,
+        detail,
+        sd_name="",
+        owner="",
+        business_type="",
+    ):
         unaccounted.append(
             {
                 "scope": scope,
@@ -315,10 +341,15 @@ def main():
         repo_name = r["repository_name"]
 
         if repo_name == KIMB_REPO:
-            logging.info("map repo=%s -> SPECIAL (split by top-level folders; treat as pseudo-repos)", repo_name)
+            logging.info(
+                "map repo=%s -> SPECIAL (split by top-level folders; treat as pseudo-repos)",
+                repo_name,
+            )
 
             folder_sizes = get_raw_top_folder_sizes(repo_name)
-            logging.info("special-case repo=%s: folders=%d", repo_name, len(folder_sizes))
+            logging.info(
+                "special-case repo=%s: folders=%d", repo_name, len(folder_sizes)
+            )
 
             base_to_codes = {}
             for folder in folder_sizes.keys():
@@ -336,12 +367,18 @@ def main():
 
                 logging.info(
                     "map special: repo=%s -> folder=%s -> base=%s code=%s bytes=%d action=ADD",
-                    repo_name, folder, base_name, code, int(size_bytes or 0)
+                    repo_name,
+                    folder,
+                    base_name,
+                    code,
+                    int(size_bytes or 0),
                 )
 
                 if SKIP_EMPTY_SERVICE and (not base_name):
                     skipped_no_service += 1
-                    logging.info("map special: folder=%s action=SKIP reason=no_service", folder)
+                    logging.info(
+                        "map special: folder=%s action=SKIP reason=no_service", folder
+                    )
                     add_unaccounted(
                         scope="folder",
                         repo=repo_name,
@@ -357,7 +394,11 @@ def main():
 
                 if code in BAN_SET:
                     skipped_ban_service_code += 1
-                    logging.info("map special: folder=%s action=SKIP reason=ban_service_code code=%s", folder, code)
+                    logging.info(
+                        "map special: folder=%s action=SKIP reason=ban_service_code code=%s",
+                        folder,
+                        code,
+                    )
                     add_unaccounted(
                         scope="folder",
                         repo=repo_name,
@@ -386,7 +427,11 @@ def main():
                     alias_code = codes[0]
                     logging.info(
                         "map special: repo=%s -> folder=%s -> base=%s code=%s bytes=%d action=ALIAS_ADD",
-                        repo_name, folder, base_name, alias_code, int(size_bytes or 0)
+                        repo_name,
+                        folder,
+                        base_name,
+                        alias_code,
+                        int(size_bytes or 0),
                     )
                     _add_to_totals(totals, alias_code, base_name, size_bytes)
                     continue
@@ -395,7 +440,11 @@ def main():
                     skipped_no_code += 1
                     logging.info(
                         "map special: repo=%s -> folder=%s -> base=%s bytes=%d action=SKIP reason=ambiguous_alias codes=%s",
-                        repo_name, folder, base_name, int(size_bytes or 0), ",".join(sorted(codes))
+                        repo_name,
+                        folder,
+                        base_name,
+                        int(size_bytes or 0),
+                        ",".join(sorted(codes)),
                     )
                     add_unaccounted(
                         scope="folder",
@@ -413,7 +462,10 @@ def main():
                 skipped_no_code += 1
                 logging.info(
                     "map special: repo=%s -> folder=%s -> base=%s bytes=%d action=SKIP reason=no_code",
-                    repo_name, folder, base_name, int(size_bytes or 0)
+                    repo_name,
+                    folder,
+                    base_name,
+                    int(size_bytes or 0),
                 )
                 add_unaccounted(
                     scope="folder",
@@ -438,7 +490,11 @@ def main():
             skipped_no_service += 1
             logging.info(
                 "map repo=%s -> raw_service=%s -> base=%s code=%s bytes=%d action=SKIP reason=no_service",
-                repo_name, raw_service, base_name, code, size_bytes
+                repo_name,
+                raw_service,
+                base_name,
+                code,
+                size_bytes,
             )
             add_unaccounted(
                 scope="repo",
@@ -457,7 +513,11 @@ def main():
             skipped_no_code += 1
             logging.info(
                 "map repo=%s -> raw_service=%s -> base=%s code=%s bytes=%d action=SKIP reason=no_code",
-                repo_name, raw_service, base_name, code, size_bytes
+                repo_name,
+                raw_service,
+                base_name,
+                code,
+                size_bytes,
             )
             add_unaccounted(
                 scope="repo",
@@ -476,7 +536,11 @@ def main():
             skipped_ban_service_code += 1
             logging.info(
                 "map repo=%s -> raw_service=%s -> base=%s code=%s bytes=%d action=SKIP reason=ban_service_code",
-                repo_name, raw_service, base_name, code, size_bytes
+                repo_name,
+                raw_service,
+                base_name,
+                code,
+                size_bytes,
             )
             add_unaccounted(
                 scope="repo",
@@ -493,7 +557,11 @@ def main():
 
         logging.info(
             "map repo=%s -> raw_service=%s -> base=%s code=%s bytes=%d action=ADD",
-            repo_name, raw_service, base_name, code, size_bytes
+            repo_name,
+            raw_service,
+            base_name,
+            code,
+            size_bytes,
         )
         _add_to_totals(totals, code, base_name, size_bytes)
 
