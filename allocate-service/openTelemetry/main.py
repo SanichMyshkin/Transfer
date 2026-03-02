@@ -39,7 +39,6 @@ GROUP BY table
 ORDER BY bytes_on_disk DESC
 """
 
-
 TABLE_PREFIX_OVERRIDES = {
     # "otel_traces": ("SOMESVC", 12345),
 }
@@ -100,6 +99,7 @@ def main() -> int:
 
     agg = {}
     unmatched = 0
+    unaccounted_rows = []
 
     for table, bytes_on_disk in table_rows:
         b = int(bytes_on_disk or 0)
@@ -108,6 +108,15 @@ def main() -> int:
         if src == "unmatched" or service_id is None:
             unmatched += 1
             LOG.warning("Unmatched table (not accounted): %s (bytes=%d)", table, b)
+            unaccounted_rows.append(
+                {
+                    "table": table,
+                    "bytes_on_disk": b,
+                    "size_h": humanize.naturalsize(b, binary=True),
+                    "reason": "unmatched",
+                    "detail": "table name does not match NAME_RE and no TABLE_PREFIX_OVERRIDES hit",
+                }
+            )
             continue
 
         if service_id not in agg:
@@ -121,6 +130,7 @@ def main() -> int:
     total_accounted = sum(v["bytes"] for v in agg.values())
 
     wb = Workbook()
+
     ws = wb.active
     ws.title = "ByService"
 
@@ -153,14 +163,36 @@ def main() -> int:
             round(pct, 6),
         ])
 
+    ws2 = wb.create_sheet("UnaccountedTables")
+    headers2 = [
+        "table",
+        "bytes_on_disk",
+        "size_on_disk_h",
+        "reason",
+        "detail",
+    ]
+    ws2.append(headers2)
+    for i in range(1, len(headers2) + 1):
+        ws2.cell(row=1, column=i).font = bold
+
+    for r in unaccounted_rows:
+        ws2.append([
+            r.get("table", ""),
+            int(r.get("bytes_on_disk") or 0),
+            r.get("size_h", ""),
+            r.get("reason", ""),
+            r.get("detail", ""),
+        ])
+
     wb.save(OUTPUT_FILE)
 
     LOG.info(
-        "Report saved: %s | services=%d | tables_total=%d | unmatched_tables=%d | total_accounted=%s",
+        "Report saved: %s | services=%d | tables_total=%d | unmatched_tables=%d | unaccounted_rows=%d | total_accounted=%s",
         OUTPUT_FILE,
         len(agg),
         len(table_rows),
         unmatched,
+        len(unaccounted_rows),
         humanize.naturalsize(total_accounted, binary=True),
     )
     return 0
