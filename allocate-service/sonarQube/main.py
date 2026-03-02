@@ -2,6 +2,7 @@ import os
 import logging
 import requests
 import urllib3
+import re
 
 from dotenv import load_dotenv
 from openpyxl import Workbook, load_workbook
@@ -9,7 +10,9 @@ from openpyxl.styles import Font
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
+)
 logger = logging.getLogger(__name__)
 
 load_dotenv()
@@ -68,11 +71,19 @@ def normalize_code(v):
     return s[:-2] if s.endswith(".0") and s[:-2].isdigit() else s
 
 
-def split_service_name_code(prefix):
-    parts = [p for p in prefix.split("-") if p]
-    if len(parts) >= 2 and parts[-1].isdigit():
-        return "-".join(parts[:-1]), parts[-1]
-    return prefix, ""
+CODE_ANYWHERE_RE = re.compile(r"(?:^|[^0-9])(\d{2,})(?:[^0-9]|$)")
+
+
+def split_service_name_code(prefix: str):
+    p = (prefix or "").strip()
+    if not p:
+        return "", ""
+    m = CODE_ANYWHERE_RE.search(p)
+    if not m:
+        return p, ""
+
+    code = m.group(1)
+    return p, code
 
 
 def make_session(token):
@@ -103,8 +114,15 @@ def get_tasks(s, url, key):
     res, p = [], 1
     while True:
         d = sonar_get(
-            s, url, "/api/ce/activity",
-            {"component": key, "status": "IN_PROGRESS,SUCCESS,FAILED,CANCELED", "p": p, "ps": 100}
+            s,
+            url,
+            "/api/ce/activity",
+            {
+                "component": key,
+                "status": "IN_PROGRESS,SUCCESS,FAILED,CANCELED",
+                "p": p,
+                "ps": 100,
+            },
         )
         res += d.get("tasks", [])
         if p * 100 >= d["paging"]["total"]:
@@ -182,7 +200,9 @@ def calc_project_tasks_lines(s, url, key, tasks, ncloc_cache, new_cache):
             b = br or "__main__"
             ck = (key, b)
             if ck not in ncloc_cache:
-                ncloc_cache[ck] = measure(s, url, key, "ncloc", branch=None if b == "__main__" else b)
+                ncloc_cache[ck] = measure(
+                    s, url, key, "ncloc", branch=None if b == "__main__" else b
+                )
             lines += ncloc_cache[ck]
     return tcnt, lines
 
@@ -199,20 +219,33 @@ def process_sonar(url, token, sd, bk, acc, unaccounted):
 
     ncloc_cache, new_cache = {}, {}
 
-    def add_unacc(reason, detail, project_key, prefix, svc_guess, code, owner, bt, tasks_total, total_lines):
-        unaccounted.append({
-            "instance": label,
-            "project_key": project_key or "",
-            "prefix": prefix or "",
-            "svc_guess": svc_guess or "",
-            "code": code or "",
-            "owner": owner or "",
-            "business_type": bt or "",
-            "tasks_total": int(tasks_total or 0),
-            "total_lines": int(total_lines or 0),
-            "reason": reason,
-            "detail": detail,
-        })
+    def add_unacc(
+        reason,
+        detail,
+        project_key,
+        prefix,
+        svc_guess,
+        code,
+        owner,
+        bt,
+        tasks_total,
+        total_lines,
+    ):
+        unaccounted.append(
+            {
+                "instance": label,
+                "project_key": project_key or "",
+                "prefix": prefix or "",
+                "svc_guess": svc_guess or "",
+                "code": code or "",
+                "owner": owner or "",
+                "business_type": bt or "",
+                "tasks_total": int(tasks_total or 0),
+                "total_lines": int(total_lines or 0),
+                "reason": reason,
+                "detail": detail,
+            }
+        )
 
     for p in projects:
         key = p.get("key")
@@ -222,14 +255,13 @@ def process_sonar(url, token, sd, bk, acc, unaccounted):
         prefix = key.split(":", 1)[0]
         svc_guess, code = split_service_name_code(prefix)
 
-        # По дефолту tasks/lines неизвестны (не тратим API), но для некоторых причин считаем (чтобы “неучтенные тоже посчитать”)
         tasks_total = 0
         total_lines = 0
 
         if not code:
             add_unacc(
                 reason="no_code_in_key",
-                detail=f"cannot parse code from prefix={prefix!r} (expected ...-<digits>)",
+                detail=f"cannot parse code from prefix={prefix!r} (expected digits somewhere in prefix)",
                 project_key=key,
                 prefix=prefix,
                 svc_guess=svc_guess,
@@ -276,9 +308,10 @@ def process_sonar(url, token, sd, bk, acc, unaccounted):
         owner = sd_row.get("owner") or ""
         bt = pick_bt(bk, owner)
 
-        # Здесь уже считаем usage (tasks/lines) один раз — и для accounted, и для unaccounted
         tasks = get_tasks(s, url, key)
-        tasks_total, total_lines = calc_project_tasks_lines(s, url, key, tasks, ncloc_cache, new_cache)
+        tasks_total, total_lines = calc_project_tasks_lines(
+            s, url, key, tasks, ncloc_cache, new_cache
+        )
 
         if SKIP_EMPTY_SERVICES and not tasks_total and not total_lines:
             add_unacc(
@@ -296,7 +329,11 @@ def process_sonar(url, token, sd, bk, acc, unaccounted):
             continue
 
         if SKIP_EMPTY_BUSINESS_TYPE and not bt:
-            det = "owner empty in SD" if not owner else "owner not found in BK or BK business_type empty"
+            det = (
+                "owner empty in SD"
+                if not owner
+                else "owner not found in BK or BK business_type empty"
+            )
             add_unacc(
                 reason="empty_business_type",
                 detail=f"SKIP_EMPTY_BUSINESS_TYPE=True and business_type empty ({det})",
@@ -328,17 +365,26 @@ def process_sonar(url, token, sd, bk, acc, unaccounted):
 
         logger.info(
             '[%s] %s (%s) owner="%s" type="%s" tasks=%d lines=%d',
-            label, svc, code, owner, bt, tasks_total, total_lines
+            label,
+            svc,
+            code,
+            owner,
+            bt,
+            tasks_total,
+            total_lines,
         )
 
-        acc.setdefault(code, {
-            "business_type": bt,
-            "service": svc,
-            "code": code,
-            "owner": owner,
-            "tasks_total": 0,
-            "total_lines": 0,
-        })
+        acc.setdefault(
+            code,
+            {
+                "business_type": bt,
+                "service": svc,
+                "code": code,
+                "owner": owner,
+                "tasks_total": 0,
+                "total_lines": 0,
+            },
+        )
 
         acc[code]["tasks_total"] += tasks_total
         acc[code]["total_lines"] += total_lines
@@ -364,24 +410,27 @@ def write_xlsx(rows, unaccounted_rows):
         c.font = Font(bold=True)
 
     total_accounted_lines = sum(r["total_lines"] for r in rows) or 0
-    total_unaccounted_lines = sum(r.get("total_lines", 0) for r in unaccounted_rows) or 0
+    total_unaccounted_lines = (
+        sum(r.get("total_lines", 0) for r in unaccounted_rows) or 0
+    )
     total_all_lines = total_accounted_lines + total_unaccounted_lines
     if total_all_lines <= 0:
         total_all_lines = 1
 
     for r in rows:
         pct = (r["total_lines"] / total_all_lines) if total_all_lines else 0.0
-        ws.append([
-            r["business_type"],
-            r["service"],
-            r["code"],
-            r["owner"],
-            int(r["tasks_total"]),
-            int(r["total_lines"]),
-            pct,  # доля, форматируем как %
-        ])
+        ws.append(
+            [
+                r["business_type"],
+                r["service"],
+                r["code"],
+                r["owner"],
+                int(r["tasks_total"]),
+                int(r["total_lines"]),
+                pct,
+            ]
+        )
 
-    # percent format (0.3% etc)
     pct_col = headers.index("% потребления") + 1
     for rr in range(2, ws.max_row + 1):
         ws.cell(row=rr, column=pct_col).number_format = "0.0%"
@@ -410,20 +459,22 @@ def write_xlsx(rows, unaccounted_rows):
     for r in unaccounted_rows:
         lines = int(r.get("total_lines", 0) or 0)
         pct_all = (lines / total_all_lines) if total_all_lines else 0.0
-        ws2.append([
-            r.get("instance", ""),
-            r.get("project_key", ""),
-            r.get("prefix", ""),
-            r.get("svc_guess", ""),
-            r.get("code", ""),
-            r.get("owner", ""),
-            r.get("business_type", ""),
-            int(r.get("tasks_total", 0) or 0),
-            lines,
-            pct_all,  # доля
-            r.get("reason", ""),
-            r.get("detail", ""),
-        ])
+        ws2.append(
+            [
+                r.get("instance", ""),
+                r.get("project_key", ""),
+                r.get("prefix", ""),
+                r.get("svc_guess", ""),
+                r.get("code", ""),
+                r.get("owner", ""),
+                r.get("business_type", ""),
+                int(r.get("tasks_total", 0) or 0),
+                lines,
+                pct_all,
+                r.get("reason", ""),
+                r.get("detail", ""),
+            ]
+        )
 
     for rr in range(2, ws2.max_row + 1):
         ws2.cell(row=rr, column=pct2_col).number_format = "0.0%"
@@ -432,7 +483,9 @@ def write_xlsx(rows, unaccounted_rows):
     logger.info("Файл сохранён: %s", OUT_FILE)
     logger.info(
         "Totals: accounted_lines=%d unaccounted_lines=%d total_lines_all=%d",
-        total_accounted_lines, total_unaccounted_lines, total_all_lines
+        total_accounted_lines,
+        total_unaccounted_lines,
+        total_all_lines,
     )
 
 
@@ -450,7 +503,9 @@ def main():
     process_sonar(SONAR2_URL, SONAR2_TOKEN, sd, bk, services, unaccounted)
 
     rows = sorted(services.values(), key=lambda x: x["total_lines"], reverse=True)
-    unaccounted_sorted = sorted(unaccounted, key=lambda x: int(x.get("total_lines", 0) or 0), reverse=True)
+    unaccounted_sorted = sorted(
+        unaccounted, key=lambda x: int(x.get("total_lines", 0) or 0), reverse=True
+    )
 
     write_xlsx(rows, unaccounted_sorted)
 
