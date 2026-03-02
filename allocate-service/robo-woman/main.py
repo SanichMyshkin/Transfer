@@ -28,8 +28,7 @@ EVENT_DAYS = 30
 BAN_SERVICE_IDS = [15473]
 SKIP_EMPTY_SERVICE_ID = True
 
-BAN_BUSINESS_TYPES = [
-]
+BAN_BUSINESS_TYPES = []
 SKIP_EMPTY_BUSINESS_TYPE = True
 
 ZBX_CHUNK = 200
@@ -214,7 +213,7 @@ def build_map(df, keys):
 
 
 def main():
-    logger.info("Старт отчета: tagged triggers (multi-tags) + events + mapping")
+    logger.info("Старт отчета: tagged triggers + events + mapping")
 
     if not ZABBIX_URL:
         die("ENV ZABBIX_URL пустой")
@@ -256,10 +255,7 @@ def main():
 
     api.logout()
 
-    def host_trg_count(hid: str) -> int:
-        return len(host_trigger_ids.get(hid, set()))
-
-    df_hosts["triggers"] = df_hosts["hostid"].map(lambda x: host_trg_count(str(x)))
+    df_hosts["triggers"] = df_hosts["hostid"].map(lambda x: len(host_trigger_ids.get(str(x), set())))
     df_hosts["events"] = df_hosts["hostid"].map(lambda x: int(host_events.get(str(x), 0)))
 
     df_db = load_db(DB_FILE)
@@ -272,39 +268,12 @@ def main():
 
     per_service_events = defaultdict(int)
     per_service_triggers = defaultdict(int)
-
-    not_mapped = []
     unaccounted = []
 
     df_tagged_hosts = df_hosts[df_hosts["triggers"] > 0].copy()
 
-    def make_trig_ids_cell(trig_ids: list[str]) -> str:
-        s = ",".join(trig_ids[:MAX_TRIGGERIDS_IN_CELL])
-        if len(trig_ids) > MAX_TRIGGERIDS_IN_CELL:
-            s += f",...(+{len(trig_ids) - MAX_TRIGGERIDS_IN_CELL})"
-        return s
-
-    def add_unaccounted(reason: str, detail: str, base_row: dict, tags: list[str], trig_ids_cell: str,
-                        service: str = "", service_id: str = "", owner: str = "", business_type: str = ""):
-        unaccounted.append({
-            "reason": reason,
-            "detail": detail,
-            "Хост": base_row.get("host", ""),
-            "DNS": base_row.get("dns", ""),
-            "IP": base_row.get("ip", ""),
-            "Теги": ",".join(tags),
-            "Кол-во триггеров": int(base_row.get("triggers", 0)),
-            "TriggerIDs": trig_ids_cell,
-            "События": int(base_row.get("events", 0)),
-            "service": service,
-            "service_id": service_id,
-            "owner": owner,
-            "business_type": business_type,
-        })
-
     for r in df_tagged_hosts.to_dict("records"):
         hid = str(r["hostid"])
-        host = r["host"]
         ip = r["ip"]
         dns = r["dns"]
         trg = int(r["triggers"])
@@ -312,7 +281,7 @@ def main():
 
         tags = sorted(list(host_tags_found.get(hid, set())))
         trig_ids = sorted(list(host_trigger_ids.get(hid, set())))
-        trig_ids_cell = make_trig_ids_cell(trig_ids)
+        trig_ids_cell = ",".join(trig_ids[:MAX_TRIGGERIDS_IN_CELL])
 
         svc_key = None
         if ip and dns and (ip, dns) in map_both:
@@ -323,81 +292,64 @@ def main():
             svc_key = map_dns[(dns,)]
 
         if not svc_key:
-            not_mapped.append({
-                "Хост": host,
+            unaccounted.append({
+                "reason": "no_mapping",
+                "Хост": r["host"],
                 "DNS": dns,
                 "IP": ip,
-                "Теги": ",".join(tags),
                 "Кол-во триггеров": trg,
-                "TriggerIDs": trig_ids_cell,
                 "События": evc,
             })
-            add_unaccounted(
-                reason="no_mapping",
-                detail="no match by (ip,dns) or ip-only or dns-only in DB map",
-                base_row=r,
-                tags=tags,
-                trig_ids_cell=trig_ids_cell,
-            )
             continue
 
         service, service_id = svc_key
         service_id = str(service_id).strip()
 
         if SKIP_EMPTY_SERVICE_ID and not service_id:
-            add_unaccounted(
-                reason="empty_service_id",
-                detail="SKIP_EMPTY_SERVICE_ID=True and service_id is empty after mapping",
-                base_row=r,
-                tags=tags,
-                trig_ids_cell=trig_ids_cell,
-                service=service,
-                service_id=service_id,
-            )
+            unaccounted.append({
+                "reason": "empty_service_id",
+                "Хост": r["host"],
+                "DNS": dns,
+                "IP": ip,
+                "Кол-во триггеров": trg,
+                "События": evc,
+            })
             continue
 
         if service_id in ban_set:
-            add_unaccounted(
-                reason="banned_service_id",
-                detail="service_id in BAN_SERVICE_IDS",
-                base_row=r,
-                tags=tags,
-                trig_ids_cell=trig_ids_cell,
-                service=service,
-                service_id=service_id,
-            )
+            unaccounted.append({
+                "reason": "banned_service_id",
+                "Хост": r["host"],
+                "DNS": dns,
+                "IP": ip,
+                "Кол-во триггеров": trg,
+                "События": evc,
+            })
             continue
 
         owner = sd_map.get(service_id, "")
-        business_type = bk_map.get(normalize_name_key(owner), "") if owner else ""
-        business_type = clean_spaces(business_type)
+        business_type = clean_spaces(bk_map.get(normalize_name_key(owner), ""))
 
         if SKIP_EMPTY_BUSINESS_TYPE and not business_type:
-            add_unaccounted(
-                reason="empty_business_type",
-                detail="SKIP_EMPTY_BUSINESS_TYPE=True and business_type is empty (owner missing in SD or BK)",
-                base_row=r,
-                tags=tags,
-                trig_ids_cell=trig_ids_cell,
-                service=service,
-                service_id=service_id,
-                owner=owner,
-                business_type=business_type,
-            )
+            unaccounted.append({
+                "reason": "empty_business_type",
+                "Хост": r["host"],
+                "DNS": dns,
+                "IP": ip,
+                "Кол-во триггеров": trg,
+                "События": evc,
+            })
             continue
 
         if ban_business_set and business_type in ban_business_set:
-            add_unaccounted(
-                reason="banned_business_type",
-                detail="business_type in BAN_BUSINESS_TYPES",
-                base_row=r,
-                tags=tags,
-                trig_ids_cell=trig_ids_cell,
-                service=service,
-                service_id=service_id,
-                owner=owner,
-                business_type=business_type,
-            )
+            unaccounted.append({
+                "reason": "banned_business_type",
+                "Хост": r["host"],
+                "DNS": dns,
+                "IP": ip,
+                "Кол-во триггеров": trg,
+                "События": evc,
+            })
             continue
 
         per_service_events[(business_type, service, service_id, owner)] += evc
@@ -423,38 +375,19 @@ def main():
             2
         )
 
-    df_report = pd.DataFrame(rows)
-    if not df_report.empty:
-        df_report = df_report.sort_values(
-            ["События", "Кол-во триггеров", "Наименование сервиса", "КОД"],
-            ascending=[False, False, True, True],
-        )
-
-    df_not_mapped = pd.DataFrame(not_mapped)
-    if not df_not_mapped.empty:
-        df_not_mapped = df_not_mapped.sort_values(
-            ["События", "Кол-во триггеров", "Хост"],
-            ascending=[False, False, True],
-        )
+    df_report = pd.DataFrame(rows).sort_values(
+        ["События", "Кол-во триггеров"],
+        ascending=[False, False],
+    )
 
     df_unaccounted = pd.DataFrame(unaccounted)
-    if not df_unaccounted.empty:
-        df_unaccounted = df_unaccounted.sort_values(
-            ["События", "Кол-во триггеров", "reason", "Хост"],
-            ascending=[False, False, True, True],
-        )
 
-    logger.info(f"Период: последние {EVENT_DAYS} дней")
-    logger.info(f"Теги (OR): {TRIGGER_TAGS}")
-    logger.info(f"Хостов с tagged-триггерами: {len(df_tagged_hosts)}")
     logger.info(f"Итого событий (в отчете): {total_events}")
     logger.info(f"Сервисов в отчете: {len(df_report)}")
-    logger.info(f"Хостов с tagged-триггерами, но без маппинга: {len(df_not_mapped)}")
-    logger.info(f"Unaccounted rows (all reasons): {len(df_unaccounted)}")
+    logger.info(f"Unaccounted rows: {len(df_unaccounted)}")
 
     with pd.ExcelWriter(OUTPUT_XLSX, engine="openpyxl") as writer:
         df_report.to_excel(writer, index=False, sheet_name="Отчет Zabbix")
-        df_not_mapped.to_excel(writer, index=False, sheet_name="Не сматчились")
         df_unaccounted.to_excel(writer, index=False, sheet_name="Unaccounted")
 
 
