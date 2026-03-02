@@ -1,5 +1,3 @@
-# gitlab_sizes_by_service_topic_2sheets.py
-
 import os
 import re
 import time
@@ -25,7 +23,7 @@ OUT_XLSX = os.getenv("OUT_XLSX", "gitlab_report.xlsx")
 SSL_VERIFY = False
 SLEEP_SEC = 0.02
 LOG_EVERY = 100
-LIMIT = 50  # 0 = без лимита
+LIMIT = 0  # 0 = без лимита
 
 BAN_SERVICE_IDS = {
     # "15473",

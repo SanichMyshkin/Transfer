@@ -2,7 +2,7 @@ import os
 import re
 import logging
 from collections import defaultdict
-from typing import Any, Optional, Tuple
+from typing import Any, Optional, Tuple, List, Dict, Set
 from urllib.parse import urlparse
 
 import humanize
@@ -125,7 +125,7 @@ def read_bk_map(path: str) -> dict[str, str]:
     return out
 
 
-def fetch_and_aggregate(client: OpenSearch) -> list[dict[str, Any]]:
+def fetch_and_aggregate(client: OpenSearch) -> Tuple[List[dict[str, Any]], List[dict[str, Any]]]:
     raw = client.cat.indices(format="json", bytes="b")
 
     acc = defaultdict(int)
@@ -133,41 +133,75 @@ def fetch_and_aggregate(client: OpenSearch) -> list[dict[str, Any]]:
     skipped_cnt = 0
     banned_cnt = 0
 
+    per_index: List[dict[str, Any]] = []
+
     for idx in raw:
         index_name = idx.get("index") or ""
+        size_b = int(idx.get("store.size", 0))
+
         parsed = normalize_index_name(index_name)
         if not parsed:
             skipped_cnt += 1
+            per_index.append(
+                {
+                    "index": index_name,
+                    "size_bytes": size_b,
+                    "size_human": humanize_bytes(size_b),
+                    "team": "",
+                    "service_id": "",
+                    "rule": "",
+                    "status": "unparsable",
+                    "status_detail": "normalize_index_name returned None",
+                }
+            )
             continue
 
         team, service_id, rule = parsed
 
         if service_id in BAN_SERVICE_IDS:
             banned_cnt += 1
+            per_index.append(
+                {
+                    "index": index_name,
+                    "size_bytes": size_b,
+                    "size_human": humanize_bytes(size_b),
+                    "team": team,
+                    "service_id": service_id,
+                    "rule": rule,
+                    "status": "banned_service_id",
+                    "status_detail": "service_id in BAN_SERVICE_IDS",
+                }
+            )
             continue
 
-        size_b = int(idx.get("store.size", 0))
         acc[service_id] += size_b
         parsed_cnt += 1
+
+        per_index.append(
+            {
+                "index": index_name,
+                "size_bytes": size_b,
+                "size_human": humanize_bytes(size_b),
+                "team": team,
+                "service_id": service_id,
+                "rule": rule,
+                "status": "candidate",
+                "status_detail": "",
+            }
+        )
 
         log.info(
             f"INDEX_MAP | rule={rule} | index={index_name} "
             f"-> team={team} service_id={service_id} size={size_b}B"
         )
 
-    rows = [
-        {
-            "service_id": service_id,
-            "total_bytes": total,
-        }
-        for service_id, total in acc.items()
-    ]
+    rows = [{"service_id": service_id, "total_bytes": total} for service_id, total in acc.items()]
 
     log.info(
         f"OpenSearch parsed={parsed_cnt} skipped={skipped_cnt} "
         f"banned={banned_cnt} aggregated_services={len(rows)}"
     )
-    return rows
+    return rows, per_index
 
 
 def enrich(
@@ -186,17 +220,21 @@ def enrich(
     return rows
 
 
-def apply_unknown_service_filter(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def apply_unknown_service_filter(
+    rows: list[dict[str, Any]],
+) -> Tuple[list[dict[str, Any]], Set[int]]:
     if not SKIP_UNKNOWN_SERVICE_IDS:
-        return rows
+        return rows, set()
 
     kept: list[dict[str, Any]] = []
+    skipped_service_ids: Set[int] = set()
     skipped = 0
 
     for r in rows:
         service_id = int(r.get("service_id") or 0)
         if service_id == 0 or not clean_spaces(r.get("service_name", "")):
             skipped += 1
+            skipped_service_ids.add(service_id)
             log.info(
                 f"SKIP_UNKNOWN | service_id={service_id} "
                 f"size={int(r.get('total_bytes') or 0)}B"
@@ -205,20 +243,24 @@ def apply_unknown_service_filter(rows: list[dict[str, Any]]) -> list[dict[str, A
         kept.append(r)
 
     log.info(f"Unknown services skipped: {skipped} (kept {len(kept)})")
-    return kept
+    return kept, skipped_service_ids
 
 
-def apply_business_type_ban(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def apply_business_type_ban(
+    rows: list[dict[str, Any]],
+) -> Tuple[list[dict[str, Any]], Set[int]]:
     if not BAN_BUSINESS_TYPES:
-        return rows
+        return rows, set()
 
     kept: list[dict[str, Any]] = []
+    banned_service_ids: Set[int] = set()
     banned = 0
 
     for r in rows:
         bt = clean_spaces(r.get("business_type", ""))
         if bt in BAN_BUSINESS_TYPES:
             banned += 1
+            banned_service_ids.add(int(r.get("service_id") or 0))
             log.info(
                 f"BAN_BT | business_type={bt!r} | "
                 f"service_id={r.get('service_id')} "
@@ -228,7 +270,7 @@ def apply_business_type_ban(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         kept.append(r)
 
     log.info(f"BusinessType banned rows: {banned} (kept {len(kept)})")
-    return kept
+    return kept, banned_service_ids
 
 
 def finalize(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -243,8 +285,58 @@ def finalize(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return rows
 
 
-def write_to_excel(path: str, rows: list[dict[str, Any]]):
+def build_unaccounted_indices(
+    per_index: List[dict[str, Any]],
+    kept_service_ids: Set[int],
+    unknown_service_ids: Set[int],
+    banned_bt_service_ids: Set[int],
+) -> List[dict[str, Any]]:
+    out: List[dict[str, Any]] = []
+
+    for r in per_index:
+        status = r.get("status")
+
+        if status in ("unparsable", "banned_service_id"):
+            out.append(r)
+            continue
+
+        if status != "candidate":
+            out.append(r)
+            continue
+
+        sid = r.get("service_id")
+        try:
+            sid_int = int(sid)
+        except Exception:
+            sid_int = 0
+
+        if sid_int in unknown_service_ids:
+            r2 = dict(r)
+            r2["status"] = "skipped_unknown_service"
+            r2["status_detail"] = "filtered by SKIP_UNKNOWN_SERVICE_IDS"
+            out.append(r2)
+            continue
+
+        if sid_int in banned_bt_service_ids:
+            r2 = dict(r)
+            r2["status"] = "banned_business_type"
+            r2["status_detail"] = "filtered by BAN_BUSINESS_TYPES"
+            out.append(r2)
+            continue
+
+        if sid_int not in kept_service_ids:
+            r2 = dict(r)
+            r2["status"] = "not_in_final"
+            r2["status_detail"] = "service_id not present in final report set"
+            out.append(r2)
+            continue
+
+    return out
+
+
+def write_to_excel(path: str, rows: list[dict[str, Any]], unaccounted: list[dict[str, Any]]):
     wb = Workbook()
+
     ws = wb.active
     ws.title = "CPL report"
 
@@ -277,8 +369,37 @@ def write_to_excel(path: str, rows: list[dict[str, Any]]):
     for i in range(2, len(rows) + 2):
         ws.cell(row=i, column=6).number_format = "0.0000%"
 
+    ws2 = wb.create_sheet("Unaccounted indices")
+    header2 = [
+        "index",
+        "reason",
+        "detail",
+        "team",
+        "service_id",
+        "rule",
+        "size_human",
+        "size_bytes",
+    ]
+    ws2.append(header2)
+    for i in range(1, len(header2) + 1):
+        ws2.cell(row=1, column=i).font = bold
+
+    for r in unaccounted:
+        ws2.append(
+            [
+                r.get("index", ""),
+                r.get("status", ""),
+                r.get("status_detail", ""),
+                r.get("team", ""),
+                r.get("service_id", ""),
+                r.get("rule", ""),
+                r.get("size_human", ""),
+                int(r.get("size_bytes") or 0),
+            ]
+        )
+
     wb.save(path)
-    log.info(f"Report written: {path}")
+    log.info(f"Report written: {path} (rows={len(rows)} unaccounted_indices={len(unaccounted)})")
 
 
 def main():
@@ -292,16 +413,26 @@ def main():
         ssl_show_warn=False,
     )
 
-    rows = fetch_and_aggregate(client)
+    rows, per_index = fetch_and_aggregate(client)
     sd = read_sd_map(SD_FILE)
     bk = read_bk_map(BK_FILE)
 
     rows = enrich(rows, sd, bk)
-    rows = apply_unknown_service_filter(rows)
-    rows = apply_business_type_ban(rows)
+
+    rows, unknown_service_ids = apply_unknown_service_filter(rows)
+    rows, banned_bt_service_ids = apply_business_type_ban(rows)
+
     rows = finalize(rows)
 
-    write_to_excel("CPL_report.xlsx", rows)
+    kept_service_ids = {int(r.get("service_id") or 0) for r in rows}
+    unaccounted = build_unaccounted_indices(
+        per_index=per_index,
+        kept_service_ids=kept_service_ids,
+        unknown_service_ids=unknown_service_ids,
+        banned_bt_service_ids=banned_bt_service_ids,
+    )
+
+    write_to_excel("CPL_report.xlsx", rows, unaccounted)
 
 
 if __name__ == "__main__":
