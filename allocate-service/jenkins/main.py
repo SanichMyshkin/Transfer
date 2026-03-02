@@ -34,7 +34,7 @@ BK_FILE = os.getenv("BK_FILE", "bk_all_users.xlsx")
 OUTPUT_XLSX = os.getenv("OUTPUT_XLSX", "jenkins_report.xlsx")
 
 BAN_SERVICE_IDS = [15473]
-BAN_BUSINESS_TYPES = ["Блок банковских технологий"]
+BAN_BUSINESS_TYPES = []
 SKIP_EMPTY_BUSINESS_TYPE = True
 
 SCRIPT_BUILDS = r"""
@@ -71,13 +71,31 @@ def die(msg: str, code: int = 2):
     raise SystemExit(code)
 
 
+def clean_spaces(s: str) -> str:
+    s = (s or "").strip()
+    s = s.replace(",", " ")
+    s = " ".join(s.split())
+    return s
+
+
+def normalize_name_key(s: str) -> str:
+    return clean_spaces(s).lower()
+
+
 def build_ban_set(ban_list):
     if not isinstance(ban_list, (list, tuple, set)):
         die("BAN_SERVICE_IDS должен быть list / tuple / set")
     return {str(x).strip() for x in ban_list if str(x).strip()}
 
 
+def build_ban_business_types_set(ban_list):
+    if not isinstance(ban_list, (list, tuple, set)):
+        die("BAN_BUSINESS_TYPES должен быть list / tuple / set")
+    return {clean_spaces(x) for x in ban_list if clean_spaces(x)}
+
+
 ban_set = build_ban_set(BAN_SERVICE_IDS)
+ban_business_types_set = build_ban_business_types_set(BAN_BUSINESS_TYPES)
 
 
 def validate_env_and_files():
@@ -100,18 +118,10 @@ def validate_env_and_files():
         os.makedirs(out_dir, exist_ok=True)
 
     logger.info(f"Бан-лист (КОД): {sorted(ban_set) if ban_set else 'пусто'}")
+    logger.info(f"BAN_BUSINESS_TYPES: {sorted(ban_business_types_set) if ban_business_types_set else 'пусто'}")
+    logger.info(f"EXCLUDE_PROJECTS_WITHOUT_TEAM_NUMBER={EXCLUDE_PROJECTS_WITHOUT_TEAM_NUMBER}")
+    logger.info(f"SKIP_EMPTY_BUSINESS_TYPE={SKIP_EMPTY_BUSINESS_TYPE}")
     logger.info("ENV/файлы ок.")
-
-
-def clean_spaces(s: str) -> str:
-    s = (s or "").strip()
-    s = s.replace(",", " ")
-    s = " ".join(s.split())
-    return s
-
-
-def normalize_name_key(s: str) -> str:
-    return clean_spaces(s).lower()
 
 
 def get_builds_inventory():
@@ -189,6 +199,22 @@ def aggregate_builds_by_service(
     logger.info("Агрегируем билды по сервису...")
 
     acc = defaultdict(int)
+    unaccounted = []
+
+    def add_unaccounted(root_project, team_number, full_name, builds, reason, detail, service_name="", owner="", business_type=""):
+        unaccounted.append(
+            {
+                "root_project": root_project,
+                "team_number": team_number,
+                "job_full_name": full_name,
+                "buildCount": builds,
+                "reason": reason,
+                "detail": detail,
+                "service_name": service_name,
+                "owner": owner,
+                "business_type": business_type,
+            }
+        )
 
     for j in data.get("jobs", []) or []:
         if j.get("isFolder"):
@@ -202,40 +228,103 @@ def aggregate_builds_by_service(
         if not root:
             continue
 
-        _, team_number = split_project_and_team(root)
-
-        if exclude_without_team and not team_number:
-            continue
-
+        proj, team_number = split_project_and_team(root)
         builds = int(j.get("buildCount") or 0)
 
-        if team_number in ban_set:
+        if exclude_without_team and not team_number:
+            add_unaccounted(
+                root_project=proj or root,
+                team_number="",
+                full_name=full_name,
+                builds=builds,
+                reason="no_team_number",
+                detail="root project name does not end with -<digits> (or exclude_without_team=True)",
+            )
+            continue
+
+        if team_number and team_number in ban_set:
+            add_unaccounted(
+                root_project=proj or root,
+                team_number=team_number,
+                full_name=full_name,
+                builds=builds,
+                reason="banned_service_id",
+                detail="team_number in BAN_SERVICE_IDS",
+            )
+            continue
+
+        if not team_number:
+            # сюда попадём, если exclude_without_team=False, но team_number не найден
+            add_unaccounted(
+                root_project=proj or root,
+                team_number="",
+                full_name=full_name,
+                builds=builds,
+                reason="no_team_number_included",
+                detail="team_number is empty but exclude_without_team=False; not attributable to service",
+            )
             continue
 
         acc[team_number] += builds
 
-    ban_business_types_set = {
-        clean_spaces(x) for x in BAN_BUSINESS_TYPES if clean_spaces(x)
-    }
-
     candidates = []
+    kept_service_ids = set()
+    filtered_empty_bt = 0
+    filtered_ban_bt = 0
+    filtered_sd_miss = 0
 
     for team_number, builds in acc.items():
-        people = sd_people_map.get(team_number, {"service_name": "", "owner": ""})
-        service_name = people.get("service_name", "")
-        owner = people.get("owner", "")
-
-        business_type = (
-            bk_type_map.get(normalize_name_key(owner), "") if owner else ""
-        )
+        people = sd_people_map.get(team_number)
+        service_name = (people or {}).get("service_name", "")
+        owner = (people or {}).get("owner", "")
+        business_type = bk_type_map.get(normalize_name_key(owner), "") if owner else ""
         business_type = clean_spaces(business_type)
 
+        if not people or (not clean_spaces(service_name) and not clean_spaces(owner)):
+            filtered_sd_miss += 1
+            add_unaccounted(
+                root_project="",
+                team_number=team_number,
+                full_name="",
+                builds=builds,
+                reason="sd_mapping_miss",
+                detail="no match in SD for this team_number",
+                service_name=service_name,
+                owner=owner,
+                business_type=business_type,
+            )
+
         if SKIP_EMPTY_BUSINESS_TYPE and not business_type:
+            filtered_empty_bt += 1
+            add_unaccounted(
+                root_project="",
+                team_number=team_number,
+                full_name="",
+                builds=builds,
+                reason="skip_empty_business_type",
+                detail="SKIP_EMPTY_BUSINESS_TYPE=True and business_type is empty",
+                service_name=service_name,
+                owner=owner,
+                business_type=business_type,
+            )
             continue
 
         if ban_business_types_set and business_type in ban_business_types_set:
+            filtered_ban_bt += 1
+            add_unaccounted(
+                root_project="",
+                team_number=team_number,
+                full_name="",
+                builds=builds,
+                reason="banned_business_type",
+                detail="business_type in BAN_BUSINESS_TYPES",
+                service_name=service_name,
+                owner=owner,
+                business_type=business_type,
+            )
             continue
 
+        kept_service_ids.add(team_number)
         candidates.append(
             {
                 "business_type": business_type,
@@ -256,7 +345,6 @@ def aggregate_builds_by_service(
             if eligible_total_builds > 0
             else 0.0
         )
-
         rows.append(
             [
                 x["business_type"],
@@ -268,13 +356,19 @@ def aggregate_builds_by_service(
             ]
         )
 
-    return rows
+    logger.info(
+        f"Фильтры: sd_miss={filtered_sd_miss}, empty_bt={filtered_empty_bt}, ban_bt={filtered_ban_bt}. "
+        f"Итого учтенных сервисов={len(candidates)}"
+    )
+
+    return rows, unaccounted
 
 
-def export_excel(rows, filename):
+def export_excel(rows, unaccounted_rows, filename):
     logger.info("Формируем Excel...")
 
     wb = Workbook()
+
     ws = wb.active
     ws.title = "Отчет Jenkins"
 
@@ -306,6 +400,48 @@ def export_excel(rows, filename):
             max(12, max_len + 2), 60
         )
 
+    ws2 = wb.create_sheet("Unaccounted")
+    headers2 = [
+        "root_project",
+        "team_number",
+        "job_full_name",
+        "buildCount",
+        "reason",
+        "detail",
+        "service_name",
+        "owner",
+        "business_type",
+    ]
+    ws2.append(headers2)
+    for cell in ws2[1]:
+        cell.font = bold
+
+    for r in unaccounted_rows:
+        ws2.append(
+            [
+                r.get("root_project", ""),
+                r.get("team_number", ""),
+                r.get("job_full_name", ""),
+                int(r.get("buildCount") or 0),
+                r.get("reason", ""),
+                r.get("detail", ""),
+                r.get("service_name", ""),
+                r.get("owner", ""),
+                r.get("business_type", ""),
+            ]
+        )
+
+    for col_idx in range(1, len(headers2) + 1):
+        max_len = 0
+        for row in ws2.iter_rows(min_col=col_idx, max_col=col_idx, values_only=True):
+            v = row[0]
+            if v is None:
+                continue
+            max_len = max(max_len, len(str(v)))
+        ws2.column_dimensions[get_column_letter(col_idx)].width = min(
+            max(12, max_len + 2), 80
+        )
+
     wb.save(filename)
     logger.info(f"Excel сохранён: {filename}")
 
@@ -319,16 +455,18 @@ def main():
 
         data = get_builds_inventory()
 
-        rows = aggregate_builds_by_service(
+        rows, unaccounted = aggregate_builds_by_service(
             data,
             sd_people_map=sd_people_map,
             bk_type_map=bk_type_map,
             exclude_without_team=EXCLUDE_PROJECTS_WITHOUT_TEAM_NUMBER,
         )
 
-        export_excel(rows, OUTPUT_XLSX)
+        export_excel(rows, unaccounted, OUTPUT_XLSX)
 
-        logger.info("Инвентаризация билдов завершена успешно.")
+        logger.info(
+            f"Инвентаризация билдов завершена успешно. accounted={len(rows)} unaccounted={len(unaccounted)}"
+        )
     except Exception as e:
         logger.exception(f"Ошибка при инвентаризации: {e}")
 
