@@ -15,7 +15,7 @@ load_dotenv()
 GRAFANA_URL = os.getenv("GRAFANA_URL")
 GRAFANA_USER = os.getenv("GRAFANA_USER")
 GRAFANA_PASS = os.getenv("GRAFANA_PASS")
-ORG_LIMIT = int(os.getenv("ORG_LIMIT", "5"))
+ORG_LIMIT = int(os.getenv("ORG_LIMIT", "555"))
 
 SD_FILE = os.getenv("SD_FILE", "sd.xlsx")
 BK_FILE = os.getenv("BK_FILE", "bk_all_users.xlsx")
@@ -30,7 +30,6 @@ INCLUDE_ALL_ZERO_NUMBERS = False
 BAN_SERVICE_IDS = [15473]
 
 BAN_BUSINESS_TYPES = [
-    "",
 ]
 
 SKIP_EMPTY_BUSINESS_TYPE = True
@@ -309,7 +308,25 @@ def main():
     logger.info(f"Организаций к обработке: {len(org_ids)}")
 
     rows_orgs = []
+    unaccounted_orgs = []
+
     skipped_zero = skipped_ban = no_access = 0
+    skipped_empty_bt = skipped_ban_bt = skipped_sd_miss = 0
+
+    def add_unaccounted(org_id, raw_org_name, org_name, org_number, reason, detail, sd_name="", owner="", business_type=""):
+        unaccounted_orgs.append(
+            {
+                "org_id": org_id,
+                "org_name_raw": raw_org_name,
+                "org_name": org_name,
+                "org_number": org_number,
+                "reason": reason,
+                "detail": detail,
+                "sd_name": sd_name,
+                "owner": owner,
+                "business_type": business_type,
+            }
+        )
 
     for org_id in org_ids:
         raw_org_name = get_org_name(org_id)
@@ -323,11 +340,21 @@ def main():
         if is_zero and not INCLUDE_ALL_ZERO_NUMBERS:
             skipped_zero += 1
             logger.info(f'ORG {org_id}: "{org_name}" ({org_number}) — skip (нули)')
+            add_unaccounted(
+                org_id, raw_org_name, org_name, org_number,
+                reason="skip_zero_number",
+                detail="org number is all zeros and INCLUDE_ALL_ZERO_NUMBERS=False",
+            )
             continue
 
         if (not is_zero) and norm_number and norm_number in ban_set:
             skipped_ban += 1
             logger.info(f'ORG {org_id}: "{org_name}" ({org_number}) — skip (бан)')
+            add_unaccounted(
+                org_id, raw_org_name, org_name, org_number,
+                reason="banned_service_id",
+                detail="org number in BAN_SERVICE_IDS",
+            )
             continue
 
         sd_name = ""
@@ -345,10 +372,33 @@ def main():
             owner = (sd or {}).get("owner") or ""
             business_type = bk_type_map.get(normalize_name_key(owner), "") if owner else ""
 
+            if not sd_name and not owner:
+                skipped_sd_miss += 1
+                add_unaccounted(
+                    org_id, raw_org_name, org_name, org_number,
+                    reason="sd_mapping_miss",
+                    detail="no match in SD by number or by name",
+                    sd_name=sd_name, owner=owner, business_type=business_type,
+                )
+
             if SKIP_EMPTY_BUSINESS_TYPE and not clean_spaces(business_type):
+                skipped_empty_bt += 1
+                add_unaccounted(
+                    org_id, raw_org_name, org_name, org_number,
+                    reason="skip_empty_business_type",
+                    detail="SKIP_EMPTY_BUSINESS_TYPE=True and business_type is empty",
+                    sd_name=sd_name, owner=owner, business_type=business_type,
+                )
                 continue
 
             if ban_business_types_set and clean_spaces(business_type) in ban_business_types_set:
+                skipped_ban_bt += 1
+                add_unaccounted(
+                    org_id, raw_org_name, org_name, org_number,
+                    reason="banned_business_type",
+                    detail="business_type in BAN_BUSINESS_TYPES",
+                    sd_name=sd_name, owner=owner, business_type=business_type,
+                )
                 continue
 
         display_service_name = sd_name if sd_name else org_name
@@ -360,6 +410,12 @@ def main():
                 f'сервис="{display_service_name}" | '
                 f'владелец="{owner or "—"}" | '
                 f'тип="{business_type or "—"}"'
+            )
+            add_unaccounted(
+                org_id, raw_org_name, org_name, org_number,
+                reason="no_access",
+                detail="switch_org returned 401",
+                sd_name=sd_name, owner=owner, business_type=business_type,
             )
             continue
 
@@ -402,7 +458,9 @@ def main():
 
     logger.info(
         f"Итог: панелей={total_panels}, skip_zero={skipped_zero}, "
-        f"skip_ban={skipped_ban}, no_access={no_access}"
+        f"skip_ban={skipped_ban}, sd_miss={skipped_sd_miss}, "
+        f"skip_empty_bt={skipped_empty_bt}, ban_bt={skipped_ban_bt}, "
+        f"no_access={no_access}"
     )
 
     for r in rows_orgs:
@@ -410,11 +468,16 @@ def main():
             r["Потребление в %"] = round(r["Кол-во панелей"] / total_panels * 100, 2)
 
     df = pd.DataFrame(rows_orgs)
+    df_un = pd.DataFrame(unaccounted_orgs)
 
     with pd.ExcelWriter(GRAFANA_REPORT_FILE, engine="openpyxl") as writer:
         df.to_excel(writer, sheet_name="Отчет Grafana", index=False)
+        df_un.to_excel(writer, sheet_name="Unaccounted orgs", index=False)
 
-    logger.info(f"Готово. Файл сохранён: {GRAFANA_REPORT_FILE}")
+    logger.info(
+        f"Готово. Файл сохранён: {GRAFANA_REPORT_FILE} | "
+        f"accounted={len(rows_orgs)} unaccounted={len(unaccounted_orgs)}"
+    )
 
 
 if __name__ == "__main__":
