@@ -29,8 +29,7 @@ INCLUDE_ALL_ZERO_NUMBERS = False
 
 BAN_SERVICE_IDS = [15473]
 
-BAN_BUSINESS_TYPES = [
-]
+BAN_BUSINESS_TYPES = []
 
 SKIP_EMPTY_BUSINESS_TYPE = True
 
@@ -313,7 +312,17 @@ def main():
     skipped_zero = skipped_ban = no_access = 0
     skipped_empty_bt = skipped_ban_bt = skipped_sd_miss = 0
 
-    def add_unaccounted(org_id, raw_org_name, org_name, org_number, reason, detail, sd_name="", owner="", business_type=""):
+    def add_unaccounted(
+        org_id,
+        raw_org_name,
+        org_name,
+        org_number,
+        reason,
+        detail,
+        sd_name="",
+        owner="",
+        business_type="",
+    ):
         unaccounted_orgs.append(
             {
                 "org_id": org_id,
@@ -341,7 +350,10 @@ def main():
             skipped_zero += 1
             logger.info(f'ORG {org_id}: "{org_name}" ({org_number}) — skip (нули)')
             add_unaccounted(
-                org_id, raw_org_name, org_name, org_number,
+                org_id,
+                raw_org_name,
+                org_name,
+                org_number,
                 reason="skip_zero_number",
                 detail="org number is all zeros and INCLUDE_ALL_ZERO_NUMBERS=False",
             )
@@ -351,7 +363,10 @@ def main():
             skipped_ban += 1
             logger.info(f'ORG {org_id}: "{org_name}" ({org_number}) — skip (бан)')
             add_unaccounted(
-                org_id, raw_org_name, org_name, org_number,
+                org_id,
+                raw_org_name,
+                org_name,
+                org_number,
                 reason="banned_service_id",
                 detail="org number in BAN_SERVICE_IDS",
             )
@@ -370,34 +385,54 @@ def main():
 
             sd_name = (sd or {}).get("sd_name") or ""
             owner = (sd or {}).get("owner") or ""
-            business_type = bk_type_map.get(normalize_name_key(owner), "") if owner else ""
+            business_type = (
+                bk_type_map.get(normalize_name_key(owner), "") if owner else ""
+            )
 
             if not sd_name and not owner:
                 skipped_sd_miss += 1
                 add_unaccounted(
-                    org_id, raw_org_name, org_name, org_number,
+                    org_id,
+                    raw_org_name,
+                    org_name,
+                    org_number,
                     reason="sd_mapping_miss",
                     detail="no match in SD by number or by name",
-                    sd_name=sd_name, owner=owner, business_type=business_type,
+                    sd_name=sd_name,
+                    owner=owner,
+                    business_type=business_type,
                 )
 
             if SKIP_EMPTY_BUSINESS_TYPE and not clean_spaces(business_type):
                 skipped_empty_bt += 1
                 add_unaccounted(
-                    org_id, raw_org_name, org_name, org_number,
+                    org_id,
+                    raw_org_name,
+                    org_name,
+                    org_number,
                     reason="skip_empty_business_type",
                     detail="SKIP_EMPTY_BUSINESS_TYPE=True and business_type is empty",
-                    sd_name=sd_name, owner=owner, business_type=business_type,
+                    sd_name=sd_name,
+                    owner=owner,
+                    business_type=business_type,
                 )
                 continue
 
-            if ban_business_types_set and clean_spaces(business_type) in ban_business_types_set:
+            if (
+                ban_business_types_set
+                and clean_spaces(business_type) in ban_business_types_set
+            ):
                 skipped_ban_bt += 1
                 add_unaccounted(
-                    org_id, raw_org_name, org_name, org_number,
+                    org_id,
+                    raw_org_name,
+                    org_name,
+                    org_number,
                     reason="banned_business_type",
                     detail="business_type in BAN_BUSINESS_TYPES",
-                    sd_name=sd_name, owner=owner, business_type=business_type,
+                    sd_name=sd_name,
+                    owner=owner,
+                    business_type=business_type,
                 )
                 continue
 
@@ -412,10 +447,15 @@ def main():
                 f'тип="{business_type or "—"}"'
             )
             add_unaccounted(
-                org_id, raw_org_name, org_name, org_number,
+                org_id,
+                raw_org_name,
+                org_name,
+                org_number,
                 reason="no_access",
                 detail="switch_org returned 401",
-                sd_name=sd_name, owner=owner, business_type=business_type,
+                sd_name=sd_name,
+                owner=owner,
+                business_type=business_type,
             )
             continue
 

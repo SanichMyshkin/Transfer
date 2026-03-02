@@ -118,8 +118,12 @@ def validate_env_and_files():
         os.makedirs(out_dir, exist_ok=True)
 
     logger.info(f"Бан-лист (КОД): {sorted(ban_set) if ban_set else 'пусто'}")
-    logger.info(f"BAN_BUSINESS_TYPES: {sorted(ban_business_types_set) if ban_business_types_set else 'пусто'}")
-    logger.info(f"EXCLUDE_PROJECTS_WITHOUT_TEAM_NUMBER={EXCLUDE_PROJECTS_WITHOUT_TEAM_NUMBER}")
+    logger.info(
+        f"BAN_BUSINESS_TYPES: {sorted(ban_business_types_set) if ban_business_types_set else 'пусто'}"
+    )
+    logger.info(
+        f"EXCLUDE_PROJECTS_WITHOUT_TEAM_NUMBER={EXCLUDE_PROJECTS_WITHOUT_TEAM_NUMBER}"
+    )
     logger.info(f"SKIP_EMPTY_BUSINESS_TYPE={SKIP_EMPTY_BUSINESS_TYPE}")
     logger.info("ENV/файлы ок.")
 
@@ -201,7 +205,17 @@ def aggregate_builds_by_service(
     acc = defaultdict(int)
     unaccounted = []
 
-    def add_unaccounted(root_project, team_number, full_name, builds, reason, detail, service_name="", owner="", business_type=""):
+    def add_unaccounted(
+        root_project,
+        team_number,
+        full_name,
+        builds,
+        reason,
+        detail,
+        service_name="",
+        owner="",
+        business_type="",
+    ):
         unaccounted.append(
             {
                 "root_project": root_project,

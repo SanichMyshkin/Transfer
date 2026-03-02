@@ -129,8 +129,10 @@ def load_bk_business_type_map(path):
     return out
 
 
-def write_excel(path, rows):
+def write_excel(path, rows, unaccounted_rows):
     wb = Workbook()
+
+    # Sheet 1: report
     ws = wb.active
     ws.title = "Отчет Nexus"
 
@@ -172,6 +174,66 @@ def write_excel(path, rows):
     for idx, w in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(idx)].width = min(max(w + 2, 12), 60)
 
+    # Sheet 2: unaccounted
+    ws2 = wb.create_sheet("Unaccounted")
+    header2 = [
+        "scope",         # repo / folder / service
+        "repo",
+        "folder",
+        "raw_service",
+        "base_name",
+        "code",
+        "bytes",
+        "size_human",
+        "reason",
+        "detail",
+        "sd_name",
+        "owner",
+        "business_type",
+    ]
+    ws2.append(header2)
+    for i in range(1, len(header2) + 1):
+        ws2.cell(row=1, column=i).font = bold
+
+    for u in unaccounted_rows:
+        b = int(u.get("bytes") or 0)
+        ws2.append(
+            [
+                u.get("scope", ""),
+                u.get("repo", ""),
+                u.get("folder", ""),
+                u.get("raw_service", ""),
+                u.get("base_name", ""),
+                u.get("code", ""),
+                b,
+                format_size(b, binary=True) if b else "",
+                u.get("reason", ""),
+                u.get("detail", ""),
+                u.get("sd_name", ""),
+                u.get("owner", ""),
+                u.get("business_type", ""),
+            ]
+        )
+
+    widths2 = [len(h) for h in header2]
+    for u in unaccounted_rows:
+        widths2[0] = max(widths2[0], len(str(u.get("scope", ""))))
+        widths2[1] = max(widths2[1], len(str(u.get("repo", ""))))
+        widths2[2] = max(widths2[2], len(str(u.get("folder", ""))))
+        widths2[3] = max(widths2[3], len(str(u.get("raw_service", ""))))
+        widths2[4] = max(widths2[4], len(str(u.get("base_name", ""))))
+        widths2[5] = max(widths2[5], len(str(u.get("code", ""))))
+        widths2[6] = max(widths2[6], len(str(int(u.get("bytes") or 0)))))
+        widths2[7] = max(widths2[7], len(str(format_size(int(u.get("bytes") or 0), binary=True) if int(u.get("bytes") or 0) else "")))
+        widths2[8] = max(widths2[8], len(str(u.get("reason", ""))))
+        widths2[9] = max(widths2[9], len(str(u.get("detail", ""))))
+        widths2[10] = max(widths2[10], len(str(u.get("sd_name", ""))))
+        widths2[11] = max(widths2[11], len(str(u.get("owner", ""))))
+        widths2[12] = max(widths2[12], len(str(u.get("business_type", ""))))
+
+    for idx, w in enumerate(widths2, start=1):
+        ws2.column_dimensions[get_column_letter(idx)].width = min(max(w + 2, 12), 90)
+
     wb.save(path)
 
 
@@ -205,6 +267,24 @@ def main():
     if not conf_url or not conf_page_id or not conf_user or not conf_pass:
         raise RuntimeError("Нужны CONF_URL, CONF_PAGE_ID, CONF_USER, CONF_PASS")
 
+    def add_unaccounted(scope, repo, folder, raw_service, base_name, code, bytes_, reason, detail, sd_name="", owner="", business_type=""):
+        unaccounted.append(
+            {
+                "scope": scope,
+                "repo": repo or "",
+                "folder": folder or "",
+                "raw_service": raw_service or "",
+                "base_name": base_name or "",
+                "code": code or "",
+                "bytes": int(bytes_ or 0),
+                "reason": reason,
+                "detail": detail,
+                "sd_name": sd_name or "",
+                "owner": owner or "",
+                "business_type": business_type or "",
+            }
+        )
+
     logging.info("Читаю таблицу из Confluence")
     conf_rows = confluence_table_as_dicts(conf_url, conf_page_id, conf_user, conf_pass)
     repo_service = repo_to_service_map(conf_rows)
@@ -220,6 +300,8 @@ def main():
     repo_sizes = get_repository_sizes()
 
     totals = {}
+    unaccounted = []
+
     hosted_total = 0
     skipped_no_service = 0
     skipped_no_code = 0
@@ -245,9 +327,10 @@ def main():
                 if base_key and code:
                     base_to_codes.setdefault(base_key, set()).add(code)
 
-            # 1) Сначала папки с кодом
+            # 1) folders with code
             for folder, size_bytes in folder_sizes.items():
                 base_name, code = split_service_and_code(folder)
+
                 if not code:
                     continue
 
@@ -259,16 +342,38 @@ def main():
                 if SKIP_EMPTY_SERVICE and (not base_name):
                     skipped_no_service += 1
                     logging.info("map special: folder=%s action=SKIP reason=no_service", folder)
+                    add_unaccounted(
+                        scope="folder",
+                        repo=repo_name,
+                        folder=folder,
+                        raw_service="",
+                        base_name=base_name,
+                        code=code,
+                        bytes_=size_bytes,
+                        reason="no_service",
+                        detail="SKIP_EMPTY_SERVICE=True and base_name is empty",
+                    )
                     continue
 
                 if code in BAN_SET:
                     skipped_ban_service_code += 1
                     logging.info("map special: folder=%s action=SKIP reason=ban_service_code code=%s", folder, code)
+                    add_unaccounted(
+                        scope="folder",
+                        repo=repo_name,
+                        folder=folder,
+                        raw_service="",
+                        base_name=base_name,
+                        code=code,
+                        bytes_=size_bytes,
+                        reason="ban_service_code",
+                        detail="code in BAN_SERVICE_CODES",
+                    )
                     continue
 
                 _add_to_totals(totals, code, base_name, size_bytes)
 
-            # 2) Потом папки без кода (алиасы)
+            # 2) folders without code (aliases)
             for folder, size_bytes in folder_sizes.items():
                 base_name, code = split_service_and_code(folder)
                 if code:
@@ -292,12 +397,34 @@ def main():
                         "map special: repo=%s -> folder=%s -> base=%s bytes=%d action=SKIP reason=ambiguous_alias codes=%s",
                         repo_name, folder, base_name, int(size_bytes or 0), ",".join(sorted(codes))
                     )
+                    add_unaccounted(
+                        scope="folder",
+                        repo=repo_name,
+                        folder=folder,
+                        raw_service="",
+                        base_name=base_name,
+                        code="",
+                        bytes_=size_bytes,
+                        reason="ambiguous_alias",
+                        detail=f"multiple possible codes: {','.join(sorted(codes))}",
+                    )
                     continue
 
                 skipped_no_code += 1
                 logging.info(
                     "map special: repo=%s -> folder=%s -> base=%s bytes=%d action=SKIP reason=no_code",
                     repo_name, folder, base_name, int(size_bytes or 0)
+                )
+                add_unaccounted(
+                    scope="folder",
+                    repo=repo_name,
+                    folder=folder,
+                    raw_service="",
+                    base_name=base_name,
+                    code="",
+                    bytes_=size_bytes,
+                    reason="no_code",
+                    detail="cannot extract code from folder name and no alias match",
                 )
 
             continue
@@ -313,6 +440,17 @@ def main():
                 "map repo=%s -> raw_service=%s -> base=%s code=%s bytes=%d action=SKIP reason=no_service",
                 repo_name, raw_service, base_name, code, size_bytes
             )
+            add_unaccounted(
+                scope="repo",
+                repo=repo_name,
+                folder="",
+                raw_service=raw_service,
+                base_name=base_name,
+                code=code,
+                bytes_=size_bytes,
+                reason="no_service",
+                detail="SKIP_EMPTY_SERVICE=True and base_name is empty",
+            )
             continue
 
         if not code:
@@ -321,6 +459,17 @@ def main():
                 "map repo=%s -> raw_service=%s -> base=%s code=%s bytes=%d action=SKIP reason=no_code",
                 repo_name, raw_service, base_name, code, size_bytes
             )
+            add_unaccounted(
+                scope="repo",
+                repo=repo_name,
+                folder="",
+                raw_service=raw_service,
+                base_name=base_name,
+                code="",
+                bytes_=size_bytes,
+                reason="no_code",
+                detail="cannot extract code from raw_service (Confluence mapping)",
+            )
             continue
 
         if code in BAN_SET:
@@ -328,6 +477,17 @@ def main():
             logging.info(
                 "map repo=%s -> raw_service=%s -> base=%s code=%s bytes=%d action=SKIP reason=ban_service_code",
                 repo_name, raw_service, base_name, code, size_bytes
+            )
+            add_unaccounted(
+                scope="repo",
+                repo=repo_name,
+                folder="",
+                raw_service=raw_service,
+                base_name=base_name,
+                code=code,
+                bytes_=size_bytes,
+                reason="ban_service_code",
+                detail="code in BAN_SERVICE_CODES",
             )
             continue
 
@@ -356,10 +516,38 @@ def main():
 
         if SKIP_EMPTY_BUSINESS_TYPE and not business_type:
             skipped_empty_business_type += 1
+            add_unaccounted(
+                scope="service",
+                repo="",
+                folder="",
+                raw_service="",
+                base_name=base_name,
+                code=code,
+                bytes_=size_bytes,
+                reason="skip_empty_business_type",
+                detail="SKIP_EMPTY_BUSINESS_TYPE=True and business_type is empty",
+                sd_name=service_name,
+                owner=owner,
+                business_type=business_type,
+            )
             continue
 
         if BAN_BUSINESS_SET and business_type in BAN_BUSINESS_SET:
             skipped_ban_business_type += 1
+            add_unaccounted(
+                scope="service",
+                repo="",
+                folder="",
+                raw_service="",
+                base_name=base_name,
+                code=code,
+                bytes_=size_bytes,
+                reason="ban_business_type",
+                detail="business_type in BAN_BUSINESS_TYPES",
+                sd_name=service_name,
+                owner=owner,
+                business_type=business_type,
+            )
             continue
 
         candidates.append(
@@ -403,9 +591,10 @@ def main():
     logging.info(f"skipped by business type ban: {skipped_ban_business_type}")
     logging.info(f"services in report: {len(rows)}")
     logging.info(f"eligible_total: {format_size(eligible_total, binary=True)}")
+    logging.info(f"unaccounted rows: {len(unaccounted)}")
     logging.info(f"write excel: {out_file}")
 
-    write_excel(out_file, rows)
+    write_excel(out_file, rows, unaccounted)
 
     logging.info("done")
 

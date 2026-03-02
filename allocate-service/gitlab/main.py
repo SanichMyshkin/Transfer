@@ -32,7 +32,9 @@ BAN_SERVICE_IDS = {
 
 SERVICE_ID_RE = re.compile(r"^service[_-]?id\s*:\s*(\d+)\s*$", re.IGNORECASE)
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s"
+)
 log = logging.getLogger("gitlab_sizes")
 
 
@@ -62,7 +64,7 @@ def connect():
 def extract_service_id_info(topics):
     ids = []
 
-    for t in (topics or []):
+    for t in topics or []:
         s = (t or "").strip()
         m = SERVICE_ID_RE.match(s)
         if m:
@@ -133,7 +135,6 @@ def main():
     log.info("Начинаем обход проектов...")
 
     for i, p in enumerate(gl.projects.list(all=True, iterator=True), start=1):
-
         if LIMIT and processed >= LIMIT:
             log.info(f"LIMIT={LIMIT} достигнут, останавливаемся")
             break
@@ -142,7 +143,11 @@ def main():
 
         try:
             full = gl.projects.get(proj_id, statistics=True)
-            name = getattr(full, "path_with_namespace", "") or getattr(full, "name", "") or str(proj_id)
+            name = (
+                getattr(full, "path_with_namespace", "")
+                or getattr(full, "name", "")
+                or str(proj_id)
+            )
             web_url = getattr(full, "web_url", "") or ""
 
             topics = list(getattr(full, "topics", []) or [])
@@ -172,7 +177,9 @@ def main():
                         name,
                         web_url,
                         humanize.naturalsize(repo_bytes, binary=True),
-                        humanize.naturalsize(job_bytes, binary=True) if job_bytes else "",
+                        humanize.naturalsize(job_bytes, binary=True)
+                        if job_bytes
+                        else "",
                         humanize.naturalsize(total_bytes, binary=True),
                     ]
                 )
@@ -181,7 +188,7 @@ def main():
 
         except Exception as e:
             errors += 1
-            log.warning(f'FAIL project_id={proj_id} err={e}')
+            log.warning(f"FAIL project_id={proj_id} err={e}")
 
         if LOG_EVERY and i % LOG_EVERY == 0:
             log.info(f"PROGRESS i={i} errors={errors}")
