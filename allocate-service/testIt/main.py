@@ -21,7 +21,7 @@ PG_USER = os.getenv("PG_USER")
 PG_PASSWORD = os.getenv("PG_PASSWORD")
 PG_DB = os.getenv("PG_DB")
 
-OUT_XLSX = os.getenv("OUT_XLSX", "testIt_projects_by_pfp.xlsx")
+OUT_XLSX = os.getenv("OUT_XLSX", "testIt_report.xlsx")
 
 PFP_RE = re.compile(r"пфп\s*[-–—:]?\s*(\d+)", re.IGNORECASE)
 
@@ -71,8 +71,8 @@ def to_int(v):
         return 0
 
 
-def write_sheet(wb: Workbook, sheet_name: str, rows):
-    ws = wb.active
+def write_sheet(wb: Workbook, sheet_name: str, rows, *, make_active=False):
+    ws = wb.active if make_active else wb.create_sheet(sheet_name)
     ws.title = sheet_name
 
     if not rows:
@@ -109,17 +109,33 @@ def main():
     logging.info("Projects loaded: %d", len(projects))
 
     agg = defaultdict(lambda: {"ProjectsCount": 0, "TestCasesCount": 0, "AutotestsCount": 0})
+    unaccounted = []
 
     for p in projects:
-        pfp = extract_pfp(p.get("Description")) or "NO_PFP"
+        desc = p.get("Description")
+        pfp = extract_pfp(desc)
+
         tc = to_int(p.get("TestCasesCount"))
         at = to_int(p.get("AutotestsCount"))
+
+        if not pfp:
+            unaccounted.append(
+                {
+                    "ProjectId": p.get("Id"),
+                    "ProjectName": p.get("Name"),
+                    "TestCasesCount": tc,
+                    "AutotestsCount": at,
+                    "TotalTests": tc + at,
+                    "Reason": "no_pfp_in_description" if desc else "empty_description",
+                    "Description": desc or "",
+                }
+            )
+            pfp = "NO_PFP"
 
         agg[pfp]["ProjectsCount"] += 1
         agg[pfp]["TestCasesCount"] += tc
         agg[pfp]["AutotestsCount"] += at
 
-    # Результат в таблицу
     rows = []
     for pfp, v in agg.items():
         total_tests = v["TestCasesCount"] + v["AutotestsCount"]
@@ -143,11 +159,16 @@ def main():
 
     rows.sort(key=sort_key)
 
-    wb = Workbook()
-    write_sheet(wb, "By_PFP", rows)
-    wb.save(OUT_XLSX)
 
+    unaccounted.sort(key=lambda x: (-to_int(x.get("TotalTests")), to_int(x.get("ProjectId"))))
+
+    wb = Workbook()
+    write_sheet(wb, "Отчет TestIT", rows, make_active=True)
+    write_sheet(wb, "Unaccounted", unaccounted, make_active=False)
+
+    wb.save(OUT_XLSX)
     logging.info("Excel saved: %s", OUT_XLSX)
+    logging.info("Unaccounted projects: %d", len(unaccounted))
 
 
 if __name__ == "__main__":
