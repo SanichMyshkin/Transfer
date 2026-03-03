@@ -36,9 +36,7 @@ BAN_SERVICES = [
     "UNAITP",
 ]
 
-BAN_BUSINESS_TYPES = [
-    "Блок банковских технологий",
-]
+BAN_BUSINESS_TYPES = []
 
 SKIP_EMPTY_BUSINESS_TYPE = True
 
@@ -280,18 +278,39 @@ def is_zero_code(code: str) -> bool:
 def collect_rows(gl, projects, sd_people_map, bk_type_map):
     ban_business_set = {clean_spaces(x) for x in BAN_BUSINESS_TYPES if clean_spaces(x)}
     totals = {}
+    unaccounted = []
+
+    def add_unacc(project, code, reason, detail, files_count=None):
+        unaccounted.append(
+            {
+                "project_id": getattr(project, "id", ""),
+                "project": getattr(project, "name", ""),
+                "path_with_namespace": getattr(project, "path_with_namespace", ""),
+                "service_guess": split_service_and_code(getattr(project, "name", ""))[0],
+                "code": code or "",
+                "reason": reason,
+                "detail": detail or "",
+                "deployment_files": files_count if files_count is not None else "",
+            }
+        )
 
     for p in projects:
         try:
             proj = gl.projects.get(p.id)
         except Exception as e:
             log.warning(f"[{p.name}] Не смог получить project объект: {e}")
+            add_unacc(p, "", "project_get_failed", str(e))
             continue
 
         service_from_git, code = split_service_and_code(p.name)
 
+        if not code:
+            add_unacc(p, "", "no_code_in_project_name", "project name does not match r'^(.*?)-(\\d+)$'")
+            continue
+
         if EXCLUDE_ZERO_CODES and is_zero_code(code):
             log.info(f"[{p.name}] SKIP (code is all zeros)")
+            add_unacc(p, code, "zero_code", "EXCLUDE_ZERO_CODES=True and code is all zeros")
             continue
 
         sd = sd_people_map.get(code, {}) if code else {}
@@ -300,6 +319,7 @@ def collect_rows(gl, projects, sd_people_map, bk_type_map):
 
         if service_for_report in BAN_SERVICES:
             log.info(f"[{p.name}] SKIP (ban service): service='{service_for_report}'")
+            add_unacc(p, code, "banned_service", f"service='{service_for_report}' in BAN_SERVICES")
             continue
 
         owner = sd.get("owner", "") if isinstance(sd, dict) else ""
@@ -307,8 +327,20 @@ def collect_rows(gl, projects, sd_people_map, bk_type_map):
         business_type = bk_type_map.get(normalize_name_key(owner), "") if owner else ""
 
         if SKIP_EMPTY_BUSINESS_TYPE and not clean_spaces(business_type):
+            add_unacc(
+                p,
+                code,
+                "empty_business_type",
+                "SKIP_EMPTY_BUSINESS_TYPE=True and business_type empty (owner not found/empty)",
+            )
             continue
         if ban_business_set and clean_spaces(business_type) in ban_business_set:
+            add_unacc(
+                p,
+                code,
+                "banned_business_type",
+                f"business_type='{clean_spaces(business_type)}' in BAN_BUSINESS_TYPES",
+            )
             continue
 
         files = find_deployment_files(proj)
@@ -316,13 +348,21 @@ def collect_rows(gl, projects, sd_people_map, bk_type_map):
             f"[p={p.name}] service='{service_for_report}' code='{code}' deployment_files={len(files)}"
         )
 
+        if not files:
+            add_unacc(p, code, "no_deployment_files", "no *-deployment.yaml/yml found in zeus-* tree", files_count=0)
+            continue
+
         cpu_total = 0.0
         mem_total = 0
+        read_ok = 0
+        read_fail = 0
 
         for path in files:
             try:
                 raw = get_file_text(proj, path, GIT_REF)
+                read_ok += 1
             except Exception as e:
+                read_fail += 1
                 log.warning(f"[{p.name}] Не смог прочитать {path} ({GIT_REF}): {e}")
                 continue
 
@@ -330,8 +370,34 @@ def collect_rows(gl, projects, sd_people_map, bk_type_map):
             cpu_total += cpu
             mem_total += mem
 
-        if cpu_total <= 0 and mem_total <= 0:
+        if read_ok == 0 and read_fail > 0:
+            add_unacc(
+                p,
+                code,
+                "all_deployment_files_failed_to_read",
+                f"all deployment files failed to read (ref={GIT_REF})",
+                files_count=len(files),
+            )
             continue
+
+        if cpu_total <= 0 and mem_total <= 0:
+            add_unacc(
+                p,
+                code,
+                "no_limits_found",
+                "cpu_total<=0 and mem_total<=0 after parsing limits",
+                files_count=len(files),
+            )
+            continue
+
+        if read_fail > 0:
+            add_unacc(
+                p,
+                code,
+                "some_deployment_files_failed_to_read",
+                f"{read_fail}/{len(files)} files failed to read (ref={GIT_REF})",
+                files_count=len(files),
+            )
 
         key = (service_for_report, code)
         if key not in totals:
@@ -375,11 +441,18 @@ def collect_rows(gl, projects, sd_people_map, bk_type_map):
         )
 
     rows.sort(key=lambda r: r["pct"], reverse=True)
-    return rows
+    unaccounted.sort(
+        key=lambda r: (
+            r.get("reason", ""),
+            str(r.get("project", "")),
+        )
+    )
+    return rows, unaccounted
 
 
-def write_excel(rows, out_file: str):
+def write_excel(rows, unaccounted_rows, out_file: str):
     wb = Workbook()
+
     ws = wb.active
     ws.title = "Report"
 
@@ -407,8 +480,34 @@ def write_excel(rows, out_file: str):
         ws.cell(i, 6, round(r["mem_mib"], 2))
         ws.cell(i, 7, round(r["pct"], 2))
 
+    ws2 = wb.create_sheet("Unaccounted")
+    headers2 = [
+        "project_id",
+        "project",
+        "path_with_namespace",
+        "service_guess",
+        "code",
+        "deployment_files",
+        "reason",
+        "detail",
+    ]
+    for col, h in enumerate(headers2, start=1):
+        c = ws2.cell(row=1, column=col, value=h)
+        c.font = bold
+
+    for i, r in enumerate(unaccounted_rows, start=2):
+        ws2.cell(i, 1, r.get("project_id", ""))
+        ws2.cell(i, 2, r.get("project", ""))
+        ws2.cell(i, 3, r.get("path_with_namespace", ""))
+        ws2.cell(i, 4, r.get("service_guess", ""))
+        ws2.cell(i, 5, r.get("code", ""))
+        ws2.cell(i, 6, r.get("deployment_files", ""))
+        ws2.cell(i, 7, r.get("reason", ""))
+        ws2.cell(i, 8, r.get("detail", ""))
+
     wb.save(out_file)
     log.info(f"Excel отчет создан: {out_file}")
+    log.info(f"Unaccounted: {len(unaccounted_rows)}")
 
 
 def main():
@@ -426,11 +525,11 @@ def main():
     gl = gl_connect()
     projects = get_group_projects(gl)
 
-    rows = collect_rows(
+    rows, unaccounted = collect_rows(
         gl, projects, sd_people_map=sd_people_map, bk_type_map=bk_type_map
     )
 
-    write_excel(rows, OUTPUT_XLSX)
+    write_excel(rows, unaccounted, OUTPUT_XLSX)
 
 
 if __name__ == "__main__":
