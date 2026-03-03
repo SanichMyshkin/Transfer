@@ -130,15 +130,18 @@ def main():
                     "Description": desc or "",
                 }
             )
-            pfp = "NO_PFP"
+            continue  # НЕ добавляем в агрегацию
 
         agg[pfp]["ProjectsCount"] += 1
         agg[pfp]["TestCasesCount"] += tc
         agg[pfp]["AutotestsCount"] += at
 
     rows = []
+    total_all_tests = 0
+
     for pfp, v in agg.items():
         total_tests = v["TestCasesCount"] + v["AutotestsCount"]
+        total_all_tests += total_tests
         rows.append(
             {
                 "PFP": pfp,
@@ -146,29 +149,34 @@ def main():
                 "TestCasesCount": v["TestCasesCount"],
                 "AutotestsCount": v["AutotestsCount"],
                 "TotalTests": total_tests,
+                "% потребления": 0.0,
             }
         )
 
-    def sort_key(r):
-        if r["PFP"] == "NO_PFP":
-            return (1, 0)
-        try:
-            return (0, int(r["PFP"]))
-        except Exception:
-            return (0, 10**18)
+    if total_all_tests == 0:
+        total_all_tests = 1
 
-    rows.sort(key=sort_key)
+    for r in rows:
+        r["% потребления"] = r["TotalTests"] / total_all_tests
 
-
+    rows.sort(key=lambda r: int(r["PFP"]) if r["PFP"].isdigit() else 10**18)
     unaccounted.sort(key=lambda x: (-to_int(x.get("TotalTests")), to_int(x.get("ProjectId"))))
 
     wb = Workbook()
-    write_sheet(wb, "Отчет TestIT", rows, make_active=True)
-    write_sheet(wb, "Unaccounted", unaccounted, make_active=False)
+    write_sheet(wb, "Отчет TestIt", rows, make_active=True)
+    write_sheet(wb, "Unaccounted", unaccounted)
+
+    ws = wb["By_PFP"]
+    pct_col = list(rows[0].keys()).index("% потребления") + 1 if rows else 0
+    if pct_col:
+        for rr in range(2, ws.max_row + 1):
+            ws.cell(row=rr, column=pct_col).number_format = "0.0%"
 
     wb.save(OUT_XLSX)
+
     logging.info("Excel saved: %s", OUT_XLSX)
     logging.info("Unaccounted projects: %d", len(unaccounted))
+    logging.info("Total tests (accounted only): %d", total_all_tests)
 
 
 if __name__ == "__main__":
