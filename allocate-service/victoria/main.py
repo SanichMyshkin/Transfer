@@ -57,7 +57,11 @@ REPORT_COLS = [
     "% от общего числа",
 ]
 
-UNACC_COLS = ["stage", "team", "service_id", "metric", "reason", "detail"]
+# добавлена колонка samples_72h
+UNACC_COLS = ["stage", "team", "service_id", "metric", "reason", "detail", "samples_72h"]
+
+# новый лист All Metrics
+ALL_METRICS_COLS = ["team", "service_id", "metric", "samples_72h", "status", "reason"]
 
 
 def build_ban_set(ban_list):
@@ -306,9 +310,9 @@ def samples_72h_for_metric(vm_url: str, metric_name: str, team: str, service_id:
     return int(total)
 
 
-def aggregate_to_group(metric_rows):
+def aggregate_to_group(metric_samples_rows):
     acc = {}
-    for r in metric_rows:
+    for r in metric_samples_rows:
         team_base, sid = normalize_team_and_sid(r.get("team", ""), r.get("service_id", ""))
         samples = int(r.get("samples_72h", 0) or 0)
 
@@ -443,7 +447,7 @@ def dedupe_and_add_percent(df: pd.DataFrame) -> pd.DataFrame:
     return out.reindex(columns=REPORT_COLS)
 
 
-def write_report(df_report: pd.DataFrame, df_unacc: pd.DataFrame):
+def write_report(df_report: pd.DataFrame, df_unacc: pd.DataFrame, df_all_metrics: pd.DataFrame):
     wb = Workbook()
     bold = Font(bold=True)
 
@@ -469,12 +473,24 @@ def write_report(df_report: pd.DataFrame, df_unacc: pd.DataFrame):
         ws2.append(["No data"])
         ws2["A1"].font = bold
     else:
-        df_unacc = df_unacc.reindex(columns=UNACC_COLS)
+        df_unacc = df_unacc.reindex(columns=UNACC_COLS).fillna("")
         ws2.append(list(df_unacc.columns))
         for c in ws2[1]:
             c.font = bold
         for row in df_unacc.itertuples(index=False):
             ws2.append(list(row))
+
+    ws3 = wb.create_sheet("All Metrics")
+    if df_all_metrics is None or df_all_metrics.empty:
+        ws3.append(["No data"])
+        ws3["A1"].font = bold
+    else:
+        df_all_metrics = df_all_metrics.reindex(columns=ALL_METRICS_COLS).fillna("")
+        ws3.append(list(df_all_metrics.columns))
+        for c in ws3[1]:
+            c.font = bold
+        for row in df_all_metrics.itertuples(index=False):
+            ws3.append(list(row))
 
     wb.save(OUTPUT_FILE)
 
@@ -498,9 +514,11 @@ def main():
 
     unacc_map = {}
 
-    def add_unacc_once(stage, team, service_id, metric, reason, detail):
+    def add_unacc_once(stage, team, service_id, metric, reason, detail, samples_72h=0):
         key = (team or "", service_id or "", metric or "")
         if key in unacc_map:
+            if samples_72h:
+                unacc_map[key]["samples_72h"] = samples_72h
             return
         unacc_map[key] = {
             "stage": stage,
@@ -509,6 +527,20 @@ def main():
             "metric": metric or "",
             "reason": reason,
             "detail": detail,
+            "samples_72h": samples_72h,
+        }
+
+    all_metrics_map: dict[tuple, dict] = {}
+
+    def set_all_metric(team, service_id, metric, samples_72h, status, reason=""):
+        key = (team or "", service_id or "", metric or "")
+        all_metrics_map[key] = {
+            "team": team or "",
+            "service_id": service_id or "",
+            "metric": metric or "",
+            "samples_72h": samples_72h,
+            "status": status,
+            "reason": reason,
         }
 
     overrides = {}
@@ -522,6 +554,9 @@ def main():
     metric_keys = discover_metric_keys(vm_url, add_unacc_once)
     log.info("Metric keys found (eligible): %d", len(metric_keys))
     log.info("Unaccounted (discover): %d", len(unacc_map))
+
+    for (team, service_id, metric), rec in unacc_map.items():
+        set_all_metric(team, service_id, metric, 0, "excluded", rec["reason"])
 
     team_to_sid_map, ambiguous_teams = build_team_to_sid_map(metric_keys)
     log.info("Team->SID inferred map size: %d", len(team_to_sid_map))
@@ -546,6 +581,7 @@ def main():
         elif not service_id:
             if team in ambiguous_teams:
                 add_unacc_once("infer", team, "", metric, "ambiguous_service_id", "multiple service_id detected for team")
+                set_all_metric(team, "", metric, 0, "excluded", "ambiguous_service_id")
                 continue
             inferred_sid = team_to_sid_map.get(team)
             if inferred_sid:
@@ -559,9 +595,22 @@ def main():
         log.info(f"[{idx}/{len(metric_keys)}] team={team} service_id={service_id} metric={metric}")
         try:
             s = samples_72h_for_metric(vm_url, metric, team, service_id, end_dt)
-            metric_samples_rows.append({"team": team, "service_id": service_id, "samples_72h": s})
+
+            if s == 0:
+                add_unacc_once(
+                    "samples", team, service_id, metric,
+                    "zero_samples", "metric exists in index but no data in last 72h",
+                    samples_72h=0,
+                )
+                set_all_metric(team, service_id, metric, 0, "excluded", "zero_samples")
+            else:
+                metric_samples_rows.append({"team": team, "service_id": service_id, "samples_72h": s})
+
+                set_all_metric(team, service_id, metric, s, "pending", "")
+
         except Exception as e:
-            add_unacc_once("samples", team, service_id, metric, "samples_failed", str(e))
+            add_unacc_once("samples", team, service_id, metric, "samples_failed", str(e), samples_72h=0)
+            set_all_metric(team, service_id, metric, 0, "excluded", f"samples_failed: {e}")
 
         time.sleep(SLEEP_SEC)
 
@@ -574,8 +623,12 @@ def main():
         accounted = enriched.copy()
 
         def mark_group_metrics_once(team, sid, stage, reason, detail):
-            for mn in sorted(per_group_metrics.get((team, normalize_sid(sid)), set())):
-                add_unacc_once(stage, team, normalize_sid(sid), mn, reason, detail)
+            sid_n = normalize_sid(sid)
+            for mn in sorted(per_group_metrics.get((team, sid_n), set())):
+                existing = all_metrics_map.get((team, sid_n, mn), {})
+                s = existing.get("samples_72h", 0)
+                add_unacc_once(stage, team, sid_n, mn, reason, detail, samples_72h=s)
+                set_all_metric(team, sid_n, mn, s, "excluded", reason)
 
         m_sd_missing = (accounted["code"].fillna("").astype(str).str.strip() != "") & (~accounted["sd_found"])
         for r in accounted[m_sd_missing].to_dict("records"):
@@ -631,6 +684,15 @@ def main():
                 )
             accounted = accounted[~m].copy()
 
+
+        for r in accounted.to_dict("records"):
+            team_v = r.get("team", "")
+            sid_v = normalize_sid(r.get("service_id", ""))
+            for mn in sorted(per_group_metrics.get((team_v, sid_v), set())):
+                existing = all_metrics_map.get((team_v, sid_v, mn), {})
+                if existing.get("status") == "pending":
+                    set_all_metric(team_v, sid_v, mn, existing.get("samples_72h", 0), "included", "")
+
         df_for_report = accounted.rename(
             columns={
                 "business_type": "Тип бизнеса",
@@ -643,13 +705,29 @@ def main():
         df_report = dedupe_and_add_percent(df_for_report)
         df_report = df_report.sort_values(["samples_72h"], ascending=False).reset_index(drop=True)
 
+
     df_unacc = pd.DataFrame(list(unacc_map.values()))
     if not df_unacc.empty:
         df_unacc = df_unacc.reindex(columns=UNACC_COLS).fillna("")
+        df_unacc["samples_72h"] = pd.to_numeric(df_unacc["samples_72h"], errors="coerce").fillna(0).astype(int)
         df_unacc = df_unacc.sort_values(["stage", "reason", "team", "service_id", "metric"]).reset_index(drop=True)
 
+
+    for key, rec in all_metrics_map.items():
+        if rec["status"] == "pending":
+            rec["status"] = "included"
+
+    df_all_metrics = pd.DataFrame(list(all_metrics_map.values()))
+    if not df_all_metrics.empty:
+        df_all_metrics["samples_72h"] = (
+            pd.to_numeric(df_all_metrics["samples_72h"], errors="coerce").fillna(0).astype(int)
+        )
+        df_all_metrics = df_all_metrics.sort_values(
+            ["status", "team", "service_id", "metric"]
+        ).reset_index(drop=True)
+
     log.info("Saving report: %s", OUTPUT_FILE)
-    write_report(df_report, df_unacc)
+    write_report(df_report, df_unacc, df_all_metrics)
     log.info("✔ Done")
 
 
