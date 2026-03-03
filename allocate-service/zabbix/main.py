@@ -4,6 +4,7 @@ from collections import defaultdict
 
 import pandas as pd
 from dotenv import load_dotenv
+from openpyxl.styles import Font
 from zabbix_utils import ZabbixAPI
 
 load_dotenv()
@@ -20,8 +21,7 @@ OUTPUT_XLSX = os.getenv("OUTPUT_XLSX", "zabbix_report.xlsx")
 BAN_SERVICE_IDS = [15473]
 SKIP_EMPTY_SERVICE_ID = True
 
-BAN_BUSINESS_TYPES = [
-]
+BAN_BUSINESS_TYPES = []
 SKIP_EMPTY_BUSINESS_TYPE = True
 
 ZBX_CHUNK = 500
@@ -283,75 +283,127 @@ def main():
     ambiguous = 0
     banned_hits = 0
     skipped_empty = 0
-    failed_rows = []
+    unaccounted = []
+
+    def add_unacc(r, reason, detail, service="", service_id="", owner="", business_type="", amb=False):
+        unaccounted.append(
+            {
+                "Хост": r.get("host", ""),
+                "IP": r.get("ip", ""),
+                "DNS": r.get("dns", ""),
+                "Айтемы": int(r.get("items", 0)),
+                "Триггеры": int(r.get("triggers", 0)),
+                "Наименование сервиса": service,
+                "КОД": service_id,
+                "Владелец сервиса": owner,
+                "Тип бизнеса": business_type,
+                "ambiguous": "yes" if amb else "",
+                "reason": reason,
+                "detail": detail,
+            }
+        )
 
     for r in df_hosts.to_dict("records"):
         ip = r.get("ip", "")
         dns = r.get("dns", "")
         svc_key = None
         amb = False
+        matched_by = ""
 
         if ip and dns and (ip, dns) in map_both:
             svc_key = map_both[(ip, dns)]
             amb = dup_both.get((ip, dns), 0) > 1
+            matched_by = "ip+dns"
         elif ip and (ip,) in map_ip:
             svc_key = map_ip[(ip,)]
             amb = dup_ip.get((ip,), 0) > 1
+            matched_by = "ip"
         elif dns and (dns,) in map_dns:
             svc_key = map_dns[(dns,)]
             amb = dup_dns.get((dns,), 0) > 1
+            matched_by = "dns"
 
         if not svc_key:
-            failed_rows.append(
-                {
-                    "Хост": r.get("host", ""),
-                    "IP": ip,
-                    "DNS": dns,
-                    "Айтемы": int(r.get("items", 0)),
-                    "Триггеры": int(r.get("triggers", 0)),
-                }
-            )
+            add_unacc(r, "no_match_in_db", "no match by (ip,dns) / ip / dns")
             continue
 
         service, service_id = svc_key
 
         if SKIP_EMPTY_SERVICE_ID and not service_id:
             skipped_empty += 1
+            add_unacc(r, "empty_service_id", "SKIP_EMPTY_SERVICE_ID=True and service_id empty", service=service, service_id=service_id, amb=amb)
             continue
 
         if service_id in ban_set:
             banned_hits += 1
+            add_unacc(r, "banned_service_id", "service_id in BAN_SERVICE_IDS", service=service, service_id=service_id, amb=amb)
+            continue
+
+        people = sd_people_map.get(service_id, {"owner": ""})
+        owner = clean_spaces(people.get("owner", ""))
+        business_type = bk_type_map.get(normalize_name_key(owner), "") if owner else ""
+        business_type = clean_spaces(business_type)
+
+        if SKIP_EMPTY_BUSINESS_TYPE and not business_type:
+            add_unacc(
+                r,
+                "empty_business_type",
+                "SKIP_EMPTY_BUSINESS_TYPE=True and business_type empty (owner not found/empty)",
+                service=service,
+                service_id=service_id,
+                owner=owner,
+                business_type=business_type,
+                amb=amb,
+            )
+            continue
+
+        if ban_business_set and business_type in ban_business_set:
+            add_unacc(
+                r,
+                "banned_business_type",
+                "business_type in BAN_BUSINESS_TYPES",
+                service=service,
+                service_id=service_id,
+                owner=owner,
+                business_type=business_type,
+                amb=amb,
+            )
             continue
 
         matched_hosts += 1
         if amb:
             ambiguous += 1
+            add_unacc(
+                r,
+                "ambiguous_match",
+                f"matched_by={matched_by} and DB has duplicates for key",
+                service=service,
+                service_id=service_id,
+                owner=owner,
+                business_type=business_type,
+                amb=True,
+            )
 
         key = (service, service_id)
         if key not in per_service:
-            per_service[key] = {"hosts": 0, "items": 0, "triggers": 0}
+            per_service[key] = {"hosts": 0, "items": 0, "triggers": 0, "owner": owner, "business_type": business_type}
         per_service[key]["hosts"] += 1
         per_service[key]["items"] += int(r.get("items", 0))
         per_service[key]["triggers"] += int(r.get("triggers", 0))
 
+        if not per_service[key]["owner"] and owner:
+            per_service[key]["owner"] = owner
+        if not per_service[key]["business_type"] and business_type:
+            per_service[key]["business_type"] = business_type
+
     candidates = []
     for (service, service_id), cnts in per_service.items():
-        people = sd_people_map.get(service_id, {"owner": ""})
-        owner = people.get("owner", "")
-        business_type = bk_type_map.get(normalize_name_key(owner), "") if owner else ""
-        business_type = clean_spaces(business_type)
-
-        if SKIP_EMPTY_BUSINESS_TYPE and not business_type:
-            continue
-        if ban_business_set and business_type in ban_business_set:
-            continue
-
         candidates.append(
             {
-                "Тип бизнеса": business_type,
+                "Тип бизнеса": cnts.get("business_type", ""),
                 "Наименование сервиса": service,
                 "КОД": service_id,
-                "Владелец сервиса": owner,
+                "Владелец сервиса": cnts.get("owner", ""),
                 "Кол-во хостов": int(cnts["hosts"]),
                 "Кол-во айтемов": int(cnts["items"]),
                 "Кол-во триггеров": int(cnts["triggers"]),
@@ -373,24 +425,30 @@ def main():
         ascending=[False, False],
     )
 
-    df_failed = pd.DataFrame(failed_rows)
+    df_unacc = pd.DataFrame(unaccounted).sort_values(
+        ["reason", "Айтемы", "Триггеры"], ascending=[True, False, False]
+    )
 
     installed_pct = (matched_hosts / total_active * 100) if total_active else 0.0
 
     logger.info(f"Активных хостов: {total_active}")
-    logger.info(
-        f"Установлено/определено хостов: {matched_hosts} ({installed_pct:.2f}%)"
-    )
+    logger.info(f"Установлено/определено хостов: {matched_hosts} ({installed_pct:.2f}%)")
     logger.info(f"Сомнительных совпадений: {ambiguous}")
     logger.info(f"Скип по бан-листу (service_id): {banned_hits}")
     logger.info(f"Скип пустых service_id: {skipped_empty}")
     logger.info(f"Итого айтемов (eligible): {eligible_items_total}")
     logger.info(f"Сервисов в отчёте: {len(df_report)}")
-    logger.info(f"Хостов в 'Не установлены': {len(df_failed)}")
+    logger.info(f"Unaccounted строк: {len(df_unacc)}")
 
     with pd.ExcelWriter(OUTPUT_XLSX, engine="openpyxl") as writer:
         df_report.to_excel(writer, index=False, sheet_name="Отчет Zabbix")
-        df_failed.to_excel(writer, index=False, sheet_name="Не установлены")
+        df_unacc.to_excel(writer, index=False, sheet_name="Unaccounted")
+
+        wb = writer.book
+        for sheet in ("Отчет Zabbix", "Unaccounted"):
+            ws = wb[sheet]
+            for c in ws[1]:
+                c.font = Font(bold=True)
 
 
 if __name__ == "__main__":
