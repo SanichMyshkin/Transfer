@@ -280,7 +280,7 @@ def collect_rows(gl, projects, sd_people_map, bk_type_map):
     totals = {}
     unaccounted = []
 
-    def add_unacc(project, code, reason, detail, files_count=None):
+    def add_unacc(project, code, reason, detail):
         unaccounted.append(
             {
                 "project_id": getattr(project, "id", ""),
@@ -290,7 +290,6 @@ def collect_rows(gl, projects, sd_people_map, bk_type_map):
                 "code": code or "",
                 "reason": reason,
                 "detail": detail or "",
-                "deployment_files": files_count if files_count is not None else "",
             }
         )
 
@@ -348,21 +347,13 @@ def collect_rows(gl, projects, sd_people_map, bk_type_map):
             f"[p={p.name}] service='{service_for_report}' code='{code}' deployment_files={len(files)}"
         )
 
-        if not files:
-            add_unacc(p, code, "no_deployment_files", "no *-deployment.yaml/yml found in zeus-* tree", files_count=0)
-            continue
-
         cpu_total = 0.0
         mem_total = 0
-        read_ok = 0
-        read_fail = 0
 
         for path in files:
             try:
                 raw = get_file_text(proj, path, GIT_REF)
-                read_ok += 1
             except Exception as e:
-                read_fail += 1
                 log.warning(f"[{p.name}] Не смог прочитать {path} ({GIT_REF}): {e}")
                 continue
 
@@ -370,34 +361,8 @@ def collect_rows(gl, projects, sd_people_map, bk_type_map):
             cpu_total += cpu
             mem_total += mem
 
-        if read_ok == 0 and read_fail > 0:
-            add_unacc(
-                p,
-                code,
-                "all_deployment_files_failed_to_read",
-                f"all deployment files failed to read (ref={GIT_REF})",
-                files_count=len(files),
-            )
-            continue
-
         if cpu_total <= 0 and mem_total <= 0:
-            add_unacc(
-                p,
-                code,
-                "no_limits_found",
-                "cpu_total<=0 and mem_total<=0 after parsing limits",
-                files_count=len(files),
-            )
             continue
-
-        if read_fail > 0:
-            add_unacc(
-                p,
-                code,
-                "some_deployment_files_failed_to_read",
-                f"{read_fail}/{len(files)} files failed to read (ref={GIT_REF})",
-                files_count=len(files),
-            )
 
         key = (service_for_report, code)
         if key not in totals:
@@ -487,7 +452,6 @@ def write_excel(rows, unaccounted_rows, out_file: str):
         "path_with_namespace",
         "service_guess",
         "code",
-        "deployment_files",
         "reason",
         "detail",
     ]
@@ -501,9 +465,8 @@ def write_excel(rows, unaccounted_rows, out_file: str):
         ws2.cell(i, 3, r.get("path_with_namespace", ""))
         ws2.cell(i, 4, r.get("service_guess", ""))
         ws2.cell(i, 5, r.get("code", ""))
-        ws2.cell(i, 6, r.get("deployment_files", ""))
-        ws2.cell(i, 7, r.get("reason", ""))
-        ws2.cell(i, 8, r.get("detail", ""))
+        ws2.cell(i, 6, r.get("reason", ""))
+        ws2.cell(i, 7, r.get("detail", ""))
 
     wb.save(out_file)
     log.info(f"Excel отчет создан: {out_file}")
