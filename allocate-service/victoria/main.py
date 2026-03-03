@@ -46,12 +46,15 @@ BK_FILE = os.getenv("BK_FILE")
 
 TEAM_TAIL_ID_RE = re.compile(r"^(.*)-(\d+)$")
 
+WINDOW_HOURS = 72  # было 24
+WINDOW_DAYS = WINDOW_HOURS / 24.0  # 3.0
+
 REPORT_COLS = [
     "Тип бизнеса",
     "Наименование сервиса",
     "КОД",
     "Владелец сервиса",
-    "samples_24h",
+    "samples_72h",
     "эксрополяция",
     "% от общего числа",
 ]
@@ -125,9 +128,7 @@ def normalize_team_and_sid(team: str, service_id: str):
 def http_query(vm_url: str, query: str):
     url = vm_url.rstrip("/") + "/api/v1/query"
     log.info(f"QUERY: {query}")
-    r = requests.get(
-        url, params={"query": query}, verify=False, timeout=HTTP_TIMEOUT_SEC
-    )
+    r = requests.get(url, params={"query": query}, verify=False, timeout=HTTP_TIMEOUT_SEC)
     r.raise_for_status()
     data = r.json()
     if data.get("status") != "success":
@@ -204,6 +205,20 @@ def load_bk_business_type_map(path: str) -> dict:
 
 def discover_groups(vm_url: str):
     groups = set()
+    unacc = []
+
+    def add_unacc(team, service_id, reason, detail):
+        team_base, sid_norm = normalize_team_and_sid(team, service_id)
+        unacc.append(
+            {
+                "stage": "discover_groups",
+                "team": team_base,
+                "service_id": sid_norm,
+                "reason": reason,
+                "detail": detail,
+            }
+        )
+
     queries = [
         'count by (team, service_id) ({team=~".+", service_id=~".+"})',
         'count by (team, service_id) ({team!~".+", service_id=~".+"})',
@@ -218,20 +233,24 @@ def discover_groups(vm_url: str):
             service_id = label(m, "service_id")
 
             if is_banned_team(team):
+                add_unacc(team, service_id, "banned_team", "team in BAN_TEAMS")
                 continue
 
             team_base, sid_norm = normalize_team_and_sid(team, service_id)
 
             if sid_norm and sid_norm in ban_service_set:
+                add_unacc(team_base, sid_norm, "banned_service_id", "service_id in BAN_SERVICE_IDS")
                 continue
 
             if EXCLUDE_NO_SERVICE_ID_AT_QUERY and not sid_norm:
+                add_unacc(team_base, sid_norm, "excluded_no_service_id", "EXCLUDE_NO_SERVICE_ID_AT_QUERY=True and service_id empty")
                 continue
 
             groups.add((team_base, sid_norm))
 
         time.sleep(SLEEP_SEC)
-    return sorted(groups)
+
+    return sorted(groups), unacc
 
 
 def build_matchers(team: str, service_id: str) -> str:
@@ -258,12 +277,10 @@ def get_group_metric_names(vm_url: str, team: str, service_id: str) -> list[str]
     return sorted(set(names))
 
 
-def samples_24h_for_metric_in_group(
-    vm_url: str, metric_name: str, team: str, service_id: str, end_dt: datetime
-) -> int:
+def samples_72h_for_metric_in_group(vm_url: str, metric_name: str, team: str, service_id: str, end_dt: datetime) -> int:
     m = build_matchers(team, service_id)
     q = f'sum(count_over_time({{{m}, __name__="{metric_name}"}}[1h]))'
-    start_dt = end_dt - timedelta(hours=24)
+    start_dt = end_dt - timedelta(hours=WINDOW_HOURS)
 
     res = http_query_range(
         vm_url,
@@ -286,18 +303,18 @@ def normalize_out_rows(rows):
     acc = {}
     for r in rows:
         team_base, sid = normalize_team_and_sid(r.get("team", ""), r.get("service_id", ""))
-        samples = int(r.get("samples_24h", 0) or 0)
+        samples = int(r.get("samples_72h", 0) or 0)
 
         if team_base not in acc:
             acc[team_base] = {
                 "team": team_base,
                 "service_id": sid,
-                "samples_24h": samples,
-                "extrapolation": samples * EXTRAPOLATION_DAYS,
+                "samples_72h": samples,
+                "extrapolation": int(round((samples / WINDOW_DAYS) * EXTRAPOLATION_DAYS)) if WINDOW_DAYS else 0,
             }
         else:
-            acc[team_base]["samples_24h"] += samples
-            acc[team_base]["extrapolation"] += samples * EXTRAPOLATION_DAYS
+            acc[team_base]["samples_72h"] += samples
+            acc[team_base]["extrapolation"] += int(round((samples / WINDOW_DAYS) * EXTRAPOLATION_DAYS)) if WINDOW_DAYS else 0
             acc[team_base]["service_id"] = pick_better_sid(acc[team_base]["service_id"], sid)
 
     return list(acc.values())
@@ -306,10 +323,20 @@ def normalize_out_rows(rows):
 def enrich_with_sd_and_bk(rows, sd_df: pd.DataFrame, bk_map: dict) -> pd.DataFrame:
     df = pd.DataFrame(rows)
     if df.empty:
-        return pd.DataFrame(columns=[
-            "team", "service_id", "code", "service_name", "owner_for_report",
-            "business_type", "samples_24h", "эксрополяция"
-        ])
+        return pd.DataFrame(
+            columns=[
+                "team",
+                "service_id",
+                "code",
+                "service_name",
+                "owner_for_report",
+                "business_type",
+                "samples_72h",
+                "эксрополяция",
+                "sd_found",
+                "bk_found",
+            ]
+        )
 
     df["service_id"] = df["service_id"].astype(str).fillna("").map(lambda x: x.strip())
     df["code"] = df["service_id"].str.extract(r"(\d+)", expand=False).fillna("")
@@ -317,20 +344,33 @@ def enrich_with_sd_and_bk(rows, sd_df: pd.DataFrame, bk_map: dict) -> pd.DataFra
 
     out = df.merge(sd_df, left_on="code", right_on="code", how="left")
 
+    out["sd_found"] = out["sd_name"].fillna("").astype(str).map(lambda x: x.strip() != "")
     out["service_name"] = out["sd_name"].fillna("").astype(str)
     out.loc[out["service_name"] == "", "service_name"] = out["team"]
 
-    out["owner_for_report"] = out["owner"].fillna("").astype(str)
+    out["owner_for_report"] = out["owner"].fillna("").astype(str).map(clean_spaces)
 
     def _bt(owner: str) -> str:
         owner = clean_spaces(owner)
         return bk_map.get(normalize_name_key(owner), "") if owner else ""
 
     out["business_type"] = out["owner_for_report"].map(_bt).map(clean_spaces)
+    out["bk_found"] = out["business_type"].map(lambda x: x.strip() != "")
 
     out = out.rename(columns={"extrapolation": "эксрополяция"})
     return out[
-        ["team", "service_id", "code", "service_name", "owner_for_report", "business_type", "samples_24h", "эксрополяция"]
+        [
+            "team",
+            "service_id",
+            "code",
+            "service_name",
+            "owner_for_report",
+            "business_type",
+            "samples_72h",
+            "эксрополяция",
+            "sd_found",
+            "bk_found",
+        ]
     ]
 
 
@@ -360,7 +400,7 @@ def dedupe_and_add_percent(df: pd.DataFrame) -> pd.DataFrame:
                 "Тип бизнеса": _first_non_empty,
                 "Наименование сервиса": _first_non_empty,
                 "Владелец сервиса": _first_non_empty,
-                "samples_24h": "sum",
+                "samples_72h": "sum",
                 "эксрополяция": "sum",
             }
         )
@@ -371,7 +411,7 @@ def dedupe_and_add_percent(df: pd.DataFrame) -> pd.DataFrame:
                 "Тип бизнеса": _first_non_empty,
                 "КОД": _first_non_empty,
                 "Владелец сервиса": _first_non_empty,
-                "samples_24h": "sum",
+                "samples_72h": "sum",
                 "эксрополяция": "sum",
             }
         )
@@ -381,15 +421,15 @@ def dedupe_and_add_percent(df: pd.DataFrame) -> pd.DataFrame:
                 "Наименование сервиса",
                 "КОД",
                 "Владелец сервиса",
-                "samples_24h",
+                "samples_72h",
                 "эксрополяция",
             ]
         ]
 
     out = pd.concat([has_code, no_code], ignore_index=True)
 
-    total = float(out["samples_24h"].sum()) if "samples_24h" in out.columns else 0.0
-    out["% от общего числа"] = (out["samples_24h"] / total * 100.0) if total else 0.0
+    total = float(out["samples_72h"].sum()) if "samples_72h" in out.columns else 0.0
+    out["% от общего числа"] = (out["samples_72h"] / total * 100.0) if total else 0.0
     out["% от общего числа"] = out["% от общего числа"].round(5)
 
     return out.reindex(columns=REPORT_COLS)
@@ -397,13 +437,13 @@ def dedupe_and_add_percent(df: pd.DataFrame) -> pd.DataFrame:
 
 def write_report(df_report: pd.DataFrame, df_unacc: pd.DataFrame):
     wb = Workbook()
+    bold = Font(bold=True)
 
     ws = wb.active
-    ws.title = "samples_24h"
+    ws.title = "samples_72h"
 
     df_report = df_report.reindex(columns=REPORT_COLS)
     ws.append(list(df_report.columns))
-    bold = Font(bold=True)
     for c in ws[1]:
         c.font = bold
 
@@ -438,6 +478,7 @@ def main():
         sys.exit(1)
 
     log.info("VM_URL=%s", vm_url)
+    log.info("WINDOW_HOURS=%s", WINDOW_HOURS)
     log.info("EXCLUDE_NO_SERVICE_ID_AT_QUERY=%s", EXCLUDE_NO_SERVICE_ID_AT_QUERY)
     log.info("EXTRAPOLATION_DAYS=%s", EXTRAPOLATION_DAYS)
     log.info("BAN_SERVICE_IDS=%s", sorted(ban_service_set) if ban_service_set else "[]")
@@ -448,49 +489,32 @@ def main():
     bk_map = load_bk_business_type_map(BK_FILE)
 
     log.info("Собираю группы (team / service_id)...")
-    groups = discover_groups(vm_url)
+    groups, unacc = discover_groups(vm_url)
     log.info(f"Групп найдено: {len(groups)}")
 
     end_dt = datetime.now(timezone.utc)
 
-    out_rows = []
-    unacc = []
-
-    def add_unacc(team, service_id, reason, detail, samples_24h=0):
+    def add_unacc(team, service_id, reason, detail, stage="calc/enrich"):
         team_base, sid_norm = normalize_team_and_sid(team, service_id)
         unacc.append(
             {
+                "stage": stage,
                 "team": team_base,
                 "service_id": sid_norm,
-                "samples_24h": int(samples_24h or 0),
                 "reason": reason,
                 "detail": detail,
             }
         )
 
+    out_rows = []
     for team, service_id in groups:
-        if is_banned_team(team):
-            add_unacc(team, service_id, "banned_team", "team in BAN_TEAMS")
-            continue
-
-        if service_id and service_id in ban_service_set:
-            add_unacc(team, service_id, "banned_service_id", "service_id in BAN_SERVICE_IDS")
-            continue
-
-        if EXCLUDE_NO_SERVICE_ID_AT_QUERY and not service_id:
-            add_unacc(team, service_id, "excluded_no_service_id", "EXCLUDE_NO_SERVICE_ID_AT_QUERY=True and service_id empty")
-            continue
-
-        log.info(
-            "[GROUP] "
-            + (f"team={team} service_id={service_id}" if (team or service_id) else "UNLABELED")
-        )
+        log.info("[GROUP] " + (f"team={team} service_id={service_id}" if (team or service_id) else "UNLABELED"))
 
         try:
             metric_names = get_group_metric_names(vm_url, team, service_id)
         except Exception as e:
             log.error(f"Не смог получить метрики для группы team={team} service_id={service_id}: {e}")
-            add_unacc(team, service_id, "metric_names_failed", str(e))
+            add_unacc(team, service_id, "metric_names_failed", str(e), stage="metric_names")
             continue
 
         time.sleep(SLEEP_SEC)
@@ -499,7 +523,7 @@ def main():
         for i, mn in enumerate(metric_names, 1):
             log.info(f"  metric[{i}/{len(metric_names)}]={mn}")
             try:
-                s = samples_24h_for_metric_in_group(vm_url, mn, team, service_id, end_dt)
+                s = samples_72h_for_metric_in_group(vm_url, mn, team, service_id, end_dt)
                 group_total += s
             except requests.exceptions.HTTPError as e:
                 log.error(f"  HTTP error metric={mn} team={team} service_id={service_id}: {e}")
@@ -507,7 +531,7 @@ def main():
                 log.error(f"  Ошибка metric={mn} team={team} service_id={service_id}: {e}")
             time.sleep(SLEEP_SEC)
 
-        out_rows.append({"team": team, "service_id": service_id, "samples_24h": group_total})
+        out_rows.append({"team": team, "service_id": service_id, "samples_72h": group_total})
 
     out_rows = normalize_out_rows(out_rows)
 
@@ -517,22 +541,69 @@ def main():
     else:
         accounted = enriched.copy()
 
-        # бизнес тип фильтры => в unaccounted
+        # маппинг в SD
+        m_sd_missing = (accounted["code"].fillna("").astype(str).str.strip() != "") & (~accounted["sd_found"])
+        if m_sd_missing.any():
+            for r in accounted[m_sd_missing].to_dict("records"):
+                add_unacc(
+                    r.get("team", ""),
+                    r.get("service_id", ""),
+                    "sd_not_found",
+                    "code extracted but not found in SD",
+                    stage="enrich",
+                )
+
+        # owner пустой после SD
+        m_owner_empty = accounted["owner_for_report"].map(clean_spaces) == ""
+        if m_owner_empty.any():
+            for r in accounted[m_owner_empty].to_dict("records"):
+                add_unacc(
+                    r.get("team", ""),
+                    r.get("service_id", ""),
+                    "owner_empty_in_sd",
+                    "owner empty after SD merge (no SD match or owner empty in SD)",
+                    stage="enrich",
+                )
+
+        # BK не нашёл business_type
+        m_bk_missing = (~m_owner_empty) & (accounted["business_type"].map(clean_spaces) == "")
+        if m_bk_missing.any():
+            for r in accounted[m_bk_missing].to_dict("records"):
+                add_unacc(
+                    r.get("team", ""),
+                    r.get("service_id", ""),
+                    "owner_not_in_bk",
+                    "owner present but business_type not found in BK",
+                    stage="enrich",
+                )
+
+        # фильтр по business_type => в unaccounted и убрать из отчёта
         if SKIP_EMPTY_BUSINESS_TYPE:
             m = accounted["business_type"].map(clean_spaces) == ""
             if m.any():
                 for r in accounted[m].to_dict("records"):
-                    add_unacc(r.get("team", ""), r.get("service_id", ""), "empty_business_type", "SKIP_EMPTY_BUSINESS_TYPE=True and business_type empty", samples_24h=r.get("samples_24h", 0))
+                    add_unacc(
+                        r.get("team", ""),
+                        r.get("service_id", ""),
+                        "empty_business_type",
+                        "SKIP_EMPTY_BUSINESS_TYPE=True and business_type empty",
+                        stage="filter",
+                    )
             accounted = accounted[~m].copy()
 
         if ban_business_set:
             m = accounted["business_type"].map(clean_spaces).isin(ban_business_set)
             if m.any():
                 for r in accounted[m].to_dict("records"):
-                    add_unacc(r.get("team", ""), r.get("service_id", ""), "banned_business_type", "business_type in BAN_BUSINESS_TYPES", samples_24h=r.get("samples_24h", 0))
+                    add_unacc(
+                        r.get("team", ""),
+                        r.get("service_id", ""),
+                        "banned_business_type",
+                        "business_type in BAN_BUSINESS_TYPES",
+                        stage="filter",
+                    )
             accounted = accounted[~m].copy()
 
-        # готовим формат под основной отчет
         df_for_report = accounted.rename(
             columns={
                 "business_type": "Тип бизнеса",
@@ -540,14 +611,15 @@ def main():
                 "service_id": "КОД",
                 "owner_for_report": "Владелец сервиса",
             }
-        )[["Тип бизнеса", "Наименование сервиса", "КОД", "Владелец сервиса", "samples_24h", "эксрополяция"]]
+        )[["Тип бизнеса", "Наименование сервиса", "КОД", "Владелец сервиса", "samples_72h", "эксрополяция"]]
 
         df_report = dedupe_and_add_percent(df_for_report)
-        df_report = df_report.sort_values(["samples_24h"], ascending=False).reset_index(drop=True)
+        df_report = df_report.sort_values(["samples_72h"], ascending=False).reset_index(drop=True)
 
     df_unacc = pd.DataFrame(unacc)
     if not df_unacc.empty:
-        df_unacc = df_unacc.sort_values(["reason", "samples_24h"], ascending=[True, False]).reset_index(drop=True)
+        df_unacc = df_unacc.drop_duplicates(subset=["stage", "team", "service_id", "reason", "detail"])
+        df_unacc = df_unacc.sort_values(["stage", "reason", "team"], ascending=[True, True, True]).reset_index(drop=True)
 
     log.info(f"Сохраняю отчет: {OUTPUT_FILE}")
     write_report(df_report, df_unacc)
