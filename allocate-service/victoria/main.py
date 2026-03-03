@@ -33,7 +33,7 @@ BAN_SERVICE_IDS = [15473]
 BAN_BUSINESS_TYPES = []
 
 TEAM_SERVICE_ID_OVERRIDES = {
-    # "sergice": "number",
+    # "DBOUL": "15473",
 }
 
 SKIP_EMPTY_BUSINESS_TYPE = True
@@ -53,7 +53,6 @@ REPORT_COLS = [
     "Наименование сервиса",
     "КОД",
     "Владелец сервиса",
-    "metric",
     "samples_72h",
     "эксрополяция",
     "% от общего числа",
@@ -87,16 +86,6 @@ def normalize_name_key(s: str) -> str:
     return clean_spaces(s).lower()
 
 
-def split_team_tail_id(team: str):
-    team = (team or "").strip()
-    m = TEAM_TAIL_ID_RE.match(team)
-    if not m:
-        return team, ""
-    base = m.group(1).strip()
-    tail_id = m.group(2)
-    return (base if base else team), tail_id
-
-
 def is_all_zeros(s: str) -> bool:
     s = (s or "").strip()
     return bool(s) and set(s) == {"0"}
@@ -109,6 +98,16 @@ def normalize_sid(sid: str) -> str:
     if is_all_zeros(sid):
         return ""
     return sid
+
+
+def split_team_tail_id(team: str):
+    team = (team or "").strip()
+    m = TEAM_TAIL_ID_RE.match(team)
+    if not m:
+        return team, ""
+    base = m.group(1).strip()
+    tail_id = m.group(2)
+    return (base if base else team), tail_id
 
 
 def sid_rank(sid: str) -> int:
@@ -308,8 +307,34 @@ def samples_72h_for_metric(vm_url: str, metric_name: str, team: str, service_id:
     return int(total)
 
 
-def enrich_metric_rows(metric_rows, sd_df: pd.DataFrame, bk_map: dict):
-    df = pd.DataFrame(metric_rows)
+def aggregate_to_group(metric_rows):
+    acc = {}
+    for r in metric_rows:
+        team_base, sid = normalize_team_and_sid(r.get("team", ""), r.get("service_id", ""))
+        samples = int(r.get("samples_72h", 0) or 0)
+
+        key = (team_base, sid)
+        if key not in acc:
+            acc[key] = {"team": team_base, "service_id": sid, "samples_72h": 0}
+        acc[key]["samples_72h"] += samples
+
+    out = []
+    for (_, _), v in acc.items():
+        s72 = int(v["samples_72h"])
+        extrap = int(round((s72 / WINDOW_DAYS) * EXTRAPOLATION_DAYS)) if WINDOW_DAYS else 0
+        out.append(
+            {
+                "team": v["team"],
+                "service_id": v["service_id"],
+                "samples_72h": s72,
+                "extrapolation": extrap,
+            }
+        )
+    return out
+
+
+def enrich_group_rows(group_rows, sd_df: pd.DataFrame, bk_map: dict):
+    df = pd.DataFrame(group_rows)
     if df.empty:
         return pd.DataFrame(
             columns=[
@@ -319,7 +344,6 @@ def enrich_metric_rows(metric_rows, sd_df: pd.DataFrame, bk_map: dict):
                 "service_name",
                 "owner_for_report",
                 "business_type",
-                "metric",
                 "samples_72h",
                 "эксрополяция",
                 "sd_found",
@@ -346,10 +370,9 @@ def enrich_metric_rows(metric_rows, sd_df: pd.DataFrame, bk_map: dict):
     out["business_type"] = out["owner_for_report"].map(_bt).map(clean_spaces)
     out["bk_found"] = out["business_type"].map(lambda x: x.strip() != "")
 
+    out = out.rename(columns={"extrapolation": "эксрополяция"})
     out["samples_72h"] = out["samples_72h"].fillna(0).astype(int)
-    out["эксрополяция"] = out["samples_72h"].map(
-        lambda s72: int(round((float(s72 or 0) / WINDOW_DAYS) * EXTRAPOLATION_DAYS)) if WINDOW_DAYS else 0
-    )
+    out["эксрополяция"] = out["эксрополяция"].fillna(0).astype(int)
 
     return out[
         [
@@ -359,13 +382,66 @@ def enrich_metric_rows(metric_rows, sd_df: pd.DataFrame, bk_map: dict):
             "service_name",
             "owner_for_report",
             "business_type",
-            "metric",
             "samples_72h",
             "эксрополяция",
             "sd_found",
             "bk_found",
         ]
     ]
+
+
+def _first_non_empty(vals):
+    for v in vals:
+        s = "" if v is None else str(v).strip()
+        if s:
+            return s
+    return ""
+
+
+def dedupe_and_add_percent(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        out = df.copy()
+        out["% от общего числа"] = []
+        return out.reindex(columns=REPORT_COLS)
+
+    df = df.copy()
+    df["КОД"] = df["КОД"].fillna("").astype(str).map(lambda x: normalize_sid(x))
+
+    has_code = df[df["КОД"] != ""].copy()
+    no_code = df[df["КОД"] == ""].copy()
+
+    if not has_code.empty:
+        has_code = has_code.groupby("КОД", as_index=False).agg(
+            {
+                "Тип бизнеса": _first_non_empty,
+                "Наименование сервиса": _first_non_empty,
+                "Владелец сервиса": _first_non_empty,
+                "samples_72h": "sum",
+                "эксрополяция": "sum",
+            }
+        )
+
+    if not no_code.empty:
+        no_code = no_code.groupby("Наименование сервиса", as_index=False).agg(
+            {
+                "Тип бизнеса": _first_non_empty,
+                "КОД": _first_non_empty,
+                "Владелец сервиса": _first_non_empty,
+                "samples_72h": "sum",
+                "эксрополяция": "sum",
+            }
+        )
+        no_code = no_code[
+            ["Тип бизнеса", "Наименование сервиса", "КОД", "Владелец сервиса", "samples_72h", "эксрополяция"]
+        ]
+
+    out = pd.concat([has_code, no_code], ignore_index=True)
+
+    total = float(out["samples_72h"].sum()) if "samples_72h" in out.columns else 0.0
+    out["% от общего числа"] = (out["samples_72h"] / total * 100.0) if total else 0.0
+    out["% от общего числа"] = out["% от общего числа"].round(5)
+
+    return out.reindex(columns=REPORT_COLS)
 
 
 def write_report(df_report: pd.DataFrame, df_unacc: pd.DataFrame):
@@ -453,6 +529,10 @@ def main():
     log.info("Ambiguous teams: %d", len(ambiguous_teams))
     log.info("Overrides: %d", len(overrides))
 
+    per_group_metrics = defaultdict(set)
+    for team, sid, mn in metric_keys:
+        per_group_metrics[(team, normalize_sid(sid))].add(mn)
+
     end_dt = datetime.now(timezone.utc)
 
     metric_samples_rows = []
@@ -463,6 +543,7 @@ def main():
         ov = overrides.get(team)
         if ov:
             service_id = ov
+            per_group_metrics[(team, service_id)].add(metric)
         elif not service_id:
             if team in ambiguous_teams:
                 add_unacc_once("infer", team, "", metric, "ambiguous_service_id", "multiple service_id detected for team")
@@ -470,6 +551,7 @@ def main():
             inferred_sid = team_to_sid_map.get(team)
             if inferred_sid:
                 service_id = inferred_sid
+                per_group_metrics[(team, service_id)].add(metric)
 
         key = (team, service_id, metric)
         if key in unacc_map:
@@ -478,41 +560,76 @@ def main():
         log.info(f"[{idx}/{len(metric_keys)}] team={team} service_id={service_id} metric={metric}")
         try:
             s = samples_72h_for_metric(vm_url, metric, team, service_id, end_dt)
-            metric_samples_rows.append({"team": team, "service_id": service_id, "metric": metric, "samples_72h": s})
+            metric_samples_rows.append({"team": team, "service_id": service_id, "samples_72h": s})
         except Exception as e:
             add_unacc_once("samples", team, service_id, metric, "samples_failed", str(e))
 
         time.sleep(SLEEP_SEC)
 
-    enriched = enrich_metric_rows(metric_samples_rows, sd_df, bk_map)
+    group_rows = aggregate_to_group(metric_samples_rows)
+    enriched = enrich_group_rows(group_rows, sd_df, bk_map)
 
     if enriched.empty:
         df_report = pd.DataFrame(columns=REPORT_COLS)
     else:
         accounted = enriched.copy()
 
+        def mark_group_metrics_once(team, sid, stage, reason, detail):
+            for mn in sorted(per_group_metrics.get((team, normalize_sid(sid)), set())):
+                add_unacc_once(stage, team, normalize_sid(sid), mn, reason, detail)
+
         m_sd_missing = (accounted["code"].fillna("").astype(str).str.strip() != "") & (~accounted["sd_found"])
         for r in accounted[m_sd_missing].to_dict("records"):
-            add_unacc_once("enrich", r.get("team", ""), r.get("service_id", ""), r.get("metric", ""), "sd_not_found", "code extracted but not found in SD")
+            mark_group_metrics_once(
+                r.get("team", ""),
+                r.get("service_id", ""),
+                "enrich",
+                "sd_not_found",
+                "code extracted but not found in SD",
+            )
 
         m_owner_empty = accounted["owner_for_report"].map(clean_spaces) == ""
         for r in accounted[m_owner_empty].to_dict("records"):
-            add_unacc_once("enrich", r.get("team", ""), r.get("service_id", ""), r.get("metric", ""), "owner_empty_in_sd", "owner empty after SD merge (no SD match or owner empty in SD)")
+            mark_group_metrics_once(
+                r.get("team", ""),
+                r.get("service_id", ""),
+                "enrich",
+                "owner_empty_in_sd",
+                "owner empty after SD merge (no SD match or owner empty in SD)",
+            )
 
         m_bk_missing = (~m_owner_empty) & (accounted["business_type"].map(clean_spaces) == "")
         for r in accounted[m_bk_missing].to_dict("records"):
-            add_unacc_once("enrich", r.get("team", ""), r.get("service_id", ""), r.get("metric", ""), "owner_not_in_bk", "owner present but business_type not found in BK")
+            mark_group_metrics_once(
+                r.get("team", ""),
+                r.get("service_id", ""),
+                "enrich",
+                "owner_not_in_bk",
+                "owner present but business_type not found in BK",
+            )
 
         if SKIP_EMPTY_BUSINESS_TYPE:
             m = accounted["business_type"].map(clean_spaces) == ""
             for r in accounted[m].to_dict("records"):
-                add_unacc_once("filter", r.get("team", ""), r.get("service_id", ""), r.get("metric", ""), "empty_business_type", "SKIP_EMPTY_BUSINESS_TYPE=True and business_type empty")
+                mark_group_metrics_once(
+                    r.get("team", ""),
+                    r.get("service_id", ""),
+                    "filter",
+                    "empty_business_type",
+                    "SKIP_EMPTY_BUSINESS_TYPE=True and business_type empty",
+                )
             accounted = accounted[~m].copy()
 
         if ban_business_set:
             m = accounted["business_type"].map(clean_spaces).isin(ban_business_set)
             for r in accounted[m].to_dict("records"):
-                add_unacc_once("filter", r.get("team", ""), r.get("service_id", ""), r.get("metric", ""), "banned_business_type", "business_type in BAN_BUSINESS_TYPES")
+                mark_group_metrics_once(
+                    r.get("team", ""),
+                    r.get("service_id", ""),
+                    "filter",
+                    "banned_business_type",
+                    "business_type in BAN_BUSINESS_TYPES",
+                )
             accounted = accounted[~m].copy()
 
         df_for_report = accounted.rename(
@@ -521,16 +638,10 @@ def main():
                 "service_name": "Наименование сервиса",
                 "service_id": "КОД",
                 "owner_for_report": "Владелец сервиса",
-                "metric": "metric",
-                "samples_72h": "samples_72h",
             }
-        )[["Тип бизнеса", "Наименование сервиса", "КОД", "Владелец сервиса", "metric", "samples_72h", "эксрополяция"]]
+        )[["Тип бизнеса", "Наименование сервиса", "КОД", "Владелец сервиса", "samples_72h", "эксрополяция"]]
 
-        total = float(df_for_report["samples_72h"].sum()) if not df_for_report.empty else 0.0
-        df_for_report["% от общего числа"] = (df_for_report["samples_72h"] / total * 100.0) if total else 0.0
-        df_for_report["% от общего числа"] = df_for_report["% от общего числа"].round(5)
-
-        df_report = df_for_report.reindex(columns=REPORT_COLS)
+        df_report = dedupe_and_add_percent(df_for_report)
         df_report = df_report.sort_values(["samples_72h"], ascending=False).reset_index(drop=True)
 
     df_unacc = pd.DataFrame(list(unacc_map.values()))
