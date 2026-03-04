@@ -23,7 +23,7 @@ OUT_XLSX = os.getenv("OUT_XLSX", "gitlab_report.xlsx")
 SSL_VERIFY = False
 SLEEP_SEC = 0.02
 LOG_EVERY = 100
-LIMIT = 0  # 0 = без лимита
+LIMIT = 0
 
 BAN_SERVICE_IDS = {
     # "15473",
@@ -92,7 +92,6 @@ def main():
     out_path = str(Path(OUT_XLSX).resolve())
     wb = Workbook()
 
-    # Лист 1 — агрегация
     ws_sum = wb.active
     ws_sum.title = "ByServiceId"
 
@@ -100,8 +99,11 @@ def main():
         [
             "service_id",
             "projects_count",
+            "repo_size_b_sum",
             "repo_size_h_sum",
+            "job_artifacts_b_sum",
             "job_artifacts_h_sum",
+            "total_b_sum",
             "total_h_sum",
             "percent_of_all_total",
         ]
@@ -109,15 +111,17 @@ def main():
     for c in ws_sum[1]:
         c.font = Font(bold=True)
 
-    # Лист 2 — не сматчилось
     ws_unmapped = wb.create_sheet("Unmapped")
     ws_unmapped.append(
         [
             "project_id",
             "project",
             "web_url",
+            "repo_size_b",
             "repo_size_h",
+            "job_artifacts_b",
             "job_artifacts_h",
+            "total_b",
             "total_h",
         ]
     )
@@ -176,10 +180,11 @@ def main():
                         proj_id,
                         name,
                         web_url,
+                        repo_bytes,
                         humanize.naturalsize(repo_bytes, binary=True),
-                        humanize.naturalsize(job_bytes, binary=True)
-                        if job_bytes
-                        else "",
+                        job_bytes,
+                        humanize.naturalsize(job_bytes, binary=True) if job_bytes else "",
+                        total_bytes,
                         humanize.naturalsize(total_bytes, binary=True),
                     ]
                 )
@@ -207,8 +212,11 @@ def main():
             [
                 service_id,
                 agg[service_id]["projects"],
+                repo_b,
                 humanize.naturalsize(repo_b, binary=True),
+                job_b,
                 humanize.naturalsize(job_b, binary=True) if job_b else "",
+                total_b,
                 humanize.naturalsize(total_b, binary=True),
                 round(pct(total_b, total_all), 4),
             ]
