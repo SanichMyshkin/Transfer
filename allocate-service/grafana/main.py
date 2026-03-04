@@ -28,16 +28,13 @@ SLEEP_BETWEEN_CALLS = 0.2
 INCLUDE_ALL_ZERO_NUMBERS = False
 
 BAN_SERVICE_IDS = [15473]
-
 BAN_BUSINESS_TYPES = []
 
 SKIP_EMPTY_BUSINESS_TYPE = True
 
 logger = logging.getLogger("grafana_usage_report")
 logger.setLevel(logging.INFO)
-fmt = logging.Formatter(
-    "%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S"
-)
+fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S")
 handler = logging.StreamHandler()
 handler.setFormatter(fmt)
 logger.handlers.clear()
@@ -253,9 +250,7 @@ def load_bk_business_type_map(path: str):
     df.columns = ["c1", "c2", "c3", "business_type"]
 
     def make_fio(r):
-        fio = " ".join(
-            [clean_spaces(r["c2"]), clean_spaces(r["c1"]), clean_spaces(r["c3"])]
-        )
+        fio = " ".join([clean_spaces(r["c2"]), clean_spaces(r["c1"]), clean_spaces(r["c3"])])
         return clean_spaces(fio)
 
     df["fio_key"] = df.apply(make_fio, axis=1).map(normalize_name_key)
@@ -288,10 +283,29 @@ def load_sd_mapping(path):
         if sd_name:
             map_by_name[normalize_name(sd_name)] = payload
 
-    logger.info(
-        f"SD: загружено сервисов по номеру={len(map_by_number)}, по имени={len(map_by_name)}"
-    )
+    logger.info(f"SD: загружено сервисов по номеру={len(map_by_number)}, по имени={len(map_by_name)}")
     return map_by_number, map_by_name
+
+
+def compute_panels_for_org(org_id):
+    if not switch_org(org_id):
+        return None
+
+    panels_total = 0
+
+    folders = get_folders()
+    for f in folders:
+        folder_uid = f.get("uid")
+        if not folder_uid:
+            continue
+        dashboards = get_dashboards_in_folder(folder_uid)
+        for d in dashboards:
+            panels_total += get_dashboard_panels(d["uid"])
+
+    for d in get_root_dashboards():
+        panels_total += get_dashboard_panels(d["uid"])
+
+    return panels_total
 
 
 def main():
@@ -322,20 +336,22 @@ def main():
         sd_name="",
         owner="",
         business_type="",
+        panels_total=None,
     ):
-        unaccounted_orgs.append(
-            {
-                "org_id": org_id,
-                "org_name_raw": raw_org_name,
-                "org_name": org_name,
-                "org_number": org_number,
-                "reason": reason,
-                "detail": detail,
-                "sd_name": sd_name,
-                "owner": owner,
-                "business_type": business_type,
-            }
-        )
+        rec = {
+            "org_id": org_id,
+            "org_name_raw": raw_org_name,
+            "org_name": org_name,
+            "org_number": org_number,
+            "reason": reason,
+            "detail": detail,
+            "sd_name": sd_name,
+            "owner": owner,
+            "business_type": business_type,
+            "Кол-во панелей": panels_total,
+        }
+        unaccounted_orgs.append(rec)
+        return rec
 
     for org_id in org_ids:
         raw_org_name = get_org_name(org_id)
@@ -348,7 +364,11 @@ def main():
 
         if is_zero and not INCLUDE_ALL_ZERO_NUMBERS:
             skipped_zero += 1
-            logger.info(f'ORG {org_id}: "{org_name}" ({org_number}) — skip (нули)')
+            panels_total = compute_panels_for_org(org_id)
+            logger.info(
+                f'ORG {org_id}: "{org_name}" ({org_number}) — unaccounted (нули) | '
+                f"панелей={panels_total if panels_total is not None else 'NO ACCESS'}"
+            )
             add_unaccounted(
                 org_id,
                 raw_org_name,
@@ -356,12 +376,17 @@ def main():
                 org_number,
                 reason="skip_zero_number",
                 detail="org number is all zeros and INCLUDE_ALL_ZERO_NUMBERS=False",
+                panels_total=panels_total,
             )
             continue
 
         if (not is_zero) and norm_number and norm_number in ban_set:
             skipped_ban += 1
-            logger.info(f'ORG {org_id}: "{org_name}" ({org_number}) — skip (бан)')
+            panels_total = compute_panels_for_org(org_id)
+            logger.info(
+                f'ORG {org_id}: "{org_name}" ({org_number}) — unaccounted (бан) | '
+                f"панелей={panels_total if panels_total is not None else 'NO ACCESS'}"
+            )
             add_unaccounted(
                 org_id,
                 raw_org_name,
@@ -369,12 +394,15 @@ def main():
                 org_number,
                 reason="banned_service_id",
                 detail="org number in BAN_SERVICE_IDS",
+                panels_total=panels_total,
             )
             continue
 
         sd_name = ""
         owner = ""
         business_type = ""
+
+        sd_miss_rec = None
 
         if not is_zero:
             sd = None
@@ -385,13 +413,11 @@ def main():
 
             sd_name = (sd or {}).get("sd_name") or ""
             owner = (sd or {}).get("owner") or ""
-            business_type = (
-                bk_type_map.get(normalize_name_key(owner), "") if owner else ""
-            )
+            business_type = bk_type_map.get(normalize_name_key(owner), "") if owner else ""
 
             if not sd_name and not owner:
                 skipped_sd_miss += 1
-                add_unaccounted(
+                sd_miss_rec = add_unaccounted(
                     org_id,
                     raw_org_name,
                     org_name,
@@ -401,10 +427,12 @@ def main():
                     sd_name=sd_name,
                     owner=owner,
                     business_type=business_type,
+                    panels_total=None,
                 )
 
             if SKIP_EMPTY_BUSINESS_TYPE and not clean_spaces(business_type):
                 skipped_empty_bt += 1
+                panels_total = compute_panels_for_org(org_id)
                 add_unaccounted(
                     org_id,
                     raw_org_name,
@@ -415,14 +443,13 @@ def main():
                     sd_name=sd_name,
                     owner=owner,
                     business_type=business_type,
+                    panels_total=panels_total,
                 )
                 continue
 
-            if (
-                ban_business_types_set
-                and clean_spaces(business_type) in ban_business_types_set
-            ):
+            if ban_business_types_set and clean_spaces(business_type) in ban_business_types_set:
                 skipped_ban_bt += 1
+                panels_total = compute_panels_for_org(org_id)
                 add_unaccounted(
                     org_id,
                     raw_org_name,
@@ -433,6 +460,7 @@ def main():
                     sd_name=sd_name,
                     owner=owner,
                     business_type=business_type,
+                    panels_total=panels_total,
                 )
                 continue
 
@@ -456,6 +484,7 @@ def main():
                 sd_name=sd_name,
                 owner=owner,
                 business_type=business_type,
+                panels_total=None,
             )
             continue
 
@@ -472,6 +501,9 @@ def main():
 
         for d in get_root_dashboards():
             panels_total += get_dashboard_panels(d["uid"])
+
+        if sd_miss_rec is not None:
+            sd_miss_rec["Кол-во панелей"] = panels_total
 
         logger.info(
             f'ORG {org_id}: "{org_name}" ({org_number}) | '
@@ -492,9 +524,7 @@ def main():
             }
         )
 
-    total_panels = sum(
-        r["Кол-во панелей"] for r in rows_orgs if isinstance(r["Кол-во панелей"], int)
-    )
+    total_panels = sum(r["Кол-во панелей"] for r in rows_orgs if isinstance(r["Кол-во панелей"], int))
 
     logger.info(
         f"Итог: панелей={total_panels}, skip_zero={skipped_zero}, "
