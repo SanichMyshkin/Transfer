@@ -1,4 +1,3 @@
-# main.py
 import os
 import logging
 import urllib3
@@ -39,7 +38,6 @@ BAN_SERVICES = [
 BAN_BUSINESS_TYPES = []
 
 SKIP_EMPTY_BUSINESS_TYPE = True
-
 EXCLUDE_ZERO_CODES = True
 
 CPU_WEIGHT = 0.40
@@ -138,8 +136,7 @@ def get_file_text(proj, file_path: str, ref: str) -> str:
 def find_deployment_files(proj):
     try:
         root = repo_tree(proj)
-    except Exception as e:
-        log.warning(f"[{proj.path_with_namespace}] repository_tree error: {e}")
+    except Exception:
         return []
 
     zeus_dir = next(
@@ -152,18 +149,14 @@ def find_deployment_files(proj):
     try:
         zeus_items = repo_tree(proj, zeus_dir["path"])
         subfolders = [i for i in zeus_items if i["type"] == "tree"]
-    except Exception as e:
-        log.warning(
-            f"[{proj.path_with_namespace}] Не смог прочитать zeus-* дерево: {e}"
-        )
+    except Exception:
         return []
 
     files = []
     for sub in subfolders:
         try:
             sub_items = repo_tree(proj, sub["path"])
-        except Exception as e:
-            log.warning(f"[{proj.path_with_namespace}] tree({sub['path']}) error: {e}")
+        except Exception:
             continue
 
         for f in sub_items:
@@ -212,9 +205,8 @@ def parse_mem_to_bytes(v):
     }
     for u, mul in units.items():
         if s.endswith(u):
-            num = s[: -len(u)].strip()
             try:
-                return int(float(num) * mul)
+                return int(float(s[: -len(u)]) * mul)
             except Exception:
                 return 0
     try:
@@ -227,11 +219,10 @@ def bytes_to_mib(b: int) -> float:
     return float(b) / (1024.0**2)
 
 
-def parse_deployment_limits(text: str, project_name: str, file_path: str):
+def parse_deployment_limits(text: str):
     try:
         docs = list(yaml.safe_load_all(text))
-    except Exception as e:
-        log.warning(f"[{project_name}] YAML не распарсился: {file_path} ({e})")
+    except Exception:
         return 0.0, 0
 
     cpu_sum = 0.0
@@ -240,20 +231,19 @@ def parse_deployment_limits(text: str, project_name: str, file_path: str):
     for doc in docs:
         if not isinstance(doc, dict):
             continue
-        if (doc.get("kind") or "").strip() != "Deployment":
+        if (doc.get("kind") or "") != "Deployment":
             continue
 
-        spec = doc.get("spec") or {}
-        tmpl = (spec.get("template") or {}).get("spec") or {}
-        containers = tmpl.get("containers") or []
-        if not isinstance(containers, list):
-            continue
+        containers = (
+            doc.get("spec", {})
+            .get("template", {})
+            .get("spec", {})
+            .get("containers", [])
+        )
 
         for c in containers:
-            if not isinstance(c, dict):
-                continue
-            res = c.get("resources") or {}
-            lim = res.get("limits") or {}
+            res = c.get("resources", {})
+            lim = res.get("limits", {})
 
             cpu_sum += parse_cpu_to_cores(lim.get("cpu"))
             mem_sum += parse_mem_to_bytes(lim.get("memory"))
@@ -262,17 +252,14 @@ def parse_deployment_limits(text: str, project_name: str, file_path: str):
 
 
 def split_service_and_code(project_name: str):
-    name = (project_name or "").strip()
-    m = re.match(r"^(.*?)-(\d+)$", name)
+    m = re.match(r"^(.*?)-(\d+)$", project_name or "")
     if not m:
-        return name, ""
+        return project_name, ""
     return m.group(1), m.group(2)
 
 
-def is_zero_code(code: str) -> bool:
-    if not code:
-        return False
-    return set(code) == {"0"}
+def is_zero_code(code: str):
+    return code and set(code) == {"0"}
 
 
 def collect_rows(gl, projects, sd_people_map, bk_type_map):
@@ -280,72 +267,10 @@ def collect_rows(gl, projects, sd_people_map, bk_type_map):
     totals = {}
     unaccounted = []
 
-    def add_unacc(project, code, reason, detail):
-        unaccounted.append(
-            {
-                "project_id": getattr(project, "id", ""),
-                "project": getattr(project, "name", ""),
-                "path_with_namespace": getattr(project, "path_with_namespace", ""),
-                "service_guess": split_service_and_code(getattr(project, "name", ""))[0],
-                "code": code or "",
-                "reason": reason,
-                "detail": detail or "",
-            }
-        )
-
     for p in projects:
-        try:
-            proj = gl.projects.get(p.id)
-        except Exception as e:
-            log.warning(f"[{p.name}] Не смог получить project объект: {e}")
-            add_unacc(p, "", "project_get_failed", str(e))
-            continue
-
-        service_from_git, code = split_service_and_code(p.name)
-
-        if not code:
-            add_unacc(p, "", "no_code_in_project_name", "project name does not match r'^(.*?)-(\\d+)$'")
-            continue
-
-        if EXCLUDE_ZERO_CODES and is_zero_code(code):
-            log.info(f"[{p.name}] SKIP (code is all zeros)")
-            add_unacc(p, code, "zero_code", "EXCLUDE_ZERO_CODES=True and code is all zeros")
-            continue
-
-        sd = sd_people_map.get(code, {}) if code else {}
-        service_from_sd = clean_spaces(sd.get("service_name", "")) if sd else ""
-        service_for_report = service_from_sd or service_from_git
-
-        if service_for_report in BAN_SERVICES:
-            log.info(f"[{p.name}] SKIP (ban service): service='{service_for_report}'")
-            add_unacc(p, code, "banned_service", f"service='{service_for_report}' in BAN_SERVICES")
-            continue
-
-        owner = sd.get("owner", "") if isinstance(sd, dict) else ""
-        owner_for_report = clean_spaces(owner)
-        business_type = bk_type_map.get(normalize_name_key(owner), "") if owner else ""
-
-        if SKIP_EMPTY_BUSINESS_TYPE and not clean_spaces(business_type):
-            add_unacc(
-                p,
-                code,
-                "empty_business_type",
-                "SKIP_EMPTY_BUSINESS_TYPE=True and business_type empty (owner not found/empty)",
-            )
-            continue
-        if ban_business_set and clean_spaces(business_type) in ban_business_set:
-            add_unacc(
-                p,
-                code,
-                "banned_business_type",
-                f"business_type='{clean_spaces(business_type)}' in BAN_BUSINESS_TYPES",
-            )
-            continue
+        proj = gl.projects.get(p.id)
 
         files = find_deployment_files(proj)
-        log.info(
-            f"[p={p.name}] service='{service_for_report}' code='{code}' deployment_files={len(files)}"
-        )
 
         cpu_total = 0.0
         mem_total = 0
@@ -353,52 +278,93 @@ def collect_rows(gl, projects, sd_people_map, bk_type_map):
         for path in files:
             try:
                 raw = get_file_text(proj, path, GIT_REF)
-            except Exception as e:
-                log.warning(f"[{p.name}] Не смог прочитать {path} ({GIT_REF}): {e}")
+            except Exception:
                 continue
 
-            cpu, mem = parse_deployment_limits(raw, p.name, path)
+            cpu, mem = parse_deployment_limits(raw)
             cpu_total += cpu
             mem_total += mem
+
+        service_from_git, code = split_service_and_code(p.name)
+
+        def add_unacc(reason, detail):
+            unaccounted.append(
+                {
+                    "project_id": p.id,
+                    "project": p.name,
+                    "path_with_namespace": p.path_with_namespace,
+                    "service_guess": service_from_git,
+                    "code": code,
+                    "cpu_cores": cpu_total,
+                    "mem_mib": bytes_to_mib(mem_total),
+                    "deployment_files": len(files),
+                    "reason": reason,
+                    "detail": detail,
+                }
+            )
+
+        if not code:
+            add_unacc("no_code", "project name does not contain code")
+            continue
+
+        if EXCLUDE_ZERO_CODES and is_zero_code(code):
+            add_unacc("zero_code", "code consists of zeros")
+            continue
+
+        sd = sd_people_map.get(code, {})
+        service = clean_spaces(sd.get("service_name")) or service_from_git
+        owner = clean_spaces(sd.get("owner"))
+
+        if service in BAN_SERVICES:
+            add_unacc("banned_service", service)
+            continue
+
+        business_type = bk_type_map.get(normalize_name_key(owner), "") if owner else ""
+
+        if SKIP_EMPTY_BUSINESS_TYPE and not business_type:
+            add_unacc("empty_business_type", "")
+            continue
+
+        if ban_business_set and business_type in ban_business_set:
+            add_unacc("banned_business_type", business_type)
+            continue
 
         if cpu_total <= 0 and mem_total <= 0:
             continue
 
-        key = (service_for_report, code)
+        key = (service, code)
+
         if key not in totals:
             totals[key] = {
                 "cpu": 0.0,
                 "mem": 0,
-                "owner": owner_for_report,
+                "owner": owner,
                 "business_type": business_type,
             }
 
         totals[key]["cpu"] += cpu_total
         totals[key]["mem"] += mem_total
 
-        if not totals[key]["owner"] and owner_for_report:
-            totals[key]["owner"] = owner_for_report
-        if not totals[key]["business_type"] and business_type:
-            totals[key]["business_type"] = business_type
-
     total_cpu = sum(v["cpu"] for v in totals.values())
     total_mem = sum(v["mem"] for v in totals.values())
 
     rows = []
-    for (service_name, code), v in totals.items():
+
+    for (service, code), v in totals.items():
         cpu = v["cpu"]
         mem = v["mem"]
 
-        cpu_pct = (cpu / total_cpu * 100.0) if total_cpu > 0 else 0.0
-        mem_pct = (mem / total_mem * 100.0) if total_mem > 0 else 0.0
-        pct = (cpu_pct * CPU_WEIGHT) + (mem_pct * RAM_WEIGHT)
+        cpu_pct = (cpu / total_cpu * 100) if total_cpu else 0
+        mem_pct = (mem / total_mem * 100) if total_mem else 0
+
+        pct = cpu_pct * CPU_WEIGHT + mem_pct * RAM_WEIGHT
 
         rows.append(
             {
-                "business_type": v.get("business_type", ""),
-                "service": service_name,
+                "business_type": v["business_type"],
+                "service": service,
                 "code": code,
-                "owner": v.get("owner", ""),
+                "owner": v["owner"],
                 "cpu_cores": cpu,
                 "mem_mib": bytes_to_mib(mem),
                 "pct": pct,
@@ -406,16 +372,11 @@ def collect_rows(gl, projects, sd_people_map, bk_type_map):
         )
 
     rows.sort(key=lambda r: r["pct"], reverse=True)
-    unaccounted.sort(
-        key=lambda r: (
-            r.get("reason", ""),
-            str(r.get("project", "")),
-        )
-    )
+
     return rows, unaccounted
 
 
-def write_excel(rows, unaccounted_rows, out_file: str):
+def write_excel(rows, unaccounted_rows, out_file):
     wb = Workbook()
 
     ws = wb.active
@@ -431,12 +392,11 @@ def write_excel(rows, unaccounted_rows, out_file: str):
         "% потребления",
     ]
 
-    bold = Font(bold=True)
-    for col, h in enumerate(headers, start=1):
-        c = ws.cell(row=1, column=col, value=h)
-        c.font = bold
+    for i, h in enumerate(headers, 1):
+        c = ws.cell(1, i, h)
+        c.font = Font(bold=True)
 
-    for i, r in enumerate(rows, start=2):
+    for i, r in enumerate(rows, 2):
         ws.cell(i, 1, r["business_type"])
         ws.cell(i, 2, r["service"])
         ws.cell(i, 3, r["code"])
@@ -446,51 +406,48 @@ def write_excel(rows, unaccounted_rows, out_file: str):
         ws.cell(i, 7, round(r["pct"], 2))
 
     ws2 = wb.create_sheet("Unaccounted")
+
     headers2 = [
         "project_id",
         "project",
         "path_with_namespace",
         "service_guess",
         "code",
+        "CPU (cores)",
+        "RAM (MiB)",
+        "deployment_files",
         "reason",
         "detail",
     ]
-    for col, h in enumerate(headers2, start=1):
-        c = ws2.cell(row=1, column=col, value=h)
-        c.font = bold
 
-    for i, r in enumerate(unaccounted_rows, start=2):
-        ws2.cell(i, 1, r.get("project_id", ""))
-        ws2.cell(i, 2, r.get("project", ""))
-        ws2.cell(i, 3, r.get("path_with_namespace", ""))
-        ws2.cell(i, 4, r.get("service_guess", ""))
-        ws2.cell(i, 5, r.get("code", ""))
-        ws2.cell(i, 6, r.get("reason", ""))
-        ws2.cell(i, 7, r.get("detail", ""))
+    for i, h in enumerate(headers2, 1):
+        c = ws2.cell(1, i, h)
+        c.font = Font(bold=True)
+
+    for i, r in enumerate(unaccounted_rows, 2):
+        ws2.cell(i, 1, r["project_id"])
+        ws2.cell(i, 2, r["project"])
+        ws2.cell(i, 3, r["path_with_namespace"])
+        ws2.cell(i, 4, r["service_guess"])
+        ws2.cell(i, 5, r["code"])
+        ws2.cell(i, 6, round(r["cpu_cores"], 6))
+        ws2.cell(i, 7, round(r["mem_mib"], 2))
+        ws2.cell(i, 8, r["deployment_files"])
+        ws2.cell(i, 9, r["reason"])
+        ws2.cell(i, 10, r["detail"])
 
     wb.save(out_file)
     log.info(f"Excel отчет создан: {out_file}")
-    log.info(f"Unaccounted: {len(unaccounted_rows)}")
 
 
 def main():
-    if not GITLAB_URL or not TOKEN or not GROUP_ID:
-        raise SystemExit("Нужны ENV: GITLAB_URL, TOKEN, GROUP_ID")
-
-    if not SD_FILE or not os.path.isfile(SD_FILE):
-        raise SystemExit(f"SD_FILE не найден: {SD_FILE}")
-    if not BK_FILE or not os.path.isfile(BK_FILE):
-        raise SystemExit(f"BK_FILE не найден: {BK_FILE}")
-
-    sd_people_map = load_sd_people_map(SD_FILE)
-    bk_type_map = load_bk_business_type_map(BK_FILE)
+    sd = load_sd_people_map(SD_FILE)
+    bk = load_bk_business_type_map(BK_FILE)
 
     gl = gl_connect()
     projects = get_group_projects(gl)
 
-    rows, unaccounted = collect_rows(
-        gl, projects, sd_people_map=sd_people_map, bk_type_map=bk_type_map
-    )
+    rows, unaccounted = collect_rows(gl, projects, sd, bk)
 
     write_excel(rows, unaccounted, OUTPUT_XLSX)
 
