@@ -410,15 +410,10 @@ def write_xlsx(rows, unaccounted_rows):
         c.font = Font(bold=True)
 
     total_accounted_lines = sum(r["total_lines"] for r in rows) or 0
-    total_unaccounted_lines = (
-        sum(r.get("total_lines", 0) for r in unaccounted_rows) or 0
-    )
-    total_all_lines = total_accounted_lines + total_unaccounted_lines
-    if total_all_lines <= 0:
-        total_all_lines = 1
+    denom = total_accounted_lines if total_accounted_lines > 0 else 1
 
     for r in rows:
-        pct = (r["total_lines"] / total_all_lines) if total_all_lines else 0.0
+        pct = (r["total_lines"] / denom) if denom else 0.0
         ws.append(
             [
                 r["business_type"],
@@ -446,7 +441,6 @@ def write_xlsx(rows, unaccounted_rows):
         "business_type",
         "tasks_total",
         "total_lines",
-        "% от total_lines_all",
         "reason",
         "detail",
     ]
@@ -454,11 +448,7 @@ def write_xlsx(rows, unaccounted_rows):
     for c in ws2[1]:
         c.font = Font(bold=True)
 
-    pct2_col = headers2.index("% от total_lines_all") + 1
-
     for r in unaccounted_rows:
-        lines = int(r.get("total_lines", 0) or 0)
-        pct_all = (lines / total_all_lines) if total_all_lines else 0.0
         ws2.append(
             [
                 r.get("instance", ""),
@@ -469,23 +459,18 @@ def write_xlsx(rows, unaccounted_rows):
                 r.get("owner", ""),
                 r.get("business_type", ""),
                 int(r.get("tasks_total", 0) or 0),
-                lines,
-                pct_all,
+                int(r.get("total_lines", 0) or 0),
                 r.get("reason", ""),
                 r.get("detail", ""),
             ]
         )
 
-    for rr in range(2, ws2.max_row + 1):
-        ws2.cell(row=rr, column=pct2_col).number_format = "0.0%"
-
     wb.save(OUT_FILE)
     logger.info("Файл сохранён: %s", OUT_FILE)
     logger.info(
-        "Totals: accounted_lines=%d unaccounted_lines=%d total_lines_all=%d",
+        "Totals: accounted_lines=%d unaccounted_lines=%d",
         total_accounted_lines,
-        total_unaccounted_lines,
-        total_all_lines,
+        sum(r.get("total_lines", 0) for r in unaccounted_rows) or 0,
     )
 
 
