@@ -2,7 +2,7 @@ import os
 import sys
 import time
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 import re
 from collections import defaultdict
 
@@ -24,15 +24,16 @@ log = logging.getLogger(__name__)
 
 load_dotenv()
 
-OUTPUT_FILE = os.getenv("OUT_FILE", "victoriareport.xlsx")
+OUTPUT_FILE = os.getenv("OUT_FILE", "victoria_report.xlsx")
 HTTP_TIMEOUT_SEC = 30
-SLEEP_SEC = 0.1
+SLEEP_SEC = 0.01
 
-BAN_TEAMS = ["UNAITP"]
+BAN_TEAMS = []
 BAN_SERVICE_IDS = [15473]
 BAN_BUSINESS_TYPES = []
 
 TEAM_SERVICE_ID_OVERRIDES = {
+    "service": "1234"
 }
 
 SKIP_EMPTY_BUSINESS_TYPE = True
@@ -44,7 +45,7 @@ BK_FILE = os.getenv("BK_FILE")
 
 TEAM_TAIL_ID_RE = re.compile(r"^(.*)-(\d+)$")
 
-WINDOW_HOURS = 72
+WINDOW_HOURS = 24
 WINDOW_DAYS = WINDOW_HOURS / 24.0
 
 REPORT_COLS = [
@@ -52,7 +53,7 @@ REPORT_COLS = [
     "Наименование сервиса",
     "КОД",
     "Владелец сервиса",
-    "samples_72h",
+    "samples_24h",
     "эксрополяция",
     "% от общего числа",
 ]
@@ -62,20 +63,7 @@ UNACC_COLS = [
     "team",
     "service_id",
     "metric",
-    "samples_72h",
-    "reason",
-    "detail",
-]
-
-METRICS_COLS = [
-    "team_base",
-    "team_raw",
-    "service_id_raw",
-    "service_id_final",
-    "metric",
-    "samples_72h",
-    "status",
-    "stage",
+    "samples_24h",
     "reason",
     "detail",
 ]
@@ -293,7 +281,7 @@ def build_matchers_raw(team_raw: str, service_id_raw: str, metric_name: str) -> 
     return ", ".join(parts)
 
 
-def samples_72h_for_series(
+def samples_24h_for_series(
     vm_url: str, metric_name: str, team_raw: str, service_id_raw: str, end_dt: datetime
 ) -> int:
     m = build_matchers_raw(team_raw, service_id_raw, metric_name)
@@ -315,24 +303,24 @@ def aggregate_to_group(metric_rows):
     for r in metric_rows:
         team_base = (r.get("team_base") or "").strip()
         sid = normalize_sid(r.get("service_id_final"))
-        samples = int(r.get("samples_72h", 0) or 0)
+        samples = int(r.get("samples_24h", 0) or 0)
 
         key = (team_base, sid)
         if key not in acc:
-            acc[key] = {"team_base": team_base, "service_id": sid, "samples_72h": 0}
-        acc[key]["samples_72h"] += samples
+            acc[key] = {"team_base": team_base, "service_id": sid, "samples_24h": 0}
+        acc[key]["samples_24h"] += samples
 
     out = []
     for (_, _), v in acc.items():
-        s72 = int(v["samples_72h"])
+        s24 = int(v["samples_24h"])
         extrap = (
-            int(round((s72 / WINDOW_DAYS) * EXTRAPOLATION_DAYS)) if WINDOW_DAYS else 0
+            int(round((s24 / WINDOW_DAYS) * EXTRAPOLATION_DAYS)) if WINDOW_DAYS else 0
         )
         out.append(
             {
                 "team": v["team_base"],
                 "service_id": v["service_id"],
-                "samples_72h": s72,
+                "samples_24h": s24,
                 "extrapolation": extrap,
             }
         )
@@ -350,7 +338,7 @@ def enrich_group_rows(group_rows, sd_df: pd.DataFrame, bk_map: dict):
                 "service_name",
                 "owner_for_report",
                 "business_type",
-                "samples_72h",
+                "samples_24h",
                 "эксрополяция",
                 "sd_found",
                 "bk_found",
@@ -381,7 +369,7 @@ def enrich_group_rows(group_rows, sd_df: pd.DataFrame, bk_map: dict):
     out["bk_found"] = out["business_type"].map(lambda x: x.strip() != "")
 
     out = out.rename(columns={"extrapolation": "эксрополяция"})
-    out["samples_72h"] = out["samples_72h"].fillna(0).astype(int)
+    out["samples_24h"] = out["samples_24h"].fillna(0).astype(int)
     out["эксрополяция"] = out["эксрополяция"].fillna(0).astype(int)
 
     return out[
@@ -392,7 +380,7 @@ def enrich_group_rows(group_rows, sd_df: pd.DataFrame, bk_map: dict):
             "service_name",
             "owner_for_report",
             "business_type",
-            "samples_72h",
+            "samples_24h",
             "эксрополяция",
             "sd_found",
             "bk_found",
@@ -426,7 +414,7 @@ def dedupe_and_add_percent(df: pd.DataFrame) -> pd.DataFrame:
                 "Тип бизнеса": _first_non_empty,
                 "Наименование сервиса": _first_non_empty,
                 "Владелец сервиса": _first_non_empty,
-                "samples_72h": "sum",
+                "samples_24h": "sum",
                 "эксрополяция": "sum",
             }
         )
@@ -437,7 +425,7 @@ def dedupe_and_add_percent(df: pd.DataFrame) -> pd.DataFrame:
                 "Тип бизнеса": _first_non_empty,
                 "КОД": _first_non_empty,
                 "Владелец сервиса": _first_non_empty,
-                "samples_72h": "sum",
+                "samples_24h": "sum",
                 "эксрополяция": "sum",
             }
         )
@@ -447,28 +435,26 @@ def dedupe_and_add_percent(df: pd.DataFrame) -> pd.DataFrame:
                 "Наименование сервиса",
                 "КОД",
                 "Владелец сервиса",
-                "samples_72h",
+                "samples_24h",
                 "эксрополяция",
             ]
         ]
 
     out = pd.concat([has_code, no_code], ignore_index=True)
 
-    total = float(out["samples_72h"].sum()) if "samples_72h" in out.columns else 0.0
-    out["% от общего числа"] = (out["samples_72h"] / total * 100.0) if total else 0.0
+    total = float(out["samples_24h"].sum()) if "samples_24h" in out.columns else 0.0
+    out["% от общего числа"] = (out["samples_24h"] / total * 100.0) if total else 0.0
     out["% от общего числа"] = out["% от общего числа"].round(5)
 
     return out.reindex(columns=REPORT_COLS)
 
 
-def write_report(
-    df_report: pd.DataFrame, df_metrics: pd.DataFrame, df_unacc: pd.DataFrame
-):
+def write_report(df_report: pd.DataFrame, df_unacc: pd.DataFrame):
     wb = Workbook()
     bold = Font(bold=True)
 
     ws = wb.active
-    ws.title = "samples_72h"
+    ws.title = "samples_24h"
     df_report = df_report.reindex(columns=REPORT_COLS)
     ws.append(list(df_report.columns))
     for c in ws[1]:
@@ -480,14 +466,6 @@ def write_report(
         for cell in ws.iter_cols(min_col=col_idx, max_col=col_idx, min_row=2):
             for c in cell:
                 c.number_format = "0.00000"
-
-    ws_m = wb.create_sheet("Metrics")
-    df_metrics = df_metrics.reindex(columns=METRICS_COLS)
-    ws_m.append(list(df_metrics.columns))
-    for c in ws_m[1]:
-        c.font = bold
-    for row in df_metrics.itertuples(index=False):
-        ws_m.append(list(row))
 
     ws2 = wb.create_sheet("Unaccounted")
     if df_unacc is None or df_unacc.empty:
@@ -531,7 +509,7 @@ def main():
     unacc_map = {}
 
     def add_unacc_once(
-        stage, team, service_id, metric, reason, detail, samples_72h=None
+        stage, team, service_id, metric, reason, detail, samples_24h=None
     ):
         key = (team or "", service_id or "", metric or "")
         if key in unacc_map:
@@ -541,7 +519,7 @@ def main():
             "team": team or "",
             "service_id": service_id or "",
             "metric": metric or "",
-            "samples_72h": "" if samples_72h is None else int(samples_72h),
+            "samples_24h": "" if samples_24h is None else int(samples_24h),
             "reason": reason,
             "detail": detail,
         }
@@ -622,11 +600,9 @@ def main():
             reason = "excluded_no_service_id"
             detail = "EXCLUDE_NO_SERVICE_ID_AT_QUERY=True and service_id empty"
 
-        s72 = 0
+        s24 = 0
         try:
-            s72 = samples_72h_for_series(
-                vm_url, metric, team_raw, service_id_raw, end_dt
-            )
+            s24 = samples_24h_for_series(vm_url, metric, team_raw, service_id_raw, end_dt)
         except Exception as e:
             add_unacc_once(
                 "samples",
@@ -635,9 +611,9 @@ def main():
                 metric,
                 "samples_failed",
                 str(e),
-                samples_72h=None,
+                samples_24h=None,
             )
-            s72 = 0
+            s24 = 0
 
         if status == "unaccounted":
             add_unacc_once(
@@ -647,14 +623,14 @@ def main():
                 metric,
                 reason,
                 detail,
-                samples_72h=s72,
+                samples_24h=s24,
             )
         else:
             accounted_metric_rows.append(
                 {
                     "team_base": team_base,
                     "service_id_final": service_id_final,
-                    "samples_72h": int(s72),
+                    "samples_24h": int(s24),
                 }
             )
 
@@ -665,7 +641,7 @@ def main():
                 "service_id_raw": service_id_raw,
                 "service_id_final": service_id_final,
                 "metric": metric,
-                "samples_72h": int(s72),
+                "samples_24h": int(s24),
                 "status": status,
                 "stage": stage,
                 "reason": reason,
@@ -701,7 +677,7 @@ def main():
                         rr.get("metric", ""),
                         reason,
                         detail,
-                        samples_72h=int(rr.get("samples_72h", 0) or 0),
+                        samples_24h=int(rr.get("samples_24h", 0) or 0),
                     )
                     rr["status"] = "unaccounted"
                     rr["stage"] = stage
@@ -779,22 +755,15 @@ def main():
                 "Наименование сервиса",
                 "КОД",
                 "Владелец сервиса",
-                "samples_72h",
+                "samples_24h",
                 "эксрополяция",
             ]
         ]
 
         df_report = dedupe_and_add_percent(df_for_report)
-        df_report = df_report.sort_values(["samples_72h"], ascending=False).reset_index(
+        df_report = df_report.sort_values(["samples_24h"], ascending=False).reset_index(
             drop=True
         )
-
-    df_metrics = pd.DataFrame(metrics_audit).fillna("")
-    if not df_metrics.empty:
-        df_metrics = df_metrics.reindex(columns=METRICS_COLS)
-        df_metrics = df_metrics.sort_values(
-            ["status", "team_base", "service_id_final", "metric"]
-        ).reset_index(drop=True)
 
     df_unacc = pd.DataFrame(list(unacc_map.values()))
     if not df_unacc.empty:
@@ -804,7 +773,7 @@ def main():
         ).reset_index(drop=True)
 
     log.info("Saving report: %s", OUTPUT_FILE)
-    write_report(df_report, df_metrics, df_unacc)
+    write_report(df_report, df_unacc)
     log.info("✔ Done")
 
 
