@@ -31,11 +31,10 @@ LIMIT = 0
 
 BAN_SERVICE_IDS = {
     "15473",
-    "0"
+    "0",
 }
 
-BAN_BUSINESS_TYPES = [
-]
+BAN_BUSINESS_TYPES = []
 
 SKIP_EMPTY_BUSINESS_TYPE = True
 
@@ -187,6 +186,8 @@ def resolve_sd_bk(service_id: str, map_by_number, map_by_name, bk_type_map):
     norm_number = normalize_number(service_id)
     if norm_number and norm_number in map_by_number:
         sd = map_by_number[norm_number]
+    else:
+        sd = None
 
     sd_name = (sd or {}).get("sd_name") or ""
     owner = (sd or {}).get("owner") or ""
@@ -201,6 +202,10 @@ def main():
     ban_set = build_ban_set(BAN_SERVICE_IDS)
     ban_business_types_set = build_ban_business_types_set(BAN_BUSINESS_TYPES)
 
+    log.info("BAN_SERVICE_IDS=%s", sorted(ban_set) if ban_set else "[]")
+    log.info("BAN_BUSINESS_TYPES=%s", sorted(ban_business_types_set) if ban_business_types_set else "[]")
+    log.info("SKIP_EMPTY_BUSINESS_TYPE=%s", SKIP_EMPTY_BUSINESS_TYPE)
+
     bk_type_map = load_bk_business_type_map(BK_FILE)
     map_by_number, map_by_name = load_sd_mapping(SD_FILE)
 
@@ -212,44 +217,46 @@ def main():
     ws_sum = wb.active
     ws_sum.title = "ByServiceId"
 
-    ws_sum.append([
-        "Тип бизнеса",
-        "Наименование сервиса",
-        "КОД",
-        "Владелец",
-        "кол-во проектов",
-        "Объем репозиториев (bytes)",
-        "Oбъем репозитория",
-        "Объем джобов(bytes)",
-        "Объем джобов",
-        "Сумарнный объем",
-        "% потребления",
-    ])
-
+    # ИЗМЕНЕНО: заголовки и порядок колонок на 1 листе (ByServiceId)
+    ws_sum.append(
+        [
+            "Тип бизнеса",
+            "Наименование сервиса",
+            "КОД",
+            "Владелец",
+            "кол-во проектов",
+            "Объем репозиториев (bytes)",
+            "Oбъем репозитория",
+            "Объем джобов(bytes)",
+            "Объем джобов",
+            "Сумарнный объем",
+            "% потребления",
+        ]
+    )
     for c in ws_sum[1]:
         c.font = Font(bold=True)
 
     ws_unmapped = wb.create_sheet("Unmapped")
-
-    ws_unmapped.append([
-        "reason",
-        "detail",
-        "sid_status",
-        "service_id",
-        "sd_name",
-        "owner",
-        "business_type",
-        "project_id",
-        "project",
-        "web_url",
-        "repo_size_b",
-        "repo_size_h",
-        "job_artifacts_b",
-        "job_artifacts_h",
-        "total_b",
-        "total_h",
-    ])
-
+    ws_unmapped.append(
+        [
+            "reason",
+            "detail",
+            "sid_status",
+            "service_id",
+            "sd_name",
+            "owner",
+            "business_type",
+            "project_id",
+            "project",
+            "web_url",
+            "repo_size_b",
+            "repo_size_h",
+            "job_artifacts_b",
+            "job_artifacts_h",
+            "total_b",
+            "total_h",
+        ]
+    )
     for c in ws_unmapped[1]:
         c.font = Font(bold=True)
 
@@ -258,78 +265,250 @@ def main():
     total_repo_all = 0
     total_job_all = 0
 
+    errors = 0
+    processed = 0
+
+    skipped_ban_sid = 0
+    skipped_sd_miss = 0
+    skipped_empty_bt = 0
+    skipped_ban_bt = 0
+    unmapped_missing = 0
+    unmapped_conflict = 0
+
     log.info("Начинаем обход проектов...")
 
-    for p in gl.projects.list(all=True, iterator=True):
+    for i, p in enumerate(gl.projects.list(all=True, iterator=True), start=1):
+        if LIMIT and processed >= LIMIT:
+            log.info("LIMIT=%d достигнут, останавливаемся", LIMIT)
+            break
 
-        full = gl.projects.get(p.id, statistics=True)
+        proj_id = getattr(p, "id", None)
 
-        name = getattr(full, "path_with_namespace", "") or getattr(full, "name", "")
-        web_url = getattr(full, "web_url", "")
+        try:
+            full = gl.projects.get(proj_id, statistics=True)
+            name = getattr(full, "path_with_namespace", "") or getattr(full, "name", "") or str(proj_id)
+            web_url = getattr(full, "web_url", "") or ""
 
-        topics = list(getattr(full, "topics", []) or [])
-        service_id, sid_status = extract_service_id_info(topics)
+            topics = list(getattr(full, "topics", []) or [])
+            service_id, sid_status = extract_service_id_info(topics)
 
-        stats = getattr(full, "statistics", {}) or {}
-        repo_bytes = int(stats.get("repository_size", 0) or 0)
-        job_bytes = int(stats.get("job_artifacts_size", 0) or 0)
-        total_bytes = repo_bytes + job_bytes
+            stats = getattr(full, "statistics", {}) or {}
+            repo_bytes = int(stats.get("repository_size", 0) or 0)
+            job_bytes = int(stats.get("job_artifacts_size", 0) or 0)
+            total_bytes = repo_bytes + job_bytes
 
-        total_repo_all += repo_bytes
-        total_job_all += job_bytes
+            total_repo_all += repo_bytes
+            total_job_all += job_bytes
 
-        sd_name = ""
-        owner = ""
-        business_type = ""
+            sd_name = ""
+            owner = ""
+            business_type = ""
 
-        if sid_status == "OK":
+            if sid_status == "OK":
+                sd_name, owner, business_type = resolve_sd_bk(service_id, map_by_number, map_by_name, bk_type_map)
 
-            sd_name, owner, business_type = resolve_sd_bk(service_id, map_by_number, map_by_name, bk_type_map)
+                if service_id in ban_set:
+                    skipped_ban_sid += 1
+                    ws_unmapped.append(
+                        [
+                            "banned_service_id",
+                            "service_id in BAN_SERVICE_IDS",
+                            sid_status,
+                            service_id,
+                            sd_name,
+                            owner,
+                            business_type,
+                            proj_id,
+                            name,
+                            web_url,
+                            repo_bytes,
+                            humanize.naturalsize(repo_bytes, binary=True),
+                            job_bytes,
+                            humanize.naturalsize(job_bytes, binary=True) if job_bytes else "",
+                            total_bytes,
+                            humanize.naturalsize(total_bytes, binary=True),
+                        ]
+                    )
+                    processed += 1
+                    continue
 
-            if service_id in ban_set:
-                ws_unmapped.append(["banned_service_id","service_id in BAN_SERVICE_IDS",sid_status,service_id,sd_name,owner,business_type,p.id,name,web_url,repo_bytes,humanize.naturalsize(repo_bytes, binary=True),job_bytes,humanize.naturalsize(job_bytes, binary=True),total_bytes,humanize.naturalsize(total_bytes, binary=True)])
-                continue
+                if not sd_name and not owner:
+                    skipped_sd_miss += 1
+                    ws_unmapped.append(
+                        [
+                            "sd_mapping_miss",
+                            "no match in SD by service_id",
+                            sid_status,
+                            service_id,
+                            sd_name,
+                            owner,
+                            business_type,
+                            proj_id,
+                            name,
+                            web_url,
+                            repo_bytes,
+                            humanize.naturalsize(repo_bytes, binary=True),
+                            job_bytes,
+                            humanize.naturalsize(job_bytes, binary=True) if job_bytes else "",
+                            total_bytes,
+                            humanize.naturalsize(total_bytes, binary=True),
+                        ]
+                    )
+                    processed += 1
+                    continue
 
-            if ban_business_types_set and clean_spaces(business_type) in ban_business_types_set:
-                ws_unmapped.append(["banned_business_type","business_type in BAN_BUSINESS_TYPES",sid_status,service_id,sd_name,owner,business_type,p.id,name,web_url,repo_bytes,humanize.naturalsize(repo_bytes, binary=True),job_bytes,humanize.naturalsize(job_bytes, binary=True),total_bytes,humanize.naturalsize(total_bytes, binary=True)])
-                continue
+                if SKIP_EMPTY_BUSINESS_TYPE and not clean_spaces(business_type):
+                    skipped_empty_bt += 1
+                    ws_unmapped.append(
+                        [
+                            "skip_empty_business_type",
+                            "SKIP_EMPTY_BUSINESS_TYPE=True and business_type is empty",
+                            sid_status,
+                            service_id,
+                            sd_name,
+                            owner,
+                            business_type,
+                            proj_id,
+                            name,
+                            web_url,
+                            repo_bytes,
+                            humanize.naturalsize(repo_bytes, binary=True),
+                            job_bytes,
+                            humanize.naturalsize(job_bytes, binary=True) if job_bytes else "",
+                            total_bytes,
+                            humanize.naturalsize(total_bytes, binary=True),
+                        ]
+                    )
+                    processed += 1
+                    continue
 
-            a = agg[service_id]
-            a["projects"] += 1
-            a["repo"] += repo_bytes
-            a["job"] += job_bytes
-            a["sd_name"] = sd_name
-            a["owner"] = owner
-            a["business_type"] = business_type
+                if ban_business_types_set and clean_spaces(business_type) in ban_business_types_set:
+                    skipped_ban_bt += 1
+                    ws_unmapped.append(
+                        [
+                            "banned_business_type",
+                            "business_type in BAN_BUSINESS_TYPES",
+                            sid_status,
+                            service_id,
+                            sd_name,
+                            owner,
+                            business_type,
+                            proj_id,
+                            name,
+                            web_url,
+                            repo_bytes,
+                            humanize.naturalsize(repo_bytes, binary=True),
+                            job_bytes,
+                            humanize.naturalsize(job_bytes, binary=True) if job_bytes else "",
+                            total_bytes,
+                            humanize.naturalsize(total_bytes, binary=True),
+                        ]
+                    )
+                    processed += 1
+                    continue
+
+                a = agg[service_id]
+                a["projects"] += 1
+                a["repo"] += repo_bytes
+                a["job"] += job_bytes
+
+                if not a["sd_name"] and sd_name:
+                    a["sd_name"] = sd_name
+                if not a["owner"] and owner:
+                    a["owner"] = owner
+                if not a["business_type"] and business_type:
+                    a["business_type"] = business_type
+
+            else:
+                if sid_status == "MISSING":
+                    unmapped_missing += 1
+                    reason = "service_id_missing"
+                    detail = "no service_id topic found"
+                else:
+                    unmapped_conflict += 1
+                    reason = "service_id_conflict"
+                    detail = "multiple different service_id topics"
+
+                ws_unmapped.append(
+                    [
+                        reason,
+                        detail,
+                        sid_status,
+                        service_id,
+                        sd_name,
+                        owner,
+                        business_type,
+                        proj_id,
+                        name,
+                        web_url,
+                        repo_bytes,
+                        humanize.naturalsize(repo_bytes, binary=True),
+                        job_bytes,
+                        humanize.naturalsize(job_bytes, binary=True) if job_bytes else "",
+                        total_bytes,
+                        humanize.naturalsize(total_bytes, binary=True),
+                    ]
+                )
+
+            processed += 1
+
+        except Exception as e:
+            errors += 1
+            log.warning("FAIL project_id=%s err=%s", proj_id, e)
+
+        if LOG_EVERY and i % LOG_EVERY == 0:
+            log.info("PROGRESS i=%d processed=%d errors=%d", i, processed, errors)
 
         if SLEEP_SEC:
             time.sleep(SLEEP_SEC)
 
     total_all = total_repo_all + total_job_all
 
-    for service_id in sorted(agg.keys()):
+    def _sort_key(x: str):
+        return int(x) if str(x).isdigit() else str(x)
 
+    for service_id in sorted(agg.keys(), key=_sort_key):
         repo_b = agg[service_id]["repo"]
         job_b = agg[service_id]["job"]
         total_b = repo_b + job_b
 
-        ws_sum.append([
-            agg[service_id]["business_type"],
-            agg[service_id]["sd_name"],
-            service_id,
-            agg[service_id]["owner"],
-            agg[service_id]["projects"],
-            repo_b,
-            humanize.naturalsize(repo_b, binary=True),
-            job_b,
-            humanize.naturalsize(job_b, binary=True) if job_b else "",
-            humanize.naturalsize(total_b, binary=True),
-            round(pct(total_b, total_all), 4),
-        ])
+        ws_sum.append(
+            [
+                agg[service_id]["business_type"],               # Тип бизнеса
+                agg[service_id]["sd_name"],                     # Наименование сервиса
+                service_id,                                     # КОД
+                agg[service_id]["owner"],                       # Владелец
+                agg[service_id]["projects"],                    # кол-во проектов
+                repo_b,                                         # Объем репозиториев (bytes)
+                humanize.naturalsize(repo_b, binary=True),      # Oбъем репозитория
+                job_b,                                          # Объем джобов(bytes)
+                humanize.naturalsize(job_b, binary=True) if job_b else "",  # Объем джобов
+                humanize.naturalsize(total_b, binary=True),     # Сумарнный объем
+                round(pct(total_b, total_all), 4),              # % потребления
+            ]
+        )
 
     wb.save(out_path)
 
-    log.info("Saved: %s", out_path)
+    log.info(
+        "Saved: %s | projects=%d | services=%d | unmapped=%d | errors=%d | total=%s",
+        out_path,
+        processed,
+        len(agg),
+        ws_unmapped.max_row - 1,
+        errors,
+        humanize.naturalsize(total_all, binary=True),
+    )
+    log.info(
+        "Unmapped breakdown: missing=%d conflict=%d ban_sid=%d sd_miss=%d empty_bt=%d ban_bt=%d",
+        unmapped_missing,
+        unmapped_conflict,
+        skipped_ban_sid,
+        skipped_sd_miss,
+        skipped_empty_bt,
+        skipped_ban_bt,
+    )
+    log.info("Готово")
 
 
 if __name__ == "__main__":
