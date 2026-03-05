@@ -30,7 +30,7 @@ LOG_EVERY = 100
 LIMIT = 0
 
 BAN_SERVICE_IDS = {
-    "15473"
+    "15473",
     "0"
 }
 
@@ -77,10 +77,14 @@ def normalize_name(x):
 
 
 def build_ban_set(ban_list):
+    if not isinstance(ban_list, (list, tuple, set)):
+        die("BAN_SERVICE_IDS должен быть list / tuple / set")
     return {str(x).strip() for x in ban_list if str(x).strip()}
 
 
 def build_ban_business_types_set(ban_list):
+    if not isinstance(ban_list, (list, tuple, set)):
+        die("BAN_BUSINESS_TYPES должен быть list / tuple / set")
     return {clean_spaces(x) for x in ban_list if clean_spaces(x)}
 
 
@@ -112,6 +116,7 @@ def load_bk_business_type_map(path: str):
 def load_sd_mapping(path: str):
     df = pd.read_excel(path, dtype=str, engine="openpyxl").fillna("")
     map_by_number = {}
+    map_by_name = {}
 
     for _, row in df.iterrows():
         num = normalize_number(row.iloc[1] if len(row) > 1 else "")
@@ -125,9 +130,11 @@ def load_sd_mapping(path: str):
 
         if num:
             map_by_number[num] = payload
+        if sd_name:
+            map_by_name[normalize_name(sd_name)] = payload
 
-    log.info("SD: загружено сервисов по номеру=%d", len(map_by_number))
-    return map_by_number
+    log.info("SD: загружено сервисов по номеру=%d, по имени=%d", len(map_by_number), len(map_by_name))
+    return map_by_number, map_by_name
 
 
 def connect():
@@ -151,7 +158,8 @@ def connect():
 def extract_service_id_info(topics):
     ids = []
     for t in topics or []:
-        m = SERVICE_ID_RE.match((t or "").strip())
+        s = (t or "").strip()
+        m = SERVICE_ID_RE.match(s)
         if m:
             ids.append(m.group(1))
 
@@ -171,11 +179,15 @@ def pct(part: int, total: int) -> float:
     return (part / total) * 100.0
 
 
-def resolve_sd_bk(service_id: str, map_by_number, bk_type_map):
+def resolve_sd_bk(service_id: str, map_by_number, map_by_name, bk_type_map):
     if not service_id:
         return "", "", ""
 
-    sd = map_by_number.get(service_id)
+    sd = None
+    norm_number = normalize_number(service_id)
+    if norm_number and norm_number in map_by_number:
+        sd = map_by_number[norm_number]
+
     sd_name = (sd or {}).get("sd_name") or ""
     owner = (sd or {}).get("owner") or ""
     business_type = bk_type_map.get(normalize_name_key(owner), "") if owner else ""
@@ -190,7 +202,7 @@ def main():
     ban_business_types_set = build_ban_business_types_set(BAN_BUSINESS_TYPES)
 
     bk_type_map = load_bk_business_type_map(BK_FILE)
-    map_by_number = load_sd_mapping(SD_FILE)
+    map_by_number, map_by_name = load_sd_mapping(SD_FILE)
 
     gl = connect()
 
@@ -252,28 +264,43 @@ def main():
 
         full = gl.projects.get(p.id, statistics=True)
 
+        name = getattr(full, "path_with_namespace", "") or getattr(full, "name", "")
+        web_url = getattr(full, "web_url", "")
+
         topics = list(getattr(full, "topics", []) or [])
         service_id, sid_status = extract_service_id_info(topics)
 
         stats = getattr(full, "statistics", {}) or {}
         repo_bytes = int(stats.get("repository_size", 0) or 0)
         job_bytes = int(stats.get("job_artifacts_size", 0) or 0)
+        total_bytes = repo_bytes + job_bytes
 
         total_repo_all += repo_bytes
         total_job_all += job_bytes
 
-        if sid_status != "OK":
-            continue
+        sd_name = ""
+        owner = ""
+        business_type = ""
 
-        sd_name, owner, business_type = resolve_sd_bk(service_id, map_by_number, bk_type_map)
+        if sid_status == "OK":
 
-        a = agg[service_id]
-        a["projects"] += 1
-        a["repo"] += repo_bytes
-        a["job"] += job_bytes
-        a["sd_name"] = sd_name
-        a["owner"] = owner
-        a["business_type"] = business_type
+            sd_name, owner, business_type = resolve_sd_bk(service_id, map_by_number, map_by_name, bk_type_map)
+
+            if service_id in ban_set:
+                ws_unmapped.append(["banned_service_id","service_id in BAN_SERVICE_IDS",sid_status,service_id,sd_name,owner,business_type,p.id,name,web_url,repo_bytes,humanize.naturalsize(repo_bytes, binary=True),job_bytes,humanize.naturalsize(job_bytes, binary=True),total_bytes,humanize.naturalsize(total_bytes, binary=True)])
+                continue
+
+            if ban_business_types_set and clean_spaces(business_type) in ban_business_types_set:
+                ws_unmapped.append(["banned_business_type","business_type in BAN_BUSINESS_TYPES",sid_status,service_id,sd_name,owner,business_type,p.id,name,web_url,repo_bytes,humanize.naturalsize(repo_bytes, binary=True),job_bytes,humanize.naturalsize(job_bytes, binary=True),total_bytes,humanize.naturalsize(total_bytes, binary=True)])
+                continue
+
+            a = agg[service_id]
+            a["projects"] += 1
+            a["repo"] += repo_bytes
+            a["job"] += job_bytes
+            a["sd_name"] = sd_name
+            a["owner"] = owner
+            a["business_type"] = business_type
 
         if SLEEP_SEC:
             time.sleep(SLEEP_SEC)
@@ -302,12 +329,7 @@ def main():
 
     wb.save(out_path)
 
-    log.info(
-        "Saved: %s | services=%d | total=%s",
-        out_path,
-        len(agg),
-        humanize.naturalsize(total_all, binary=True),
-    )
+    log.info("Saved: %s", out_path)
 
 
 if __name__ == "__main__":
