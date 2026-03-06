@@ -1,4 +1,5 @@
 import os
+import re
 import logging
 import requests
 import urllib3
@@ -6,6 +7,7 @@ from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from openpyxl import Workbook
 from openpyxl.styles import Font
+from openpyxl.utils import get_column_letter
 
 from reference_loader import load_reference_rows
 
@@ -25,6 +27,35 @@ CONF_PASS = os.getenv("CONF_PASS", "").strip()
 
 REFERENCES_DIR = "references"
 OUT_FILE = "employees.xlsx"
+
+
+def set_bold_row(ws, row_num, col_count):
+    font = Font(bold=True)
+    for col in range(1, col_count + 1):
+        ws.cell(row=row_num, column=col).font = font
+
+
+def try_parse_percent(value):
+    if value is None:
+        return None
+
+    s = str(value).strip().replace(",", ".")
+    if not s:
+        return None
+
+    if "/" in s:
+        return None
+
+    if s.endswith("%"):
+        s = s[:-1].strip()
+
+    if not re.fullmatch(r"\d+(\.\d+)?", s):
+        return None
+
+    num = float(s)
+    if num > 1:
+        return num / 100
+    return num
 
 
 def fetch_confluence_table():
@@ -55,37 +86,41 @@ def fetch_confluence_table():
     if not rows:
         raise RuntimeError("No rows found in Confluence table")
 
-    employees = []
+    headers = [c.get_text(strip=True) for c in rows[0].find_all(["th", "td"])]
+    service_headers = headers[3:]
+
+    data_rows = []
 
     for tr in rows[1:]:
         cols = [c.get_text(strip=True) for c in tr.find_all(["th", "td"])]
         if not cols:
             continue
 
-        employee = cols[0].strip() if len(cols) > 0 else ""
-        load_value = cols[1].strip() if len(cols) > 1 else ""
-
+        employee = cols[0].strip()
         if not employee:
             continue
 
-        employees.append(
+        load_value = cols[1].strip() if len(cols) > 1 else ""
+        service_values = cols[3:] if len(cols) > 3 else []
+
+        if len(service_values) < len(service_headers):
+            service_values += [""] * (len(service_headers) - len(service_values))
+        else:
+            service_values = service_values[:len(service_headers)]
+
+        data_rows.append(
             {
                 "employee": employee,
                 "load": load_value,
+                "services": dict(zip(service_headers, service_values)),
             }
         )
 
-    log.info("Loaded %s employees from Confluence", len(employees))
-    return employees
+    log.info("Loaded %s employees from Confluence", len(data_rows))
+    return headers, service_headers, data_rows
 
 
-def bold_row(ws, row_num: int):
-    bold_font = Font(bold=True)
-    for cell in ws[row_num]:
-        cell.font = bold_font
-
-
-def build_source_map(rows, source_name: str):
+def build_source_map(rows, source_name):
     result = {}
 
     for row in rows:
@@ -133,87 +168,57 @@ def merge_source_maps(source_maps):
     return result
 
 
-def write_employees_block(ws, employees, start_row=1, start_col=1):
-    row = start_row
-    col = start_col
+def write_employees_sheet(ws, headers, service_headers, data_rows):
+    ws.append(headers)
+    set_bold_row(ws, 1, len(headers))
 
-    ws.cell(row=row, column=col, value="ФИО")
-    ws.cell(row=row, column=col + 1, value="Загрузка")
-    bold_row(ws, row)
+    service_start_col = 4
+    service_end_col = service_start_col + len(service_headers) - 1
 
-    row += 1
-    for item in employees:
-        ws.cell(row=row, column=col, value=item["employee"])
-        ws.cell(row=row, column=col + 1, value=item["load"])
-        row += 1
+    for row_idx, item in enumerate(data_rows, start=2):
+        row = [item["employee"], item["load"], None]
 
-    return row
+        for service_name in service_headers:
+            raw_value = item["services"].get(service_name, "")
+            parsed = try_parse_percent(raw_value)
+            row.append(parsed if parsed is not None else raw_value)
+
+        ws.append(row)
+
+        if service_headers:
+            start_letter = get_column_letter(service_start_col)
+            end_letter = get_column_letter(service_end_col)
+            total_cell = ws.cell(row=row_idx, column=3)
+            total_cell.value = f"=SUM({start_letter}{row_idx}:{end_letter}{row_idx})"
+            total_cell.number_format = "0%"
+
+    for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=4, max_col=3 + len(service_headers)):
+        for cell in row:
+            if isinstance(cell.value, (int, float)):
+                cell.number_format = "0%"
 
 
-def write_services_matrix(ws, merged_rows, source_columns, start_row, start_col=1):
-    top_header_row = start_row
-    description_row = start_row + 1
-    table_header_row = start_row + 2
-    data_start_row = start_row + 3
+def write_sources_sheet(ws, merged_rows, source_columns):
+    headers = ["Service name", "Code"] + source_columns
+    ws.append(headers)
+    set_bold_row(ws, 1, len(headers))
 
-    ws.cell(row=table_header_row, column=start_col, value="Service name")
-    ws.cell(row=table_header_row, column=start_col + 1, value="Code")
-
-    current_col = start_col + 2
-    for source_name in source_columns:
-        ws.cell(row=top_header_row, column=current_col, value=source_name)
-        ws.cell(row=description_row, column=current_col, value="")
-        ws.cell(row=table_header_row, column=current_col, value="%")
-        current_col += 1
-
-    bold_font = Font(bold=True)
-    for col in range(start_col, current_col):
-        ws.cell(row=top_header_row, column=col).font = bold_font
-        ws.cell(row=table_header_row, column=col).font = bold_font
-
-    row = data_start_row
     for item in merged_rows:
-        ws.cell(row=row, column=start_col, value=item["service_name"])
-        ws.cell(row=row, column=start_col + 1, value=item["service_code"])
-
-        current_col = start_col + 2
+        row = [item["service_name"], item["service_code"]]
         for source_name in source_columns:
-            value = item.get(source_name)
-            ws.cell(row=row, column=current_col, value=value)
-            current_col += 1
+            row.append(item.get(source_name))
+        ws.append(row)
 
-        row += 1
-
-    return row
-
-
-def export_report(employees, merged_rows, source_columns, out_file):
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "report"
-
-    log.info("Writing employees block")
-    next_row = write_employees_block(ws, employees, start_row=1, start_col=1)
-
-    next_row += 2
-
-    log.info("Writing services matrix")
-    write_services_matrix(
-        ws=ws,
-        merged_rows=merged_rows,
-        source_columns=source_columns,
-        start_row=next_row,
-        start_col=1,
-    )
-
-    wb.save(out_file)
-    log.info("Report saved to %s", out_file)
+    for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=3, max_col=2 + len(source_columns)):
+        for cell in row:
+            if isinstance(cell.value, (int, float)):
+                cell.number_format = "0.0000"
 
 
 def main():
     log.info("Started report generation")
 
-    employees = fetch_confluence_table()
+    headers, service_headers, employees = fetch_confluence_table()
 
     log.info("Loading Nexus reference")
     nexus_rows = load_reference_rows(
@@ -228,13 +233,18 @@ def main():
     nexus_map = build_source_map(nexus_rows, "Nexus")
     merged_rows = merge_source_maps([nexus_map])
 
-    export_report(
-        employees=employees,
-        merged_rows=merged_rows,
-        source_columns=["Nexus"],
-        out_file=OUT_FILE,
-    )
+    wb = Workbook()
 
+    ws_employees = wb.active
+    ws_employees.title = "Employees"
+    write_employees_sheet(ws_employees, headers, service_headers, employees)
+
+    ws_sources = wb.create_sheet("Sources")
+    write_sources_sheet(ws_sources, merged_rows, ["Nexus"])
+
+    wb.save(OUT_FILE)
+
+    log.info("Report saved to %s", OUT_FILE)
     log.info("Finished report generation")
 
 
