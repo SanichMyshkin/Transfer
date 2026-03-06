@@ -32,8 +32,6 @@ def load_reference_rows(
     wb = load_workbook(path, data_only=True)
 
     if sheet_name:
-        if sheet_name not in wb.sheetnames:
-            raise RuntimeError(f"Sheet '{sheet_name}' not found in {file_path}")
         ws = wb[sheet_name]
     else:
         ws = wb[wb.sheetnames[0]]
