@@ -19,47 +19,52 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
+
 log = logging.getLogger(__name__)
 
-CONF_URL = os.getenv("CONF_URL", "").strip()
-CONF_PAGE_ID = os.getenv("CONF_PAGE_ID", "").strip()
-CONF_USER = os.getenv("CONF_USER", "").strip()
-CONF_PASS = os.getenv("CONF_PASS", "").strip()
+CONF_URL = os.getenv("CONF_URL")
+CONF_PAGE_ID = os.getenv("CONF_PAGE_ID")
+CONF_USER = os.getenv("CONF_USER")
+CONF_PASS = os.getenv("CONF_PASS")
 
 REFERENCES_DIR = "references"
 OUT_FILE = "employees.xlsx"
 
 
-def set_bold_row(ws, row_num, col_count):
-    font = Font(bold=True)
-    for col in range(1, col_count + 1):
-        ws.cell(row=row_num, column=col).font = font
+def set_bold_row(ws, row, cols):
+    for col in range(1, cols + 1):
+        ws.cell(row=row, column=col).font = Font(bold=True)
 
 
 def try_parse_percent(value):
+
     if value is None:
         return None
 
     s = str(value).strip().replace(",", ".")
-    if not s:
-        return None
 
     if "/" in s:
         return None
 
     if s.endswith("%"):
-        s = s[:-1].strip()
+        s = s[:-1]
+
+    if not s:
+        return None
 
     if not re.fullmatch(r"\d+(\.\d+)?", s):
         return None
 
     num = float(s)
+
     if num > 1:
         return num / 100
+
     return num
 
 
 def fetch_confluence_table():
+
     url = f"{CONF_URL.rstrip('/')}/rest/api/content/{CONF_PAGE_ID}"
     params = {"expand": "body.storage"}
 
@@ -72,6 +77,7 @@ def fetch_confluence_table():
         timeout=30,
         verify=False,
     )
+
     r.raise_for_status()
 
     html = r.json()["body"]["storage"]["value"]
@@ -87,6 +93,7 @@ def fetch_confluence_table():
     data_rows = []
 
     for tr in rows[1:]:
+
         cols = [c.get_text(strip=True) for c in tr.find_all(["th", "td"])]
 
         if not cols:
@@ -143,10 +150,13 @@ def write_employees_sheet(ws, headers, service_headers, data_rows):
         total_cell.number_format = "0%"
 
     sum_row = ws.max_row + 1
+
     ws.cell(row=sum_row, column=1, value="SUM")
 
     for col in range(service_start, service_end + 1):
+
         col_letter = get_column_letter(col)
+
         cell = ws.cell(row=sum_row, column=col)
         cell.value = f"=SUM({col_letter}2:{col_letter}{sum_row - 1})"
         cell.number_format = "0%"
@@ -180,7 +190,32 @@ def build_source_rows(rows, source_name):
     return result
 
 
-def write_sources_sheet(ws, merged_rows, source_columns, platform_col_map, employees_sum_row):
+def merge_source_rows(rows_list):
+
+    merged = {}
+
+    for rows in rows_list:
+
+        for item in rows:
+
+            key = (item["service_name"], item["service_code"])
+
+            if key not in merged:
+                merged[key] = {
+                    "service_name": item["service_name"],
+                    "service_code": item["service_code"],
+                }
+
+            for k, v in item.items():
+                if k in ("service_name", "service_code"):
+                    continue
+
+                merged[key][k] = v
+
+    return list(merged.values())
+
+
+def write_sources_sheet(ws, merged_rows, source_configs, platform_map, sum_row):
 
     ws.merge_cells(start_row=1, start_column=1, end_row=2, end_column=1)
     ws.merge_cells(start_row=1, start_column=2, end_row=2, end_column=2)
@@ -190,7 +225,10 @@ def write_sources_sheet(ws, merged_rows, source_columns, platform_col_map, emplo
 
     current_col = 3
 
-    for source_name in source_columns:
+    for cfg in source_configs:
+
+        source = cfg["name"]
+        subtitle = cfg["subtitle"]
 
         ws.merge_cells(
             start_row=1,
@@ -199,7 +237,7 @@ def write_sources_sheet(ws, merged_rows, source_columns, platform_col_map, emplo
             end_column=current_col + 1,
         )
 
-        head = ws.cell(row=1, column=current_col, value=source_name)
+        head = ws.cell(row=1, column=current_col, value=source)
         head.font = Font(bold=True)
         head.alignment = Alignment(horizontal="center")
 
@@ -210,7 +248,7 @@ def write_sources_sheet(ws, merged_rows, source_columns, platform_col_map, emplo
             end_column=current_col + 1,
         )
 
-        desc = ws.cell(row=2, column=current_col, value="Объем репозиториев")
+        desc = ws.cell(row=2, column=current_col, value=subtitle)
         desc.alignment = Alignment(horizontal="center")
 
         current_col += 2
@@ -222,9 +260,12 @@ def write_sources_sheet(ws, merged_rows, source_columns, platform_col_map, emplo
 
         current_col = 3
 
-        for source_name in source_columns:
+        for cfg in source_configs:
 
-            percent_value = item.get(f"{source_name}_percent")
+            source = cfg["name"]
+
+            percent_value = item.get(f"{source}_percent")
+
             percent_cell = ws.cell(row=row_idx, column=current_col, value=percent_value)
 
             if isinstance(percent_value, (int, float)):
@@ -232,7 +273,7 @@ def write_sources_sheet(ws, merged_rows, source_columns, platform_col_map, emplo
 
             weight_cell = ws.cell(row=row_idx, column=current_col + 1)
 
-            platform_col = platform_col_map.get(source_name)
+            platform_col = platform_map.get(source)
 
             if platform_col:
 
@@ -240,9 +281,11 @@ def write_sources_sheet(ws, merged_rows, source_columns, platform_col_map, emplo
                 percent_letter = get_column_letter(current_col)
 
                 weight_cell.value = (
-                    f"=Employees!{platform_letter}{employees_sum_row}"
+                    f"=Employees!{platform_letter}{sum_row}"
                     f"*{percent_letter}{row_idx}"
                 )
+
+                weight_cell.number_format = "0.0000"
 
             current_col += 2
 
@@ -251,16 +294,42 @@ def main():
 
     headers, service_headers, employees = fetch_confluence_table()
 
+    log.info("Loading Nexus data")
+
     nexus_rows = load_reference_rows(
         file_path=os.path.join(REFERENCES_DIR, "nexus.xlsx"),
         service_name_col=2,
         service_code_col=3,
         owner_col=4,
-        percent_col=6,
+        percent_col=11,
         header_row=1,
     )
 
-    source_rows = build_source_rows(nexus_rows, "Nexus")
+    log.info("Loading Gitlab data")
+
+    gitlab_rows = load_reference_rows(
+        file_path=os.path.join(REFERENCES_DIR, "gitlab.xlsx"),
+        service_name_col=2,
+        service_code_col=3,
+        owner_col=4,
+        percent_col=11,
+        header_row=1,
+    )
+
+    source_configs = [
+        {
+            "name": "Nexus",
+            "subtitle": "Объем репозиториев",
+            "rows": build_source_rows(nexus_rows, "Nexus"),
+        },
+        {
+            "name": "Gitlab",
+            "subtitle": "Объем проектов",
+            "rows": build_source_rows(gitlab_rows, "Gitlab"),
+        },
+    ]
+
+    merged_rows = merge_source_rows([c["rows"] for c in source_configs])
 
     wb = Workbook()
 
@@ -278,8 +347,8 @@ def main():
 
     write_sources_sheet(
         ws_sources,
-        source_rows,
-        ["Nexus"],
+        merged_rows,
+        source_configs,
         platform_map,
         sum_row,
     )
