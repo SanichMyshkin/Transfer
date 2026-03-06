@@ -141,12 +141,13 @@ def build_source_map(rows, source_name):
                 f"{source_name}_owner": owner,
                 f"{source_name}_percent": percent,
             }
-        else:
-            current = result[key].get(f"{source_name}_percent")
-            if current is None:
-                result[key][f"{source_name}_percent"] = percent
-            elif percent is not None:
-                result[key][f"{source_name}_percent"] = current + percent
+            continue
+
+        current = result[key].get(f"{source_name}_percent")
+        if current is None:
+            result[key][f"{source_name}_percent"] = percent
+        elif percent is not None:
+            result[key][f"{source_name}_percent"] = current + percent
 
     return result
 
@@ -176,7 +177,6 @@ def write_employees_sheet(ws, headers, service_headers, data_rows):
 
     service_start_col = 4
     service_end_col = service_start_col + len(service_headers) - 1
-    employee_row_map = {}
 
     for row_idx, item in enumerate(data_rows, start=2):
         row = [item["employee"], item["load"], None]
@@ -187,7 +187,6 @@ def write_employees_sheet(ws, headers, service_headers, data_rows):
             row.append(parsed if parsed is not None else raw_value)
 
         ws.append(row)
-        employee_row_map[item["employee"]] = row_idx
 
         if service_headers:
             start_letter = get_column_letter(service_start_col)
@@ -201,22 +200,19 @@ def write_employees_sheet(ws, headers, service_headers, data_rows):
             if isinstance(cell.value, (int, float)):
                 cell.number_format = "0%"
 
-    return employee_row_map
 
-
-def write_sources_sheet(ws, merged_rows, source_columns, employee_row_map):
+def write_sources_sheet(ws, merged_rows, source_columns):
     headers = ["Service name", "Code"]
-
     for source_name in source_columns:
         headers.append(f"{source_name} %")
-        headers.append(f"{source_name} weighted")
+        headers.append(f"{source_name} weight")
 
     ws.append(headers)
     set_bold_row(ws, 1, len(headers))
 
     for row_idx, item in enumerate(merged_rows, start=2):
-        row = [item["service_name"], item["service_code"]]
-        ws.append(row)
+        ws.cell(row=row_idx, column=1, value=item["service_name"])
+        ws.cell(row=row_idx, column=2, value=item["service_code"])
 
         current_col = 3
         for source_name in source_columns:
@@ -227,15 +223,15 @@ def write_sources_sheet(ws, merged_rows, source_columns, employee_row_map):
             if isinstance(percent_value, (int, float)):
                 percent_cell.number_format = "0.0000"
 
-            weighted_cell = ws.cell(row=row_idx, column=current_col + 1)
+            weight_cell = ws.cell(row=row_idx, column=current_col + 1)
+            owner_escaped = owner.replace('"', '""')
 
-            owner_row = employee_row_map.get(owner)
-            if owner_row:
-                percent_col_letter = get_column_letter(current_col)
-                weighted_cell.value = f"={percent_col_letter}{row_idx}*Employees!C{owner_row}"
-                weighted_cell.number_format = "0.0000"
-            else:
-                weighted_cell.value = None
+            # percent * total_from_Employees_column_C_by_owner_name
+            weight_cell.value = (
+                f'=IFERROR({get_column_letter(current_col)}{row_idx}*INDEX(Employees!$C:$C,'
+                f'MATCH("{owner_escaped}",Employees!$A:$A,0)),"")'
+            )
+            weight_cell.number_format = "0.0000"
 
             current_col += 2
 
@@ -262,10 +258,10 @@ def main():
 
     ws_employees = wb.active
     ws_employees.title = "Employees"
-    employee_row_map = write_employees_sheet(ws_employees, headers, service_headers, employees)
+    write_employees_sheet(ws_employees, headers, service_headers, employees)
 
     ws_sources = wb.create_sheet("Sources")
-    write_sources_sheet(ws_sources, merged_rows, ["Nexus"], employee_row_map)
+    write_sources_sheet(ws_sources, merged_rows, ["Nexus"])
 
     wb.save(OUT_FILE)
 
