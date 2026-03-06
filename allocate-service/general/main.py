@@ -30,14 +30,6 @@ REFERENCES_DIR = "references"
 OUT_FILE = "employees.xlsx"
 
 
-def normalize_name(value):
-    if value is None:
-        return ""
-    value = str(value).strip().lower()
-    value = re.sub(r"\s+", " ", value)
-    return value
-
-
 def set_bold_row(ws, row_num, col_count):
     font = Font(bold=True)
     for col in range(1, col_count + 1):
@@ -131,8 +123,8 @@ def fetch_confluence_table():
     return headers, service_headers, data_rows
 
 
-def build_source_map(rows, source_name):
-    result = {}
+def build_source_rows(rows, source_name):
+    result = []
 
     for row in rows:
         service_name = str(row.get("service_name", "") or "").strip()
@@ -142,50 +134,39 @@ def build_source_map(rows, source_name):
         if not service_name and not service_code:
             continue
 
-        key = (service_name, service_code)
-
-        if key not in result:
-            result[key] = {
+        result.append(
+            {
                 "service_name": service_name,
                 "service_code": service_code,
                 f"{source_name}_percent": percent,
             }
-            continue
-
-        current = result[key].get(f"{source_name}_percent")
-        if current is None:
-            result[key][f"{source_name}_percent"] = percent
-        elif percent is not None:
-            result[key][f"{source_name}_percent"] = current + percent
+        )
 
     return result
 
 
-def merge_source_maps(source_maps):
+def merge_source_rows(source_rows_by_source):
     merged = {}
 
-    for source_map in source_maps:
-        for key, item in source_map.items():
+    for rows in source_rows_by_source:
+        for item in rows:
+            service_name = item["service_name"]
+            service_code = item["service_code"]
+            key = (service_name, service_code)
+
             if key not in merged:
-                merged[key] = dict(item)
-                continue
+                merged[key] = {
+                    "service_name": service_name,
+                    "service_code": service_code,
+                }
 
             for k, v in item.items():
                 if k in ("service_name", "service_code"):
                     continue
-
-                if k not in merged[key]:
-                    merged[key][k] = v
-                    continue
-
-                current = merged[key][k]
-                if current is None:
-                    merged[key][k] = v
-                elif v is not None:
-                    merged[key][k] = current + v
+                merged[key][k] = v
 
     result = list(merged.values())
-    result.sort(key=lambda x: (normalize_name(x["service_name"]), x["service_code"]))
+    result.sort(key=lambda x: (x["service_name"].lower(), x["service_code"]))
     return result
 
 
@@ -193,12 +174,12 @@ def write_employees_sheet(ws, headers, service_headers, data_rows):
     ws.append(headers)
     set_bold_row(ws, 1, len(headers))
 
+    platform_col_map = {}
     service_start_col = 4
     service_end_col = service_start_col + len(service_headers) - 1
-    service_column_map = {}
 
     for idx, service_name in enumerate(service_headers, start=service_start_col):
-        service_column_map[normalize_name(service_name)] = idx
+        platform_col_map[service_name] = idx
 
     for row_idx, item in enumerate(data_rows, start=2):
         row = [item["employee"], item["load"], None]
@@ -245,19 +226,20 @@ def write_employees_sheet(ws, headers, service_headers, data_rows):
 
     set_bold_row(ws, sum_row, len(headers))
 
-    return service_column_map, sum_row
+    return platform_col_map, sum_row
 
 
-def write_sources_sheet(ws, merged_rows, source_columns, service_column_map, employees_sum_row):
-    ws.cell(row=1, column=1, value="Service name")
-    ws.cell(row=1, column=2, value="Code")
-
-    ws.cell(row=1, column=1).font = Font(bold=True)
-    ws.cell(row=1, column=2).font = Font(bold=True)
+def write_sources_sheet(ws, merged_rows, source_columns, platform_col_map, employees_sum_row):
     ws.merge_cells(start_row=1, start_column=1, end_row=2, end_column=1)
     ws.merge_cells(start_row=1, start_column=2, end_row=2, end_column=2)
-    ws.cell(row=1, column=1).alignment = Alignment(horizontal="center", vertical="center")
-    ws.cell(row=1, column=2).alignment = Alignment(horizontal="center", vertical="center")
+
+    name_cell = ws.cell(row=1, column=1, value="Service name")
+    code_cell = ws.cell(row=1, column=2, value="Code")
+
+    name_cell.font = Font(bold=True)
+    code_cell.font = Font(bold=True)
+    name_cell.alignment = Alignment(horizontal="center", vertical="center")
+    code_cell.alignment = Alignment(horizontal="center", vertical="center")
 
     current_col = 3
     for source_name in source_columns:
@@ -267,9 +249,10 @@ def write_sources_sheet(ws, merged_rows, source_columns, service_column_map, emp
             end_row=1,
             end_column=current_col + 1,
         )
-        head_cell = ws.cell(row=1, column=current_col, value=source_name)
-        head_cell.font = Font(bold=True)
-        head_cell.alignment = Alignment(horizontal="center", vertical="center")
+
+        header_cell = ws.cell(row=1, column=current_col, value=source_name)
+        header_cell.font = Font(bold=True)
+        header_cell.alignment = Alignment(horizontal="center", vertical="center")
 
         percent_head = ws.cell(row=2, column=current_col, value="%")
         weight_head = ws.cell(row=2, column=current_col + 1, value="weight")
@@ -281,13 +264,8 @@ def write_sources_sheet(ws, merged_rows, source_columns, service_column_map, emp
         current_col += 2
 
     for row_idx, item in enumerate(merged_rows, start=3):
-        service_name = item["service_name"]
-        service_code = item["service_code"]
-
-        ws.cell(row=row_idx, column=1, value=service_name)
-        ws.cell(row=row_idx, column=2, value=service_code)
-
-        employees_service_col = service_column_map.get(normalize_name(service_name))
+        ws.cell(row=row_idx, column=1, value=item["service_name"])
+        ws.cell(row=row_idx, column=2, value=item["service_code"])
 
         current_col = 3
         for source_name in source_columns:
@@ -299,17 +277,13 @@ def write_sources_sheet(ws, merged_rows, source_columns, service_column_map, emp
 
             weight_cell = ws.cell(row=row_idx, column=current_col + 1)
 
-            if employees_service_col is not None:
-                employees_col_letter = get_column_letter(employees_service_col)
-                percent_col_letter = get_column_letter(current_col)
-                weight_cell.value = (
-                    f"=Employees!{employees_col_letter}{employees_sum_row}"
-                    f"*{percent_col_letter}{row_idx}"
-                )
-            else:
-                weight_cell.value = '=""'
+            platform_col = platform_col_map.get(source_name)
+            if platform_col is not None:
+                platform_letter = get_column_letter(platform_col)
+                percent_letter = get_column_letter(current_col)
+                weight_cell.value = f"=Employees!{platform_letter}{employees_sum_row}*{percent_letter}{row_idx}"
+                weight_cell.number_format = "0.0000"
 
-            weight_cell.number_format = "0.0000"
             current_col += 2
 
 
@@ -328,14 +302,14 @@ def main():
         header_row=1,
     )
 
-    nexus_map = build_source_map(nexus_rows, "Nexus")
-    merged_rows = merge_source_maps([nexus_map])
+    nexus_source_rows = build_source_rows(nexus_rows, "Nexus")
+    merged_rows = merge_source_rows([nexus_source_rows])
 
     wb = Workbook()
 
     ws_employees = wb.active
     ws_employees.title = "Employees"
-    service_column_map, employees_sum_row = write_employees_sheet(
+    platform_col_map, employees_sum_row = write_employees_sheet(
         ws_employees,
         headers,
         service_headers,
@@ -347,7 +321,7 @@ def main():
         ws_sources,
         merged_rows,
         ["Nexus"],
-        service_column_map,
+        platform_col_map,
         employees_sum_row,
     )
 
