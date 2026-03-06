@@ -56,15 +56,10 @@ def load_reference_rows(
         if not service_name and not service_code:
             continue
 
-        service_display = service_name
-        if service_code:
-            service_display = f"{service_name} ({service_code})"
-
         result.append(
             {
                 "service_name": service_name,
                 "service_code": service_code,
-                "service_display": service_display,
                 "owner": owner,
                 "percent": normalize_percent(percent),
             }
