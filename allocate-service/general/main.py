@@ -30,6 +30,14 @@ REFERENCES_DIR = "references"
 OUT_FILE = "employees.xlsx"
 
 
+def normalize_name(value):
+    if value is None:
+        return ""
+    value = str(value).strip().lower()
+    value = re.sub(r"\s+", " ", value)
+    return value
+
+
 def set_bold_row(ws, row_num, col_count):
     font = Font(bold=True)
     for col in range(1, col_count + 1):
@@ -177,7 +185,7 @@ def merge_source_maps(source_maps):
                     merged[key][k] = current + v
 
     result = list(merged.values())
-    result.sort(key=lambda x: (x["service_name"].lower(), x["service_code"]))
+    result.sort(key=lambda x: (normalize_name(x["service_name"]), x["service_code"]))
     return result
 
 
@@ -190,7 +198,7 @@ def write_employees_sheet(ws, headers, service_headers, data_rows):
     service_column_map = {}
 
     for idx, service_name in enumerate(service_headers, start=service_start_col):
-        service_column_map[service_name] = idx
+        service_column_map[normalize_name(service_name)] = idx
 
     for row_idx, item in enumerate(data_rows, start=2):
         row = [item["employee"], item["load"], None]
@@ -243,11 +251,13 @@ def write_employees_sheet(ws, headers, service_headers, data_rows):
 def write_sources_sheet(ws, merged_rows, source_columns, service_column_map, employees_sum_row):
     ws.cell(row=1, column=1, value="Service name")
     ws.cell(row=1, column=2, value="Code")
-    ws.cell(row=2, column=1, value="")
-    ws.cell(row=2, column=2, value="")
 
     ws.cell(row=1, column=1).font = Font(bold=True)
     ws.cell(row=1, column=2).font = Font(bold=True)
+    ws.merge_cells(start_row=1, start_column=1, end_row=2, end_column=1)
+    ws.merge_cells(start_row=1, start_column=2, end_row=2, end_column=2)
+    ws.cell(row=1, column=1).alignment = Alignment(horizontal="center", vertical="center")
+    ws.cell(row=1, column=2).alignment = Alignment(horizontal="center", vertical="center")
 
     current_col = 3
     for source_name in source_columns:
@@ -259,12 +269,14 @@ def write_sources_sheet(ws, merged_rows, source_columns, service_column_map, emp
         )
         head_cell = ws.cell(row=1, column=current_col, value=source_name)
         head_cell.font = Font(bold=True)
-        head_cell.alignment = Alignment(horizontal="center")
+        head_cell.alignment = Alignment(horizontal="center", vertical="center")
 
         percent_head = ws.cell(row=2, column=current_col, value="%")
         weight_head = ws.cell(row=2, column=current_col + 1, value="weight")
         percent_head.font = Font(bold=True)
         weight_head.font = Font(bold=True)
+        percent_head.alignment = Alignment(horizontal="center")
+        weight_head.alignment = Alignment(horizontal="center")
 
         current_col += 2
 
@@ -275,7 +287,7 @@ def write_sources_sheet(ws, merged_rows, source_columns, service_column_map, emp
         ws.cell(row=row_idx, column=1, value=service_name)
         ws.cell(row=row_idx, column=2, value=service_code)
 
-        employees_service_col = service_column_map.get(service_name)
+        employees_service_col = service_column_map.get(normalize_name(service_name))
 
         current_col = 3
         for source_name in source_columns:
@@ -294,8 +306,10 @@ def write_sources_sheet(ws, merged_rows, source_columns, service_column_map, emp
                     f"=Employees!{employees_col_letter}{employees_sum_row}"
                     f"*{percent_col_letter}{row_idx}"
                 )
-                weight_cell.number_format = "0.0000"
+            else:
+                weight_cell.value = '=""'
 
+            weight_cell.number_format = "0.0000"
             current_col += 2
 
 
