@@ -13,8 +13,7 @@ from openpyxl.styles import Font
 
 load_dotenv()
 
-SD_FILE = os.getenv("SD_FILE")
-BK_FILE = os.getenv("BK_FILE")
+ACTIVITY_FILE = os.getenv("ACTIVITY_FILE", "activity.xlsx")
 
 OPENSEARCH_URL = os.getenv("OPENSEARCH_URL")
 OPENSEARCH_PORT = int(os.getenv("OPENSEARCH_PORT", "9200"))
@@ -22,13 +21,11 @@ OPENSEARCH_PORT = int(os.getenv("OPENSEARCH_PORT", "9200"))
 USER = os.getenv("USER")
 PASS = os.getenv("PASS")
 
+OUTPUT_FILE = os.getenv("OUTPUT_FILE", "CPL_report.xlsx")
+
 BAN_SERVICE_IDS = {15473}
 
-BAN_BUSINESS_TYPES: set[str] = {
-    # "Розница",
-}
-
-SKIP_UNKNOWN_SERVICE_IDS: bool = True
+SKIP_UNKNOWN_SERVICE_IDS = True
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,8 +39,8 @@ DIGITS_RE = re.compile(r"(\d+)")
 TAIL_SERVICE_RE = re.compile(r"-(\d+)(?:_\d+)?$", re.IGNORECASE)
 
 
-def clean_spaces(s: str) -> str:
-    return " ".join((s or "").replace(",", " ").split()).strip()
+def clean_spaces(s: Any) -> str:
+    return " ".join(str(s or "").replace(",", " ").split()).strip()
 
 
 def humanize_bytes(n: int) -> str:
@@ -79,49 +76,45 @@ def normalize_index_name(index_name: str) -> Optional[Tuple[str, int, str]]:
     return team, head_service_id, "default"
 
 
-def read_sd_map(path: str) -> dict[int, dict[str, str]]:
+def read_activity_map(path: str) -> dict[int, dict[str, Any]]:
+    if not path:
+        raise RuntimeError("ACTIVITY_FILE не задан")
+
     wb = load_workbook(path, read_only=True, data_only=True)
     ws = wb.worksheets[0]
 
-    sd: dict[int, dict[str, str]] = {}
+    out: dict[int, dict[str, Any]] = {}
+
     for row in ws.iter_rows(values_only=True):
-        m = DIGITS_RE.search(str(row[1] or ""))
+        if not row or len(row) < 4:
+            continue
+
+        m = DIGITS_RE.search(str(row[0] or ""))
         if not m:
             continue
 
         service_id = int(m.group(1))
-        if service_id in sd:
+        if service_id in out:
             continue
 
-        sd[service_id] = {
-            "service_name": clean_spaces(row[3]),
-            "owner": clean_spaces(row[7]),
+        service_name = clean_spaces(row[1])
+        activity_code_raw = row[2]
+        activity_name = clean_spaces(row[3])
+
+        activity_code = ""
+        if activity_code_raw is not None:
+            s = clean_spaces(activity_code_raw)
+            if s:
+                activity_code = s
+
+        out[service_id] = {
+            "service_name": service_name,
+            "activity_code": activity_code,
+            "activity_name": activity_name,
         }
 
     wb.close()
-    log.info(f"SD loaded: {len(sd)} services")
-    return sd
-
-
-def read_bk_map(path: str) -> dict[str, str]:
-    wb = load_workbook(path, read_only=True, data_only=True)
-    ws = wb.worksheets[0]
-
-    out: dict[str, str] = {}
-    for row in ws.iter_rows(values_only=True):
-        if len(row) < 45:
-            continue
-
-        fio = clean_spaces(f"{row[1]} {row[0]} {row[2]}")
-        business_type = clean_spaces(row[44])
-
-        if not fio or not business_type:
-            continue
-
-        out.setdefault(fio, business_type)
-
-    wb.close()
-    log.info(f"BK loaded: {len(out)} owners")
+    log.info(f"Activity book loaded: {len(out)} services")
     return out
 
 
@@ -206,16 +199,13 @@ def fetch_and_aggregate(client: OpenSearch) -> Tuple[List[dict[str, Any]], List[
 
 def enrich(
     rows: list[dict[str, Any]],
-    sd: dict[int, dict[str, str]],
-    bk: dict[str, str],
+    activity_map: dict[int, dict[str, Any]],
 ) -> list[dict[str, Any]]:
     for r in rows:
-        meta = sd.get(r["service_id"], {})
-        r["service_name"] = meta.get("service_name", "")
-        r["owner"] = meta.get("owner", "")
-
-        owner_norm = clean_spaces(r["owner"])
-        r["business_type"] = clean_spaces(bk.get(owner_norm, ""))
+        meta = activity_map.get(r["service_id"], {})
+        r["service_name"] = clean_spaces(meta.get("service_name", ""))
+        r["activity_code"] = clean_spaces(meta.get("activity_code", ""))
+        r["activity_name"] = clean_spaces(meta.get("activity_name", ""))
 
     return rows
 
@@ -246,33 +236,6 @@ def apply_unknown_service_filter(
     return kept, skipped_service_ids
 
 
-def apply_business_type_ban(
-    rows: list[dict[str, Any]],
-) -> Tuple[list[dict[str, Any]], Set[int]]:
-    if not BAN_BUSINESS_TYPES:
-        return rows, set()
-
-    kept: list[dict[str, Any]] = []
-    banned_service_ids: Set[int] = set()
-    banned = 0
-
-    for r in rows:
-        bt = clean_spaces(r.get("business_type", ""))
-        if bt in BAN_BUSINESS_TYPES:
-            banned += 1
-            banned_service_ids.add(int(r.get("service_id") or 0))
-            log.info(
-                f"BAN_BT | business_type={bt!r} | "
-                f"service_id={r.get('service_id')} "
-                f"service_name={r.get('service_name')!r}"
-            )
-            continue
-        kept.append(r)
-
-    log.info(f"BusinessType banned rows: {banned} (kept {len(kept)})")
-    return kept, banned_service_ids
-
-
 def finalize(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     total_all = sum(int(r["total_bytes"]) for r in rows)
 
@@ -289,7 +252,7 @@ def build_unaccounted_indices(
     per_index: List[dict[str, Any]],
     kept_service_ids: Set[int],
     unknown_service_ids: Set[int],
-    banned_bt_service_ids: Set[int],
+    activity_map: Dict[int, Dict[str, Any]],
 ) -> List[dict[str, Any]]:
     out: List[dict[str, Any]] = []
 
@@ -297,11 +260,33 @@ def build_unaccounted_indices(
         status = r.get("status")
 
         if status in ("unparsable", "banned_service_id"):
-            out.append(r)
+            r2 = dict(r)
+            sid = r2.get("service_id")
+            try:
+                sid_int = int(sid)
+            except Exception:
+                sid_int = 0
+
+            meta = activity_map.get(sid_int, {})
+            r2["service_name"] = clean_spaces(meta.get("service_name", ""))
+            r2["activity_code"] = clean_spaces(meta.get("activity_code", ""))
+            r2["activity_name"] = clean_spaces(meta.get("activity_name", ""))
+            out.append(r2)
             continue
 
         if status != "candidate":
-            out.append(r)
+            r2 = dict(r)
+            sid = r2.get("service_id")
+            try:
+                sid_int = int(sid)
+            except Exception:
+                sid_int = 0
+
+            meta = activity_map.get(sid_int, {})
+            r2["service_name"] = clean_spaces(meta.get("service_name", ""))
+            r2["activity_code"] = clean_spaces(meta.get("activity_code", ""))
+            r2["activity_name"] = clean_spaces(meta.get("activity_name", ""))
+            out.append(r2)
             continue
 
         sid = r.get("service_id")
@@ -310,17 +295,18 @@ def build_unaccounted_indices(
         except Exception:
             sid_int = 0
 
+        meta = activity_map.get(sid_int, {})
+        service_name = clean_spaces(meta.get("service_name", ""))
+        activity_code = clean_spaces(meta.get("activity_code", ""))
+        activity_name = clean_spaces(meta.get("activity_name", ""))
+
         if sid_int in unknown_service_ids:
             r2 = dict(r)
-            r2["status"] = "skipped_unknown_service"
-            r2["status_detail"] = "filtered by SKIP_UNKNOWN_SERVICE_IDS"
-            out.append(r2)
-            continue
-
-        if sid_int in banned_bt_service_ids:
-            r2 = dict(r)
-            r2["status"] = "banned_business_type"
-            r2["status_detail"] = "filtered by BAN_BUSINESS_TYPES"
+            r2["status"] = "service_not_found_in_activity"
+            r2["status_detail"] = "service_id отсутствует в activity.xlsx"
+            r2["service_name"] = service_name
+            r2["activity_code"] = activity_code
+            r2["activity_name"] = activity_name
             out.append(r2)
             continue
 
@@ -328,6 +314,9 @@ def build_unaccounted_indices(
             r2 = dict(r)
             r2["status"] = "not_in_final"
             r2["status_detail"] = "service_id not present in final report set"
+            r2["service_name"] = service_name
+            r2["activity_code"] = activity_code
+            r2["activity_name"] = activity_name
             out.append(r2)
             continue
 
@@ -341,10 +330,10 @@ def write_to_excel(path: str, rows: list[dict[str, Any]], unaccounted: list[dict
     ws.title = "CPL report"
 
     header = [
-        "Тип бизнеса",
-        "Наименование сервиса",
-        "КОД",
-        "Владелец",
+        "Имя сервиса",
+        "Код",
+        "Код активности",
+        "Наименование активности",
         "Объем",
         "% потребления",
     ]
@@ -357,10 +346,10 @@ def write_to_excel(path: str, rows: list[dict[str, Any]], unaccounted: list[dict
     for r in rows:
         ws.append(
             [
-                r.get("business_type", ""),
                 r.get("service_name", ""),
                 r.get("service_id", ""),
-                r.get("owner", ""),
+                r.get("activity_code", ""),
+                r.get("activity_name", ""),
                 r.get("size_human", ""),
                 r.get("pct", 0),
             ]
@@ -376,6 +365,9 @@ def write_to_excel(path: str, rows: list[dict[str, Any]], unaccounted: list[dict
         "detail",
         "team",
         "service_id",
+        "service_name",
+        "activity_code",
+        "activity_name",
         "rule",
         "size_human",
         "size_bytes",
@@ -392,6 +384,9 @@ def write_to_excel(path: str, rows: list[dict[str, Any]], unaccounted: list[dict
                 r.get("status_detail", ""),
                 r.get("team", ""),
                 r.get("service_id", ""),
+                r.get("service_name", ""),
+                r.get("activity_code", ""),
+                r.get("activity_name", ""),
                 r.get("rule", ""),
                 r.get("size_human", ""),
                 int(r.get("size_bytes") or 0),
@@ -403,6 +398,8 @@ def write_to_excel(path: str, rows: list[dict[str, Any]], unaccounted: list[dict
 
 
 def main():
+    activity_map = read_activity_map(ACTIVITY_FILE)
+
     host, port, use_ssl = parse_host_and_ssl(OPENSEARCH_URL, OPENSEARCH_PORT)
 
     client = OpenSearch(
@@ -414,14 +411,9 @@ def main():
     )
 
     rows, per_index = fetch_and_aggregate(client)
-    sd = read_sd_map(SD_FILE)
-    bk = read_bk_map(BK_FILE)
 
-    rows = enrich(rows, sd, bk)
-
+    rows = enrich(rows, activity_map)
     rows, unknown_service_ids = apply_unknown_service_filter(rows)
-    rows, banned_bt_service_ids = apply_business_type_ban(rows)
-
     rows = finalize(rows)
 
     kept_service_ids = {int(r.get("service_id") or 0) for r in rows}
@@ -429,10 +421,10 @@ def main():
         per_index=per_index,
         kept_service_ids=kept_service_ids,
         unknown_service_ids=unknown_service_ids,
-        banned_bt_service_ids=banned_bt_service_ids,
+        activity_map=activity_map,
     )
 
-    write_to_excel("CPL_report.xlsx", rows, unaccounted)
+    write_to_excel(OUTPUT_FILE, rows, unaccounted)
 
 
 if __name__ == "__main__":

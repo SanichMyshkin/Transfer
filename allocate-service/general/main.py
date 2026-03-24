@@ -301,7 +301,7 @@ def main():
         service_name_col=2,
         service_code_col=3,
         owner_col=4,
-        percent_col=11,
+        percent_col=6,
         header_row=1,
     )
 
