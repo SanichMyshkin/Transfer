@@ -7,7 +7,6 @@ from dotenv import load_dotenv
 from collections import defaultdict
 from openpyxl import Workbook
 from openpyxl.styles import Font
-from openpyxl.utils import get_column_letter
 from jenkins_client import JenkinsGroovyClient
 
 logger = logging.getLogger("jenkins_report")
@@ -29,13 +28,10 @@ TOKEN = os.getenv("TOKEN")
 
 EXCLUDE_PROJECTS_WITHOUT_TEAM_NUMBER = True
 
-SD_FILE = os.getenv("SD_FILE", "sd.xlsx")
-BK_FILE = os.getenv("BK_FILE", "bk_all_users.xlsx")
+ACTIVITY_FILE = os.getenv("ACTIVITY_FILE", "activity.xlsx")
 OUTPUT_XLSX = os.getenv("OUTPUT_XLSX", "jenkins_report.xlsx")
 
 BAN_SERVICE_IDS = [15473]
-BAN_BUSINESS_TYPES = []
-SKIP_EMPTY_BUSINESS_TYPE = True
 
 SCRIPT_BUILDS = r"""
 import jenkins.model.Jenkins
@@ -78,24 +74,13 @@ def clean_spaces(s: str) -> str:
     return s
 
 
-def normalize_name_key(s: str) -> str:
-    return clean_spaces(s).lower()
-
-
 def build_ban_set(ban_list):
     if not isinstance(ban_list, (list, tuple, set)):
         die("BAN_SERVICE_IDS должен быть list / tuple / set")
     return {str(x).strip() for x in ban_list if str(x).strip()}
 
 
-def build_ban_business_types_set(ban_list):
-    if not isinstance(ban_list, (list, tuple, set)):
-        die("BAN_BUSINESS_TYPES должен быть list / tuple / set")
-    return {clean_spaces(x) for x in ban_list if clean_spaces(x)}
-
-
 ban_set = build_ban_set(BAN_SERVICE_IDS)
-ban_business_types_set = build_ban_business_types_set(BAN_BUSINESS_TYPES)
 
 
 def validate_env_and_files():
@@ -108,10 +93,8 @@ def validate_env_and_files():
     if not TOKEN:
         die("ENV TOKEN пустой")
 
-    if not SD_FILE or not os.path.isfile(SD_FILE):
-        die(f"SD_FILE не найден: {SD_FILE}")
-    if not BK_FILE or not os.path.isfile(BK_FILE):
-        die(f"BK_FILE не найден: {BK_FILE}")
+    if not ACTIVITY_FILE or not os.path.isfile(ACTIVITY_FILE):
+        die(f"ACTIVITY_FILE не найден: {ACTIVITY_FILE}")
 
     out_dir = os.path.dirname(OUTPUT_XLSX)
     if out_dir and not os.path.exists(out_dir):
@@ -119,12 +102,8 @@ def validate_env_and_files():
 
     logger.info(f"Бан-лист (КОД): {sorted(ban_set) if ban_set else 'пусто'}")
     logger.info(
-        f"BAN_BUSINESS_TYPES: {sorted(ban_business_types_set) if ban_business_types_set else 'пусто'}"
-    )
-    logger.info(
         f"EXCLUDE_PROJECTS_WITHOUT_TEAM_NUMBER={EXCLUDE_PROJECTS_WITHOUT_TEAM_NUMBER}"
     )
-    logger.info(f"SKIP_EMPTY_BUSINESS_TYPE={SKIP_EMPTY_BUSINESS_TYPE}")
     logger.info("ENV/файлы ок.")
 
 
@@ -146,59 +125,53 @@ def split_project_and_team(project_raw: str):
     return project_raw, ""
 
 
-def load_sd_people_map(path: str):
-    logger.info("Читаем SD (B=КОД, D=Наименование, H=Владелец)...")
-
-    df = pd.read_excel(path, usecols="B,D,H", dtype=str, engine="openpyxl")
-    df.columns = ["service_id", "service_name", "owner"]
-    df = df.fillna("")
-
-    df["service_id"] = df["service_id"].astype(str).str.strip()
-    df["service_name"] = df["service_name"].astype(str).map(clean_spaces)
-    df["owner"] = df["owner"].astype(str).map(clean_spaces)
-
-    df = df[df["service_id"] != ""].copy()
-    last = df.drop_duplicates("service_id", keep="last")
-
-    mp = {
-        sid: {"service_name": sn, "owner": o}
-        for sid, sn, o in zip(
-            last["service_id"].tolist(),
-            last["service_name"].tolist(),
-            last["owner"].tolist(),
-        )
-    }
-
-    logger.info(f"SD: загружено сервисов по КОД: {len(mp)}")
-    return mp
+def normalize_number(x):
+    if pd.isna(x):
+        return None
+    s = str(x).strip()
+    if not s:
+        return None
+    if "." in s and s.replace(".", "", 1).isdigit():
+        try:
+            f = float(s)
+            if f.is_integer():
+                s = str(int(f))
+        except Exception:
+            pass
+    return s
 
 
-def load_bk_business_type_map(path: str):
-    logger.info("Читаем BK (A:B:C=ФИО, AS=Тип бизнеса)...")
+def load_activity_mapping(path: str):
+    logger.info("Читаем ACTIVITY (A=КОД, B=Наименование сервиса, C=Код активности, D=Наименование активности)...")
 
-    df = pd.read_excel(path, usecols="A:C,AS", dtype=str, engine="openpyxl")
-    df = df.fillna("")
-    df.columns = ["c1", "c2", "c3", "business_type"]
+    df = pd.read_excel(path, dtype=str, engine="openpyxl").fillna("")
 
-    def make_fio(r):
-        fio = " ".join(
-            [clean_spaces(r["c2"]), clean_spaces(r["c1"]), clean_spaces(r["c3"])]
-        )
-        return clean_spaces(fio)
+    map_by_number = {}
 
-    df["fio_key"] = df.apply(make_fio, axis=1).map(normalize_name_key)
-    df["business_type"] = df["business_type"].astype(str).map(clean_spaces)
+    for _, row in df.iterrows():
+        service_id = normalize_number(row.iloc[0] if len(row) > 0 else "")
+        service_name = clean_spaces(row.iloc[1] if len(row) > 1 else "")
+        activity_code = clean_spaces(row.iloc[2] if len(row) > 2 else "")
+        activity_name = clean_spaces(row.iloc[3] if len(row) > 3 else "")
 
-    df = df[df["fio_key"] != ""].copy()
-    last = df.drop_duplicates("fio_key", keep="last")
+        if not service_id:
+            continue
 
-    mp = dict(zip(last["fio_key"], last["business_type"]))
-    logger.info(f"BK: загружено ФИО->Тип бизнеса: {len(mp)}")
-    return mp
+        if service_id in map_by_number:
+            continue
+
+        map_by_number[service_id] = {
+            "service_name": service_name,
+            "activity_code": activity_code,
+            "activity_name": activity_name,
+        }
+
+    logger.info(f"ACTIVITY: загружено сервисов по КОД: {len(map_by_number)}")
+    return map_by_number
 
 
 def aggregate_builds_by_service(
-    data, sd_people_map, bk_type_map, exclude_without_team=True
+    data, activity_map, exclude_without_team=True
 ):
     logger.info("Агрегируем билды по сервису...")
 
@@ -213,8 +186,8 @@ def aggregate_builds_by_service(
         reason,
         detail,
         service_name="",
-        owner="",
-        business_type="",
+        activity_code="",
+        activity_name="",
     ):
         unaccounted.append(
             {
@@ -225,8 +198,8 @@ def aggregate_builds_by_service(
                 "reason": reason,
                 "detail": detail,
                 "service_name": service_name,
-                "owner": owner,
-                "business_type": business_type,
+                "activity_code": activity_code,
+                "activity_name": activity_name,
             }
         )
 
@@ -257,6 +230,7 @@ def aggregate_builds_by_service(
             continue
 
         if team_number and team_number in ban_set:
+            meta = activity_map.get(team_number, {})
             add_unaccounted(
                 root_project=proj or root,
                 team_number=team_number,
@@ -264,11 +238,13 @@ def aggregate_builds_by_service(
                 builds=builds,
                 reason="banned_service_id",
                 detail="team_number in BAN_SERVICE_IDS",
+                service_name=meta.get("service_name", ""),
+                activity_code=meta.get("activity_code", ""),
+                activity_name=meta.get("activity_name", ""),
             )
             continue
 
         if not team_number:
-            # сюда попадём, если exclude_without_team=False, но team_number не найден
             add_unaccounted(
                 root_project=proj or root,
                 team_number="",
@@ -282,69 +258,35 @@ def aggregate_builds_by_service(
         acc[team_number] += builds
 
     candidates = []
-    kept_service_ids = set()
-    filtered_empty_bt = 0
-    filtered_ban_bt = 0
-    filtered_sd_miss = 0
+    filtered_activity_miss = 0
 
     for team_number, builds in acc.items():
-        people = sd_people_map.get(team_number)
-        service_name = (people or {}).get("service_name", "")
-        owner = (people or {}).get("owner", "")
-        business_type = bk_type_map.get(normalize_name_key(owner), "") if owner else ""
-        business_type = clean_spaces(business_type)
+        meta = activity_map.get(team_number)
+        service_name = (meta or {}).get("service_name", "")
+        activity_code = (meta or {}).get("activity_code", "")
+        activity_name = (meta or {}).get("activity_name", "")
 
-        if not people or (not clean_spaces(service_name) and not clean_spaces(owner)):
-            filtered_sd_miss += 1
+        if not meta or not clean_spaces(service_name):
+            filtered_activity_miss += 1
             add_unaccounted(
                 root_project="",
                 team_number=team_number,
                 full_name="",
                 builds=builds,
-                reason="sd_mapping_miss",
-                detail="no match in SD for this team_number",
+                reason="activity_mapping_miss",
+                detail="no match in activity.xlsx for this team_number",
                 service_name=service_name,
-                owner=owner,
-                business_type=business_type,
-            )
-
-        if SKIP_EMPTY_BUSINESS_TYPE and not business_type:
-            filtered_empty_bt += 1
-            add_unaccounted(
-                root_project="",
-                team_number=team_number,
-                full_name="",
-                builds=builds,
-                reason="skip_empty_business_type",
-                detail="SKIP_EMPTY_BUSINESS_TYPE=True and business_type is empty",
-                service_name=service_name,
-                owner=owner,
-                business_type=business_type,
+                activity_code=activity_code,
+                activity_name=activity_name,
             )
             continue
 
-        if ban_business_types_set and business_type in ban_business_types_set:
-            filtered_ban_bt += 1
-            add_unaccounted(
-                root_project="",
-                team_number=team_number,
-                full_name="",
-                builds=builds,
-                reason="banned_business_type",
-                detail="business_type in BAN_BUSINESS_TYPES",
-                service_name=service_name,
-                owner=owner,
-                business_type=business_type,
-            )
-            continue
-
-        kept_service_ids.add(team_number)
         candidates.append(
             {
-                "business_type": business_type,
                 "service_name": service_name,
                 "team_number": team_number,
-                "owner": owner,
+                "activity_code": activity_code,
+                "activity_name": activity_name,
                 "builds": builds,
             }
         )
@@ -361,17 +303,17 @@ def aggregate_builds_by_service(
         )
         rows.append(
             [
-                x["business_type"],
                 x["service_name"],
                 x["team_number"],
-                x["owner"],
+                x["activity_code"],
+                x["activity_name"],
                 builds,
                 round(pct, 2),
             ]
         )
 
     logger.info(
-        f"Фильтры: sd_miss={filtered_sd_miss}, empty_bt={filtered_empty_bt}, ban_bt={filtered_ban_bt}. "
+        f"Фильтры: activity_miss={filtered_activity_miss}. "
         f"Итого учтенных сервисов={len(candidates)}"
     )
 
@@ -387,10 +329,10 @@ def export_excel(rows, unaccounted_rows, filename):
     ws.title = "Отчет Jenkins"
 
     headers = [
-        "Тип бизнеса",
-        "Наименование сервиса",
-        "КОД",
-        "Владелец сервиса",
+        "Имя сервиса",
+        "Код",
+        "Код активности",
+        "Наименование активности",
         "Кол-во билдов",
         "% от общего кол-ва билдов",
     ]
@@ -403,17 +345,6 @@ def export_excel(rows, unaccounted_rows, filename):
     for r in rows:
         ws.append(r)
 
-    for col_idx in range(1, len(headers) + 1):
-        max_len = 0
-        for row in ws.iter_rows(min_col=col_idx, max_col=col_idx, values_only=True):
-            v = row[0]
-            if v is None:
-                continue
-            max_len = max(max_len, len(str(v)))
-        ws.column_dimensions[get_column_letter(col_idx)].width = min(
-            max(12, max_len + 2), 60
-        )
-
     ws2 = wb.create_sheet("Unaccounted")
     headers2 = [
         "root_project",
@@ -423,8 +354,8 @@ def export_excel(rows, unaccounted_rows, filename):
         "reason",
         "detail",
         "service_name",
-        "owner",
-        "business_type",
+        "activity_code",
+        "activity_name",
     ]
     ws2.append(headers2)
     for cell in ws2[1]:
@@ -440,20 +371,9 @@ def export_excel(rows, unaccounted_rows, filename):
                 r.get("reason", ""),
                 r.get("detail", ""),
                 r.get("service_name", ""),
-                r.get("owner", ""),
-                r.get("business_type", ""),
+                r.get("activity_code", ""),
+                r.get("activity_name", ""),
             ]
-        )
-
-    for col_idx in range(1, len(headers2) + 1):
-        max_len = 0
-        for row in ws2.iter_rows(min_col=col_idx, max_col=col_idx, values_only=True):
-            v = row[0]
-            if v is None:
-                continue
-            max_len = max(max_len, len(str(v)))
-        ws2.column_dimensions[get_column_letter(col_idx)].width = min(
-            max(12, max_len + 2), 80
         )
 
     wb.save(filename)
@@ -464,15 +384,13 @@ def main():
     try:
         validate_env_and_files()
 
-        sd_people_map = load_sd_people_map(SD_FILE)
-        bk_type_map = load_bk_business_type_map(BK_FILE)
+        activity_map = load_activity_mapping(ACTIVITY_FILE)
 
         data = get_builds_inventory()
 
         rows, unaccounted = aggregate_builds_by_service(
             data,
-            sd_people_map=sd_people_map,
-            bk_type_map=bk_type_map,
+            activity_map=activity_map,
             exclude_without_team=EXCLUDE_PROJECTS_WITHOUT_TEAM_NUMBER,
         )
 
