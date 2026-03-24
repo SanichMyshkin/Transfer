@@ -20,9 +20,7 @@ GITLAB_URL = (os.getenv("GITLAB_URL") or "").rstrip("/")
 GITLAB_TOKEN = os.getenv("GITLAB_TOKEN") or ""
 
 OUT_XLSX = os.getenv("OUT_XLSX", "gitlab_report.xlsx")
-
-SD_FILE = os.getenv("SD_FILE", "sd.xlsx")
-BK_FILE = os.getenv("BK_FILE", "bk_all_users.xlsx")
+ACTIVITY_FILE = os.getenv("ACTIVITY_FILE", "activity.xlsx")
 
 SSL_VERIFY = False
 SLEEP_SEC = 0.02
@@ -34,9 +32,7 @@ BAN_SERVICE_IDS = {
     "0",
 }
 
-BAN_BUSINESS_TYPES = []
-
-SKIP_EMPTY_BUSINESS_TYPE = True
+SKIP_UNKNOWN_SERVICE_IDS = True
 
 SERVICE_ID_RE = re.compile(r"^service[_-]?id\s*:\s*(\d+)\s*$", re.IGNORECASE)
 
@@ -56,10 +52,6 @@ def clean_spaces(s: str) -> str:
     return s
 
 
-def normalize_name_key(s: str) -> str:
-    return clean_spaces(s).lower()
-
-
 def normalize_number(x):
     if pd.isna(x):
         return None
@@ -69,71 +61,42 @@ def normalize_number(x):
     return s
 
 
-def normalize_name(x):
-    if pd.isna(x):
-        return None
-    return str(x).strip().casefold()
-
-
 def build_ban_set(ban_list):
     if not isinstance(ban_list, (list, tuple, set)):
         die("BAN_SERVICE_IDS должен быть list / tuple / set")
     return {str(x).strip() for x in ban_list if str(x).strip()}
 
 
-def build_ban_business_types_set(ban_list):
-    if not isinstance(ban_list, (list, tuple, set)):
-        die("BAN_BUSINESS_TYPES должен быть list / tuple / set")
-    return {clean_spaces(x) for x in ban_list if clean_spaces(x)}
-
-
 def validate_files():
-    if not SD_FILE or not os.path.isfile(SD_FILE):
-        die(f"SD_FILE не найден: {SD_FILE}")
-    if not BK_FILE or not os.path.isfile(BK_FILE):
-        die(f"BK_FILE не найден: {BK_FILE}")
+    if not ACTIVITY_FILE or not os.path.isfile(ACTIVITY_FILE):
+        die(f"ACTIVITY_FILE не найден: {ACTIVITY_FILE}")
 
 
-def load_bk_business_type_map(path: str):
-    df = pd.read_excel(path, usecols="A:C,AS", dtype=str, engine="openpyxl").fillna("")
-    df.columns = ["c1", "c2", "c3", "business_type"]
-
-    def make_fio(r):
-        fio = " ".join([clean_spaces(r["c2"]), clean_spaces(r["c1"]), clean_spaces(r["c3"])])
-        return clean_spaces(fio)
-
-    df["fio_key"] = df.apply(make_fio, axis=1).map(normalize_name_key)
-    df["business_type"] = df["business_type"].astype(str).map(clean_spaces)
-
-    last = df[df["fio_key"] != ""].drop_duplicates("fio_key", keep="last")
-    mp = dict(zip(last["fio_key"], last["business_type"]))
-
-    log.info("BK: загружено ФИО → тип бизнеса: %d", len(mp))
-    return mp
-
-
-def load_sd_mapping(path: str):
+def load_activity_mapping(path: str):
     df = pd.read_excel(path, dtype=str, engine="openpyxl").fillna("")
+
     map_by_number = {}
-    map_by_name = {}
 
     for _, row in df.iterrows():
-        num = normalize_number(row.iloc[1] if len(row) > 1 else "")
-        sd_name_raw = row.iloc[3] if len(row) > 3 else ""
-        owner_raw = row.iloc[7] if len(row) > 7 else ""
+        service_id = normalize_number(row.iloc[0] if len(row) > 0 else "")
+        service_name = clean_spaces(row.iloc[1] if len(row) > 1 else "")
+        activity_code = clean_spaces(row.iloc[2] if len(row) > 2 else "")
+        activity_name = clean_spaces(row.iloc[3] if len(row) > 3 else "")
 
-        sd_name = clean_spaces(sd_name_raw)
-        owner = clean_spaces(owner_raw)
+        if not service_id:
+            continue
 
-        payload = {"sd_name": sd_name, "owner": owner}
+        if service_id in map_by_number:
+            continue
 
-        if num:
-            map_by_number[num] = payload
-        if sd_name:
-            map_by_name[normalize_name(sd_name)] = payload
+        map_by_number[service_id] = {
+            "service_name": service_name,
+            "activity_code": activity_code,
+            "activity_name": activity_name,
+        }
 
-    log.info("SD: загружено сервисов по номеру=%d, по имени=%d", len(map_by_number), len(map_by_name))
-    return map_by_number, map_by_name
+    log.info("ACTIVITY: загружено сервисов по номеру=%d", len(map_by_number))
+    return map_by_number
 
 
 def connect():
@@ -178,36 +141,31 @@ def pct(part: int, total: int) -> float:
     return (part / total) * 100.0
 
 
-def resolve_sd_bk(service_id: str, map_by_number, map_by_name, bk_type_map):
+def resolve_activity(service_id: str, map_by_number):
     if not service_id:
         return "", "", ""
 
-    sd = None
     norm_number = normalize_number(service_id)
     if norm_number and norm_number in map_by_number:
-        sd = map_by_number[norm_number]
-    else:
-        sd = None
+        item = map_by_number[norm_number]
+        return (
+            item.get("service_name", "") or "",
+            item.get("activity_code", "") or "",
+            item.get("activity_name", "") or "",
+        )
 
-    sd_name = (sd or {}).get("sd_name") or ""
-    owner = (sd or {}).get("owner") or ""
-    business_type = bk_type_map.get(normalize_name_key(owner), "") if owner else ""
-
-    return sd_name, owner, business_type
+    return "", "", ""
 
 
 def main():
     validate_files()
 
     ban_set = build_ban_set(BAN_SERVICE_IDS)
-    ban_business_types_set = build_ban_business_types_set(BAN_BUSINESS_TYPES)
 
     log.info("BAN_SERVICE_IDS=%s", sorted(ban_set) if ban_set else "[]")
-    log.info("BAN_BUSINESS_TYPES=%s", sorted(ban_business_types_set) if ban_business_types_set else "[]")
-    log.info("SKIP_EMPTY_BUSINESS_TYPE=%s", SKIP_EMPTY_BUSINESS_TYPE)
+    log.info("SKIP_UNKNOWN_SERVICE_IDS=%s", SKIP_UNKNOWN_SERVICE_IDS)
 
-    bk_type_map = load_bk_business_type_map(BK_FILE)
-    map_by_number, map_by_name = load_sd_mapping(SD_FILE)
+    activity_map = load_activity_mapping(ACTIVITY_FILE)
 
     gl = connect()
 
@@ -217,19 +175,19 @@ def main():
     ws_sum = wb.active
     ws_sum.title = "ByServiceId"
 
-    # ИЗМЕНЕНО: заголовки и порядок колонок на 1 листе (ByServiceId)
     ws_sum.append(
         [
-            "Тип бизнеса",
-            "Наименование сервиса",
-            "КОД",
-            "Владелец",
+            "Имя сервиса",
+            "Код",
+            "Код активности",
+            "Наименование активности",
             "кол-во проектов",
             "Объем репозиториев (bytes)",
-            "Oбъем репозитория",
+            "Объем репозиториев",
             "Объем джобов(bytes)",
             "Объем джобов",
-            "Сумарнный объем",
+            "Суммарный объем(bytes)",
+            "Суммарный объем",
             "% потребления",
         ]
     )
@@ -243,9 +201,9 @@ def main():
             "detail",
             "sid_status",
             "service_id",
-            "sd_name",
-            "owner",
-            "business_type",
+            "service_name",
+            "activity_code",
+            "activity_name",
             "project_id",
             "project",
             "web_url",
@@ -260,7 +218,16 @@ def main():
     for c in ws_unmapped[1]:
         c.font = Font(bold=True)
 
-    agg = defaultdict(lambda: {"projects": 0, "repo": 0, "job": 0, "sd_name": "", "owner": "", "business_type": ""})
+    agg = defaultdict(
+        lambda: {
+            "projects": 0,
+            "repo": 0,
+            "job": 0,
+            "service_name": "",
+            "activity_code": "",
+            "activity_name": "",
+        }
+    )
 
     total_repo_all = 0
     total_job_all = 0
@@ -269,9 +236,7 @@ def main():
     processed = 0
 
     skipped_ban_sid = 0
-    skipped_sd_miss = 0
-    skipped_empty_bt = 0
-    skipped_ban_bt = 0
+    skipped_activity_miss = 0
     unmapped_missing = 0
     unmapped_conflict = 0
 
@@ -300,12 +265,12 @@ def main():
             total_repo_all += repo_bytes
             total_job_all += job_bytes
 
-            sd_name = ""
-            owner = ""
-            business_type = ""
+            service_name = ""
+            activity_code = ""
+            activity_name = ""
 
             if sid_status == "OK":
-                sd_name, owner, business_type = resolve_sd_bk(service_id, map_by_number, map_by_name, bk_type_map)
+                service_name, activity_code, activity_name = resolve_activity(service_id, activity_map)
 
                 if service_id in ban_set:
                     skipped_ban_sid += 1
@@ -315,9 +280,9 @@ def main():
                             "service_id in BAN_SERVICE_IDS",
                             sid_status,
                             service_id,
-                            sd_name,
-                            owner,
-                            business_type,
+                            service_name,
+                            activity_code,
+                            activity_name,
                             proj_id,
                             name,
                             web_url,
@@ -332,67 +297,17 @@ def main():
                     processed += 1
                     continue
 
-                if not sd_name and not owner:
-                    skipped_sd_miss += 1
+                if SKIP_UNKNOWN_SERVICE_IDS and not clean_spaces(service_name):
+                    skipped_activity_miss += 1
                     ws_unmapped.append(
                         [
-                            "sd_mapping_miss",
-                            "no match in SD by service_id",
+                            "activity_mapping_miss",
+                            "no match in activity.xlsx by service_id",
                             sid_status,
                             service_id,
-                            sd_name,
-                            owner,
-                            business_type,
-                            proj_id,
-                            name,
-                            web_url,
-                            repo_bytes,
-                            humanize.naturalsize(repo_bytes, binary=True),
-                            job_bytes,
-                            humanize.naturalsize(job_bytes, binary=True) if job_bytes else "",
-                            total_bytes,
-                            humanize.naturalsize(total_bytes, binary=True),
-                        ]
-                    )
-                    processed += 1
-                    continue
-
-                if SKIP_EMPTY_BUSINESS_TYPE and not clean_spaces(business_type):
-                    skipped_empty_bt += 1
-                    ws_unmapped.append(
-                        [
-                            "skip_empty_business_type",
-                            "SKIP_EMPTY_BUSINESS_TYPE=True and business_type is empty",
-                            sid_status,
-                            service_id,
-                            sd_name,
-                            owner,
-                            business_type,
-                            proj_id,
-                            name,
-                            web_url,
-                            repo_bytes,
-                            humanize.naturalsize(repo_bytes, binary=True),
-                            job_bytes,
-                            humanize.naturalsize(job_bytes, binary=True) if job_bytes else "",
-                            total_bytes,
-                            humanize.naturalsize(total_bytes, binary=True),
-                        ]
-                    )
-                    processed += 1
-                    continue
-
-                if ban_business_types_set and clean_spaces(business_type) in ban_business_types_set:
-                    skipped_ban_bt += 1
-                    ws_unmapped.append(
-                        [
-                            "banned_business_type",
-                            "business_type in BAN_BUSINESS_TYPES",
-                            sid_status,
-                            service_id,
-                            sd_name,
-                            owner,
-                            business_type,
+                            service_name,
+                            activity_code,
+                            activity_name,
                             proj_id,
                             name,
                             web_url,
@@ -412,12 +327,12 @@ def main():
                 a["repo"] += repo_bytes
                 a["job"] += job_bytes
 
-                if not a["sd_name"] and sd_name:
-                    a["sd_name"] = sd_name
-                if not a["owner"] and owner:
-                    a["owner"] = owner
-                if not a["business_type"] and business_type:
-                    a["business_type"] = business_type
+                if not a["service_name"] and service_name:
+                    a["service_name"] = service_name
+                if not a["activity_code"] and activity_code:
+                    a["activity_code"] = activity_code
+                if not a["activity_name"] and activity_name:
+                    a["activity_name"] = activity_name
 
             else:
                 if sid_status == "MISSING":
@@ -435,9 +350,9 @@ def main():
                         detail,
                         sid_status,
                         service_id,
-                        sd_name,
-                        owner,
-                        business_type,
+                        service_name,
+                        activity_code,
+                        activity_name,
                         proj_id,
                         name,
                         web_url,
@@ -474,17 +389,18 @@ def main():
 
         ws_sum.append(
             [
-                agg[service_id]["business_type"],               # Тип бизнеса
-                agg[service_id]["sd_name"],                     # Наименование сервиса
-                service_id,                                     # КОД
-                agg[service_id]["owner"],                       # Владелец
-                agg[service_id]["projects"],                    # кол-во проектов
-                repo_b,                                         # Объем репозиториев (bytes)
-                humanize.naturalsize(repo_b, binary=True),      # Oбъем репозитория
-                job_b,                                          # Объем джобов(bytes)
-                humanize.naturalsize(job_b, binary=True) if job_b else "",  # Объем джобов
-                humanize.naturalsize(total_b, binary=True),     # Сумарнный объем
-                round(pct(total_b, total_all), 4),              # % потребления
+                agg[service_id]["service_name"],
+                service_id,
+                agg[service_id]["activity_code"],
+                agg[service_id]["activity_name"],
+                agg[service_id]["projects"],
+                repo_b,
+                humanize.naturalsize(repo_b, binary=True),
+                job_b,
+                humanize.naturalsize(job_b, binary=True) if job_b else "",
+                total_b,
+                humanize.naturalsize(total_b, binary=True),
+                round(pct(total_b, total_all), 4),
             ]
         )
 
@@ -500,13 +416,11 @@ def main():
         humanize.naturalsize(total_all, binary=True),
     )
     log.info(
-        "Unmapped breakdown: missing=%d conflict=%d ban_sid=%d sd_miss=%d empty_bt=%d ban_bt=%d",
+        "Unmapped breakdown: missing=%d conflict=%d ban_sid=%d activity_miss=%d",
         unmapped_missing,
         unmapped_conflict,
         skipped_ban_sid,
-        skipped_sd_miss,
-        skipped_empty_bt,
-        skipped_ban_bt,
+        skipped_activity_miss,
     )
     log.info("Готово")
 
