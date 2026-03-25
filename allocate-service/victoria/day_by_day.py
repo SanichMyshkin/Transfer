@@ -38,14 +38,12 @@ TEAM_SERVICE_ID_OVERRIDES = {
 }
 
 EXCLUDE_NO_SERVICE_ID_AT_QUERY = False
-EXTRAPOLATION_DAYS = int(os.getenv("EXTRAPOLATION_DAYS", "90"))
 
 ACTIVITY_FILE = os.getenv("ACTIVITY_FILE", "activity.xlsx")
 
 TEAM_TAIL_ID_RE = re.compile(r"^(.*)-(\d+)$")
 
 WINDOW_HOURS = int(os.getenv("WINDOW_HOURS", "24"))
-WINDOW_DAYS = WINDOW_HOURS / 24.0
 
 DB_BACKEND = (os.getenv("DB_BACKEND", "sqlite") or "sqlite").strip().lower()
 SQLITE_DB_FILE = os.getenv("SQLITE_DB_FILE", "victoria_daily.sqlite")
@@ -317,7 +315,7 @@ def aggregate_to_group(metric_rows):
         acc[key]["samples_value"] += samples
 
     out = []
-    for (_, _), v in acc.items():
+    for _, v in acc.items():
         out.append(
             {
                 "team": v["team_base"],
@@ -516,9 +514,6 @@ class BaseDb:
     def load_period_rows(self, lookback_days: int) -> pd.DataFrame:
         raise NotImplementedError
 
-    def get_period_snapshot_days(self, lookback_days: int) -> int:
-        raise NotImplementedError
-
 
 class SqliteDb(BaseDb):
     def __init__(self, path: str):
@@ -708,21 +703,6 @@ class SqliteDb(BaseDb):
             )
         return pd.DataFrame(rows)
 
-    def get_period_snapshot_days(self, lookback_days: int) -> int:
-        cur = self.conn.cursor()
-        start_date = self._period_start_date(lookback_days)
-
-        if start_date is None:
-            cur.execute("SELECT COUNT(*) AS cnt FROM snapshot_runs")
-        else:
-            cur.execute(
-                "SELECT COUNT(*) AS cnt FROM snapshot_runs WHERE snapshot_date >= ?",
-                (start_date,),
-            )
-
-        row = cur.fetchone()
-        return int(row["cnt"] if row else 0)
-
 
 class PostgresDb(BaseDb):
     def __init__(self):
@@ -740,14 +720,37 @@ def get_db() -> BaseDb:
     raise SystemExit(f"Неизвестный DB_BACKEND: {DB_BACKEND}")
 
 
-def build_period_report(df_period: pd.DataFrame, snapshot_days: int) -> pd.DataFrame:
+def calc_period_distance_days(df_period: pd.DataFrame) -> int:
+    if df_period is None or df_period.empty or "snapshot_date" not in df_period.columns:
+        return 1
+
+    dates = pd.to_datetime(df_period["snapshot_date"], errors="coerce").dropna()
+    if dates.empty:
+        return 1
+
+    min_dt = dates.min().date()
+    max_dt = dates.max().date()
+    delta_days = (max_dt - min_dt).days + 1
+
+    if delta_days <= 0:
+        return 1
+    return int(delta_days)
+
+
+def build_period_samples_col_name(df_period: pd.DataFrame) -> str:
+    days_distance = calc_period_distance_days(df_period)
+    return f"samples_за_{days_distance}d"
+
+
+def build_period_report(df_period: pd.DataFrame) -> pd.DataFrame:
+    samples_col = build_period_samples_col_name(df_period)
+
     report_cols = [
         "Имя сервиса",
         "Код",
         "Код активности",
         "Наименование активности",
-        "samples_за_период",
-        "эксрополяция",
+        samples_col,
         "% от общего числа",
     ]
 
@@ -778,13 +781,13 @@ def build_period_report(df_period: pd.DataFrame, snapshot_days: int) -> pd.DataF
             }
         )
         out_parts.append(
-            has_code.rename(columns={"samples_value": "samples_за_период"})[
+            has_code.rename(columns={"samples_value": samples_col})[
                 [
                     "Имя сервиса",
                     "Код",
                     "Код активности",
                     "Наименование активности",
-                    "samples_за_период",
+                    samples_col,
                 ]
             ]
         )
@@ -801,13 +804,13 @@ def build_period_report(df_period: pd.DataFrame, snapshot_days: int) -> pd.DataF
             }
         )
         out_parts.append(
-            no_code.rename(columns={"samples_value": "samples_за_период"})[
+            no_code.rename(columns={"samples_value": samples_col})[
                 [
                     "Имя сервиса",
                     "Код",
                     "Код активности",
                     "Наименование активности",
-                    "samples_за_период",
+                    samples_col,
                 ]
             ]
         )
@@ -816,21 +819,14 @@ def build_period_report(df_period: pd.DataFrame, snapshot_days: int) -> pd.DataF
         return pd.DataFrame(columns=report_cols)
 
     out = pd.concat(out_parts, ignore_index=True)
-    out["samples_за_период"] = out["samples_за_период"].fillna(0).astype(int)
+    out[samples_col] = out[samples_col].fillna(0).astype(int)
 
-    if snapshot_days > 0:
-        out["эксрополяция"] = out["samples_за_период"].apply(
-            lambda x: int(round((x / snapshot_days) * EXTRAPOLATION_DAYS))
-        )
-    else:
-        out["эксрополяция"] = 0
-
-    total = float(out["samples_за_период"].sum())
-    out["% от общего числа"] = (out["samples_за_период"] / total * 100.0) if total else 0.0
+    total = float(out[samples_col].sum())
+    out["% от общего числа"] = (out[samples_col] / total * 100.0) if total else 0.0
     out["% от общего числа"] = out["% от общего числа"].round(5)
 
     out = out[report_cols]
-    out = out.sort_values(["samples_за_период"], ascending=False).reset_index(drop=True)
+    out = out.sort_values([samples_col], ascending=False).reset_index(drop=True)
     return out
 
 
@@ -880,7 +876,6 @@ def main():
     log.info("VM_URL=%s", vm_url)
     log.info("WINDOW_HOURS=%s", WINDOW_HOURS)
     log.info("EXCLUDE_NO_SERVICE_ID_AT_QUERY=%s", EXCLUDE_NO_SERVICE_ID_AT_QUERY)
-    log.info("EXTRAPOLATION_DAYS=%s", EXTRAPOLATION_DAYS)
     log.info("BAN_SERVICE_IDS=%s", sorted(ban_service_set) if ban_service_set else "[]")
     log.info("ACTIVITY_FILE=%s", ACTIVITY_FILE)
     log.info("DB_BACKEND=%s", DB_BACKEND)
@@ -1122,12 +1117,11 @@ def main():
         db.save_daily_snapshot(today_snapshot, df_daily)
 
     df_period = db.load_period_rows(SNAPSHOT_LOOKBACK_DAYS)
-    snapshot_days = db.get_period_snapshot_days(SNAPSHOT_LOOKBACK_DAYS)
 
     log.info("Period rows loaded: %d", len(df_period))
-    log.info("Snapshot days in period: %d", snapshot_days)
+    log.info("Period distance days: %d", calc_period_distance_days(df_period))
 
-    df_report = build_period_report(df_period, snapshot_days)
+    df_report = build_period_report(df_period)
 
     df_unacc = pd.DataFrame(list(unacc_map.values()))
     if not df_unacc.empty:
