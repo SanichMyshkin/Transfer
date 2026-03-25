@@ -514,6 +514,9 @@ class BaseDb:
     def load_period_rows(self, lookback_days: int) -> pd.DataFrame:
         raise NotImplementedError
 
+    def close(self):
+        raise NotImplementedError
+
 
 class SqliteDb(BaseDb):
     def __init__(self, path: str):
@@ -579,73 +582,77 @@ class SqliteDb(BaseDb):
         now_str = datetime.now(timezone.utc).isoformat()
         cur = self.conn.cursor()
 
-        cur.execute("BEGIN")
+        try:
+            cur.execute("BEGIN")
 
-        cur.execute(
-            "SELECT 1 FROM snapshot_runs WHERE snapshot_date = ? LIMIT 1",
-            (snapshot_date,),
-        )
-        if cur.fetchone() is not None:
-            self.conn.rollback()
-            log.info("Snapshot for %s already exists in DB", snapshot_date)
-            return
-
-        rows = []
-        for row in df_daily.to_dict("records"):
-            service_name = clean_spaces(row.get("Имя сервиса", ""))
-            service_id = normalize_sid(row.get("Код", ""))
-            activity_code = clean_spaces(row.get("Код активности", ""))
-            activity_name = clean_spaces(row.get("Наименование активности", ""))
-            samples_value = int(row.get("samples_value", 0) or 0)
-            service_key = service_id if service_id else service_name
-
-            rows.append(
-                (
-                    snapshot_date,
-                    service_key,
-                    service_id,
-                    service_name,
-                    activity_code,
-                    activity_name,
-                    samples_value,
-                    WINDOW_HOURS,
-                    now_str,
-                )
+            cur.execute(
+                "SELECT 1 FROM snapshot_runs WHERE snapshot_date = ? LIMIT 1",
+                (snapshot_date,),
             )
+            if cur.fetchone() is not None:
+                self.conn.rollback()
+                log.info("Snapshot for %s already exists in DB", snapshot_date)
+                return
 
-        if rows:
-            cur.executemany(
+            rows = []
+            for row in df_daily.to_dict("records"):
+                service_name = clean_spaces(row.get("Имя сервиса", ""))
+                service_id = normalize_sid(row.get("Код", ""))
+                activity_code = clean_spaces(row.get("Код активности", ""))
+                activity_name = clean_spaces(row.get("Наименование активности", ""))
+                samples_value = int(row.get("samples_value", 0) or 0)
+                service_key = service_id if service_id else service_name
+
+                rows.append(
+                    (
+                        snapshot_date,
+                        service_key,
+                        service_id,
+                        service_name,
+                        activity_code,
+                        activity_name,
+                        samples_value,
+                        WINDOW_HOURS,
+                        now_str,
+                    )
+                )
+
+            if rows:
+                cur.executemany(
+                    """
+                    INSERT OR IGNORE INTO daily_activity_samples (
+                        snapshot_date,
+                        service_key,
+                        service_id,
+                        service_name,
+                        activity_code,
+                        activity_name,
+                        samples_value,
+                        window_hours,
+                        created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    rows,
+                )
+
+            cur.execute(
                 """
-                INSERT OR IGNORE INTO daily_activity_samples (
+                INSERT INTO snapshot_runs (
                     snapshot_date,
-                    service_key,
-                    service_id,
-                    service_name,
-                    activity_code,
-                    activity_name,
-                    samples_value,
-                    window_hours,
+                    rows_count,
                     created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?)
                 """,
-                rows,
+                (snapshot_date, len(rows), now_str),
             )
 
-        cur.execute(
-            """
-            INSERT INTO snapshot_runs (
-                snapshot_date,
-                rows_count,
-                created_at
-            )
-            VALUES (?, ?, ?)
-            """,
-            (snapshot_date, len(rows), now_str),
-        )
-
-        self.conn.commit()
-        log.info("Snapshot saved into DB: %s rows=%d", snapshot_date, len(rows))
+            self.conn.commit()
+            log.info("Snapshot saved into DB: %s rows=%d", snapshot_date, len(rows))
+        except Exception:
+            self.conn.rollback()
+            raise
 
     def _period_start_date(self, lookback_days: int) -> str | None:
         if lookback_days <= 0:
@@ -703,6 +710,11 @@ class SqliteDb(BaseDb):
             )
         return pd.DataFrame(rows)
 
+    def close(self):
+        if getattr(self, "conn", None) is not None:
+            self.conn.close()
+            self.conn = None
+
 
 class PostgresDb(BaseDb):
     def __init__(self):
@@ -710,6 +722,21 @@ class PostgresDb(BaseDb):
             "DB_BACKEND=postgres пока не реализован в этом коде. "
             "Схема и интерфейс уже подготовлены, сейчас используй sqlite."
         )
+
+    def init_schema(self):
+        raise NotImplementedError
+
+    def has_snapshot(self, snapshot_date: str) -> bool:
+        raise NotImplementedError
+
+    def save_daily_snapshot(self, snapshot_date: str, df_daily: pd.DataFrame):
+        raise NotImplementedError
+
+    def load_period_rows(self, lookback_days: int) -> pd.DataFrame:
+        raise NotImplementedError
+
+    def close(self):
+        return
 
 
 def get_db() -> BaseDb:
@@ -871,268 +898,271 @@ def main():
         sys.exit(1)
 
     db = get_db()
-    db.init_schema()
+    try:
+        db.init_schema()
 
-    log.info("VM_URL=%s", vm_url)
-    log.info("WINDOW_HOURS=%s", WINDOW_HOURS)
-    log.info("EXCLUDE_NO_SERVICE_ID_AT_QUERY=%s", EXCLUDE_NO_SERVICE_ID_AT_QUERY)
-    log.info("BAN_SERVICE_IDS=%s", sorted(ban_service_set) if ban_service_set else "[]")
-    log.info("ACTIVITY_FILE=%s", ACTIVITY_FILE)
-    log.info("DB_BACKEND=%s", DB_BACKEND)
-    log.info("SQLITE_DB_FILE=%s", SQLITE_DB_FILE)
-    log.info("SNAPSHOT_LOOKBACK_DAYS=%s", SNAPSHOT_LOOKBACK_DAYS)
+        log.info("VM_URL=%s", vm_url)
+        log.info("WINDOW_HOURS=%s", WINDOW_HOURS)
+        log.info("EXCLUDE_NO_SERVICE_ID_AT_QUERY=%s", EXCLUDE_NO_SERVICE_ID_AT_QUERY)
+        log.info("BAN_SERVICE_IDS=%s", sorted(ban_service_set) if ban_service_set else "[]")
+        log.info("ACTIVITY_FILE=%s", ACTIVITY_FILE)
+        log.info("DB_BACKEND=%s", DB_BACKEND)
+        log.info("SQLITE_DB_FILE=%s", SQLITE_DB_FILE)
+        log.info("SNAPSHOT_LOOKBACK_DAYS=%s", SNAPSHOT_LOOKBACK_DAYS)
 
-    activity_df = read_activity_map(ACTIVITY_FILE)
+        activity_df = read_activity_map(ACTIVITY_FILE)
 
-    overrides = {}
-    for k, v in (TEAM_SERVICE_ID_OVERRIDES or {}).items():
-        kk = clean_spaces(k)
-        vv = normalize_sid(v)
-        if kk and vv:
-            overrides[kk] = vv
+        overrides = {}
+        for k, v in (TEAM_SERVICE_ID_OVERRIDES or {}).items():
+            kk = clean_spaces(k)
+            vv = normalize_sid(v)
+            if kk and vv:
+                overrides[kk] = vv
 
-    today_snapshot = datetime.now(timezone.utc).date().isoformat()
+        today_snapshot = datetime.now(timezone.utc).date().isoformat()
 
-    unacc_map = {}
+        unacc_map = {}
 
-    def add_unacc_once(
-        stage, team, service_id, metric, reason, detail, samples_value=None
-    ):
-        key = (team or "", service_id or "", metric or "")
-        if key in unacc_map:
-            return
+        def add_unacc_once(
+            stage, team, service_id, metric, reason, detail, samples_value=None
+        ):
+            key = (team or "", service_id or "", metric or "")
+            if key in unacc_map:
+                return
 
-        sid = normalize_sid(service_id)
-        service_name = ""
-        activity_code = ""
-        activity_name = ""
+            sid = normalize_sid(service_id)
+            service_name = ""
+            activity_code = ""
+            activity_name = ""
 
-        if sid and not activity_df.empty:
-            match = activity_df[activity_df["code"].astype(str) == sid]
-            if not match.empty:
-                first = match.iloc[0]
-                service_name = clean_spaces(first.get("service_name", ""))
-                activity_code = clean_spaces(first.get("activity_code", ""))
-                activity_name = clean_spaces(first.get("activity_name", ""))
+            if sid and not activity_df.empty:
+                match = activity_df[activity_df["code"].astype(str) == sid]
+                if not match.empty:
+                    first = match.iloc[0]
+                    service_name = clean_spaces(first.get("service_name", ""))
+                    activity_code = clean_spaces(first.get("activity_code", ""))
+                    activity_name = clean_spaces(first.get("activity_name", ""))
 
-        unacc_map[key] = {
-            "stage": stage,
-            "team": team or "",
-            "service_id": sid,
-            "service_name": service_name,
-            "activity_code": activity_code,
-            "activity_name": activity_name,
-            "metric": metric or "",
-            "samples_value": "" if samples_value is None else int(samples_value),
-            "reason": reason,
-            "detail": detail,
-        }
+            unacc_map[key] = {
+                "stage": stage,
+                "team": team or "",
+                "service_id": sid,
+                "service_name": service_name,
+                "activity_code": activity_code,
+                "activity_name": activity_name,
+                "metric": metric or "",
+                "samples_value": "" if samples_value is None else int(samples_value),
+                "reason": reason,
+                "detail": detail,
+            }
 
-    if db.has_snapshot(today_snapshot):
-        log.info("Snapshot for today already exists: %s", today_snapshot)
-        log.info("Heavy Victoria collection skipped")
-    else:
-        log.info("No snapshot for today, starting heavy Victoria collection")
+        if db.has_snapshot(today_snapshot):
+            log.info("Snapshot for today already exists: %s", today_snapshot)
+            log.info("Heavy Victoria collection skipped")
+        else:
+            log.info("No snapshot for today, starting heavy Victoria collection")
 
-        log.info("Discover series ...")
-        series_rows = discover_series(vm_url)
-        log.info("Series found: %d", len(series_rows))
+            log.info("Discover series ...")
+            series_rows = discover_series(vm_url)
+            log.info("Series found: %d", len(series_rows))
 
-        team_to_sid_map, ambiguous_teams = build_team_to_sid_maps(series_rows)
-        log.info("Team->SID inferred map size: %d", len(team_to_sid_map))
-        log.info("Ambiguous teams: %d", len(ambiguous_teams))
-        log.info("Overrides: %d", len(overrides))
+            team_to_sid_map, ambiguous_teams = build_team_to_sid_maps(series_rows)
+            log.info("Team->SID inferred map size: %d", len(team_to_sid_map))
+            log.info("Ambiguous teams: %d", len(ambiguous_teams))
+            log.info("Overrides: %d", len(overrides))
 
-        end_dt = datetime.now(timezone.utc)
+            end_dt = datetime.now(timezone.utc)
 
-        metrics_audit = []
-        accounted_metric_rows = []
+            metrics_audit = []
+            accounted_metric_rows = []
 
-        for idx, r in enumerate(series_rows, 1):
-            team_raw = (r.get("team_raw") or "").strip()
-            team_base = (r.get("team_base") or "").strip()
-            service_id_raw = normalize_sid(r.get("service_id_raw"))
-            sid_from_team = normalize_sid(r.get("sid_from_team"))
-            sid_seed = normalize_sid(r.get("sid_seed"))
-            metric = (r.get("metric") or "").strip()
+            for idx, r in enumerate(series_rows, 1):
+                team_raw = (r.get("team_raw") or "").strip()
+                team_base = (r.get("team_base") or "").strip()
+                service_id_raw = normalize_sid(r.get("service_id_raw"))
+                sid_from_team = normalize_sid(r.get("sid_from_team"))
+                sid_seed = normalize_sid(r.get("sid_seed"))
+                metric = (r.get("metric") or "").strip()
 
-            if not metric:
-                continue
+                if not metric:
+                    continue
 
-            service_id_final = sid_seed
-            stage = ""
-            reason = ""
-            detail = ""
-            status = "accounted"
+                service_id_final = sid_seed
+                stage = ""
+                reason = ""
+                detail = ""
+                status = "accounted"
 
-            ov = overrides.get(team_base)
-            if ov:
-                service_id_final = ov
-            else:
-                if not service_id_final:
-                    if (
-                        (not service_id_raw)
-                        and (not sid_from_team)
-                        and (team_base in ambiguous_teams)
-                    ):
-                        status = "unaccounted"
-                        stage = "infer"
-                        reason = "ambiguous_service_id"
-                        detail = "multiple service_id detected for team_base"
-                    else:
-                        inferred = team_to_sid_map.get(team_base, "")
-                        if (not service_id_raw) and (not sid_from_team) and inferred:
-                            service_id_final = inferred
+                ov = overrides.get(team_base)
+                if ov:
+                    service_id_final = ov
+                else:
+                    if not service_id_final:
+                        if (
+                            (not service_id_raw)
+                            and (not sid_from_team)
+                            and (team_base in ambiguous_teams)
+                        ):
+                            status = "unaccounted"
+                            stage = "infer"
+                            reason = "ambiguous_service_id"
+                            detail = "multiple service_id detected for team_base"
+                        else:
+                            inferred = team_to_sid_map.get(team_base, "")
+                            if (not service_id_raw) and (not sid_from_team) and inferred:
+                                service_id_final = inferred
 
-            if is_banned_team(team_base):
-                status = "unaccounted"
-                stage = "discover"
-                reason = "banned_team"
-                detail = "team in BAN_TEAMS"
+                if is_banned_team(team_base):
+                    status = "unaccounted"
+                    stage = "discover"
+                    reason = "banned_team"
+                    detail = "team in BAN_TEAMS"
 
-            if (
-                status == "accounted"
-                and service_id_final
-                and service_id_final in ban_service_set
-            ):
-                status = "unaccounted"
-                stage = "discover"
-                reason = "banned_service_id"
-                detail = "service_id in BAN_SERVICE_IDS"
+                if (
+                    status == "accounted"
+                    and service_id_final
+                    and service_id_final in ban_service_set
+                ):
+                    status = "unaccounted"
+                    stage = "discover"
+                    reason = "banned_service_id"
+                    detail = "service_id in BAN_SERVICE_IDS"
 
-            if (
-                status == "accounted"
-                and EXCLUDE_NO_SERVICE_ID_AT_QUERY
-                and not service_id_final
-            ):
-                status = "unaccounted"
-                stage = "discover"
-                reason = "excluded_no_service_id"
-                detail = "EXCLUDE_NO_SERVICE_ID_AT_QUERY=True and service_id empty"
+                if (
+                    status == "accounted"
+                    and EXCLUDE_NO_SERVICE_ID_AT_QUERY
+                    and not service_id_final
+                ):
+                    status = "unaccounted"
+                    stage = "discover"
+                    reason = "excluded_no_service_id"
+                    detail = "EXCLUDE_NO_SERVICE_ID_AT_QUERY=True and service_id empty"
 
-            samples_value = 0
-            try:
-                samples_value = samples_for_series(vm_url, metric, team_raw, service_id_raw, end_dt)
-            except Exception as e:
-                add_unacc_once(
-                    "samples",
-                    team_base,
-                    service_id_final,
-                    metric,
-                    "samples_failed",
-                    str(e),
-                    samples_value=None,
-                )
                 samples_value = 0
+                try:
+                    samples_value = samples_for_series(vm_url, metric, team_raw, service_id_raw, end_dt)
+                except Exception as e:
+                    add_unacc_once(
+                        "samples",
+                        team_base,
+                        service_id_final,
+                        metric,
+                        "samples_failed",
+                        str(e),
+                        samples_value=None,
+                    )
+                    samples_value = 0
 
-            if status == "unaccounted":
-                add_unacc_once(
-                    stage,
-                    team_base,
-                    service_id_final,
-                    metric,
-                    reason,
-                    detail,
-                    samples_value=samples_value,
-                )
-            else:
-                accounted_metric_rows.append(
+                if status == "unaccounted":
+                    add_unacc_once(
+                        stage,
+                        team_base,
+                        service_id_final,
+                        metric,
+                        reason,
+                        detail,
+                        samples_value=samples_value,
+                    )
+                else:
+                    accounted_metric_rows.append(
+                        {
+                            "team_base": team_base,
+                            "service_id_final": service_id_final,
+                            "samples_value": int(samples_value),
+                        }
+                    )
+
+                metrics_audit.append(
                     {
                         "team_base": team_base,
+                        "team_raw": team_raw,
+                        "service_id_raw": service_id_raw,
                         "service_id_final": service_id_final,
+                        "metric": metric,
                         "samples_value": int(samples_value),
+                        "status": status,
+                        "stage": stage,
+                        "reason": reason,
+                        "detail": detail,
                     }
                 )
 
-            metrics_audit.append(
-                {
-                    "team_base": team_base,
-                    "team_raw": team_raw,
-                    "service_id_raw": service_id_raw,
-                    "service_id_final": service_id_final,
-                    "metric": metric,
-                    "samples_value": int(samples_value),
-                    "status": status,
-                    "stage": stage,
-                    "reason": reason,
-                    "detail": detail,
-                }
-            )
+                if idx % 200 == 0:
+                    log.info("Processed: %d/%d", idx, len(series_rows))
 
-            if idx % 200 == 0:
-                log.info("Processed: %d/%d", idx, len(series_rows))
+                time.sleep(SLEEP_SEC)
 
-            time.sleep(SLEEP_SEC)
+            group_rows = aggregate_to_group(accounted_metric_rows)
+            enriched = enrich_group_rows(group_rows, activity_df)
 
-        group_rows = aggregate_to_group(accounted_metric_rows)
-        enriched = enrich_group_rows(group_rows, activity_df)
+            if not enriched.empty:
+                accounted = enriched.copy()
 
-        if not enriched.empty:
-            accounted = enriched.copy()
+                def mark_unacc_for_service(team, sid, stage, reason, detail):
+                    for rr in metrics_audit:
+                        if rr.get("status") != "accounted":
+                            continue
+                        if (rr.get("team_base") or "") == (team or "") and normalize_sid(
+                            rr.get("service_id_final")
+                        ) == normalize_sid(sid):
+                            add_unacc_once(
+                                stage,
+                                rr.get("team_base", ""),
+                                rr.get("service_id_final", ""),
+                                rr.get("metric", ""),
+                                reason,
+                                detail,
+                                samples_value=int(rr.get("samples_value", 0) or 0),
+                            )
+                            rr["status"] = "unaccounted"
+                            rr["stage"] = stage
+                            rr["reason"] = reason
+                            rr["detail"] = detail
 
-            def mark_unacc_for_service(team, sid, stage, reason, detail):
-                for rr in metrics_audit:
-                    if rr.get("status") != "accounted":
-                        continue
-                    if (rr.get("team_base") or "") == (team or "") and normalize_sid(
-                        rr.get("service_id_final")
-                    ) == normalize_sid(sid):
-                        add_unacc_once(
-                            stage,
-                            rr.get("team_base", ""),
-                            rr.get("service_id_final", ""),
-                            rr.get("metric", ""),
-                            reason,
-                            detail,
-                            samples_value=int(rr.get("samples_value", 0) or 0),
-                        )
-                        rr["status"] = "unaccounted"
-                        rr["stage"] = stage
-                        rr["reason"] = reason
-                        rr["detail"] = detail
+                m_activity_missing = accounted["activity_found"] == False
+                for rr in accounted[m_activity_missing].to_dict("records"):
+                    mark_unacc_for_service(
+                        rr.get("team", ""),
+                        rr.get("service_id", ""),
+                        "enrich",
+                        "activity_mapping_miss",
+                        "service_id not found in activity.xlsx",
+                    )
 
-            m_activity_missing = accounted["activity_found"] == False
-            for rr in accounted[m_activity_missing].to_dict("records"):
-                mark_unacc_for_service(
-                    rr.get("team", ""),
-                    rr.get("service_id", ""),
-                    "enrich",
-                    "activity_mapping_miss",
-                    "service_id not found in activity.xlsx",
+                accounted = accounted[accounted["activity_found"] == True].copy()
+                df_daily = build_daily_df_report(accounted)
+            else:
+                df_daily = pd.DataFrame(
+                    columns=[
+                        "Имя сервиса",
+                        "Код",
+                        "Код активности",
+                        "Наименование активности",
+                        "samples_value",
+                    ]
                 )
 
-            accounted = accounted[accounted["activity_found"] == True].copy()
-            df_daily = build_daily_df_report(accounted)
-        else:
-            df_daily = pd.DataFrame(
-                columns=[
-                    "Имя сервиса",
-                    "Код",
-                    "Код активности",
-                    "Наименование активности",
-                    "samples_value",
-                ]
-            )
+            db.save_daily_snapshot(today_snapshot, df_daily)
 
-        db.save_daily_snapshot(today_snapshot, df_daily)
+        df_period = db.load_period_rows(SNAPSHOT_LOOKBACK_DAYS)
 
-    df_period = db.load_period_rows(SNAPSHOT_LOOKBACK_DAYS)
+        log.info("Period rows loaded: %d", len(df_period))
+        log.info("Period distance days: %d", calc_period_distance_days(df_period))
 
-    log.info("Period rows loaded: %d", len(df_period))
-    log.info("Period distance days: %d", calc_period_distance_days(df_period))
+        df_report = build_period_report(df_period)
 
-    df_report = build_period_report(df_period)
+        df_unacc = pd.DataFrame(list(unacc_map.values()))
+        if not df_unacc.empty:
+            df_unacc = df_unacc.reindex(columns=UNACC_COLS).fillna("")
+            df_unacc = df_unacc.sort_values(
+                ["stage", "reason", "team", "service_id", "metric"]
+            ).reset_index(drop=True)
 
-    df_unacc = pd.DataFrame(list(unacc_map.values()))
-    if not df_unacc.empty:
-        df_unacc = df_unacc.reindex(columns=UNACC_COLS).fillna("")
-        df_unacc = df_unacc.sort_values(
-            ["stage", "reason", "team", "service_id", "metric"]
-        ).reset_index(drop=True)
-
-    log.info("Saving report: %s", OUTPUT_FILE)
-    write_report(df_report, df_unacc)
-    log.info("✔ Done")
+        log.info("Saving report: %s", OUTPUT_FILE)
+        write_report(df_report, df_unacc)
+        log.info("✔ Done")
+    finally:
+        db.close()
 
 
 if __name__ == "__main__":
