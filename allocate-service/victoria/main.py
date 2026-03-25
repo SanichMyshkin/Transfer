@@ -11,6 +11,7 @@ import urllib3
 from dotenv import load_dotenv
 from openpyxl import Workbook
 from openpyxl.styles import Font
+from openpyxl import load_workbook
 import pandas as pd
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -30,18 +31,15 @@ SLEEP_SEC = 0.01
 
 BAN_TEAMS = []
 BAN_SERVICE_IDS = [15473]
-BAN_BUSINESS_TYPES = []
 
 TEAM_SERVICE_ID_OVERRIDES = {
     "service": "1234"
 }
 
-SKIP_EMPTY_BUSINESS_TYPE = True
 EXCLUDE_NO_SERVICE_ID_AT_QUERY = False
 EXTRAPOLATION_DAYS = 90
 
-SD_FILE = os.getenv("SD_FILE")
-BK_FILE = os.getenv("BK_FILE")
+ACTIVITY_FILE = os.getenv("ACTIVITY_FILE", "activity.xlsx")
 
 TEAM_TAIL_ID_RE = re.compile(r"^(.*)-(\d+)$")
 
@@ -49,10 +47,10 @@ WINDOW_HOURS = 24
 WINDOW_DAYS = WINDOW_HOURS / 24.0
 
 REPORT_COLS = [
-    "Тип бизнеса",
-    "Наименование сервиса",
-    "КОД",
-    "Владелец сервиса",
+    "Имя сервиса",
+    "Код",
+    "Код активности",
+    "Наименование активности",
     "samples_24h",
     "эксрополяция",
     "% от общего числа",
@@ -62,6 +60,9 @@ UNACC_COLS = [
     "stage",
     "team",
     "service_id",
+    "service_name",
+    "activity_code",
+    "activity_name",
     "metric",
     "samples_24h",
     "reason",
@@ -76,22 +77,24 @@ def build_ban_set(ban_list):
 
 
 ban_service_set = build_ban_set(BAN_SERVICE_IDS)
-ban_business_set = {
-    " ".join(str(x).replace(",", " ").split())
-    for x in BAN_BUSINESS_TYPES
-    if " ".join(str(x).replace(",", " ").split())
-}
 
 
-def clean_spaces(s: str) -> str:
-    s = (s or "").strip()
+def clean_spaces(s) -> str:
+    if s is None:
+        return ""
+    s = str(s).strip()
     s = s.replace(",", " ")
     s = " ".join(s.split())
     return s
 
 
-def normalize_name_key(s: str) -> str:
-    return clean_spaces(s).lower()
+def normalize_code(v):
+    if v is None:
+        return ""
+    if isinstance(v, (int, float)):
+        return str(int(v))
+    s = str(v).strip()
+    return s[:-2] if s.endswith(".0") and s[:-2].isdigit() else s
 
 
 def is_all_zeros(s: str) -> bool:
@@ -135,7 +138,7 @@ def pick_better_sid(a: str, b: str) -> str:
 
 def http_query(vm_url: str, query: str, at_ts: float | None = None):
     url = vm_url.rstrip("/") + "/api/v1/query"
-    log.info(f"QUERY: {query}")
+    log.info("QUERY: %s", query)
     params = {"query": query}
     if at_ts is not None:
         params["time"] = at_ts
@@ -164,38 +167,38 @@ def is_banned_team(team_base: str) -> bool:
     return False
 
 
-def read_sd_map(path: str) -> pd.DataFrame:
+def read_activity_map(path: str) -> pd.DataFrame:
     if not path or not os.path.exists(path):
-        log.warning("SD_FILE не найден: %s", path)
-        return pd.DataFrame(columns=["code", "sd_name", "owner"])
+        log.warning("ACTIVITY_FILE не найден: %s", path)
+        return pd.DataFrame(columns=["code", "service_name", "activity_code", "activity_name"])
 
-    df = pd.read_excel(path, sheet_name=0, header=None, dtype=str).fillna("")
-    out = pd.DataFrame(
-        {
-            "code": df.iloc[:, 1].astype(str).str.extract(r"(\d+)", expand=False),
-            "sd_name": df.iloc[:, 3].map(clean_spaces),
-            "owner": df.iloc[:, 7].map(clean_spaces),
-        }
-    )
-    out = out[out["code"].notna()].copy()
-    out["code"] = out["code"].astype(str)
-    return out.drop_duplicates(subset=["code"], keep="first")
+    wb = load_workbook(path, read_only=True, data_only=True)
+    ws = wb.worksheets[0]
 
+    rows = []
+    for row in ws.iter_rows(values_only=True):
+        code = normalize_code(row[0] if len(row) > 0 else None)
+        if not code:
+            continue
 
-def load_bk_business_type_map(path: str) -> dict:
-    if not path or not os.path.exists(path):
-        log.warning("BK_FILE не найден: %s", path)
-        return {}
+        rows.append(
+            {
+                "code": code,
+                "service_name": clean_spaces(row[1] if len(row) > 1 else ""),
+                "activity_code": clean_spaces(row[2] if len(row) > 2 else ""),
+                "activity_name": clean_spaces(row[3] if len(row) > 3 else ""),
+            }
+        )
 
-    df = pd.read_excel(path, usecols="A:C,AS", dtype=str).fillna("")
-    df.columns = ["c1", "c2", "c3", "business_type"]
+    wb.close()
 
-    fio = (df["c2"] + " " + df["c1"] + " " + df["c3"]).map(clean_spaces)
-    df["fio_key"] = fio.map(normalize_name_key)
-    df["business_type"] = df["business_type"].map(clean_spaces)
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return pd.DataFrame(columns=["code", "service_name", "activity_code", "activity_name"])
 
-    df = df[df["fio_key"] != ""].drop_duplicates("fio_key", keep="last")
-    return dict(zip(df["fio_key"], df["business_type"]))
+    out = out.drop_duplicates(subset=["code"], keep="first").copy()
+    log.info("ACTIVITY loaded: %d", len(out))
+    return out
 
 
 def discover_series(vm_url: str):
@@ -327,7 +330,7 @@ def aggregate_to_group(metric_rows):
     return out
 
 
-def enrich_group_rows(group_rows, sd_df: pd.DataFrame, bk_map: dict):
+def enrich_group_rows(group_rows, activity_df: pd.DataFrame):
     df = pd.DataFrame(group_rows)
     if df.empty:
         return pd.DataFrame(
@@ -336,37 +339,27 @@ def enrich_group_rows(group_rows, sd_df: pd.DataFrame, bk_map: dict):
                 "service_id",
                 "code",
                 "service_name",
-                "owner_for_report",
-                "business_type",
+                "activity_code",
+                "activity_name",
                 "samples_24h",
                 "эксрополяция",
-                "sd_found",
-                "bk_found",
+                "activity_found",
             ]
         )
 
-    df["service_id"] = (
-        df["service_id"].astype(str).fillna("").map(lambda x: normalize_sid(x))
-    )
-    df["code"] = df["service_id"].str.extract(r"(\d+)", expand=False).fillna("")
-    df.loc[df["code"].isin(list(ban_service_set)), "code"] = ""
+    df["service_id"] = df["service_id"].astype(str).fillna("").map(normalize_sid)
+    df["code"] = df["service_id"].astype(str)
 
-    out = df.merge(sd_df, left_on="code", right_on="code", how="left")
-    out["sd_found"] = (
-        out["sd_name"].fillna("").astype(str).map(lambda x: x.strip() != "")
+    out = df.merge(activity_df, left_on="code", right_on="code", how="left")
+    out["activity_found"] = (
+        out["service_name"].fillna("").astype(str).map(lambda x: x.strip() != "")
     )
 
-    out["service_name"] = out["sd_name"].fillna("").astype(str)
+    out["service_name"] = out["service_name"].fillna("").astype(str)
     out.loc[out["service_name"] == "", "service_name"] = out["team"]
 
-    out["owner_for_report"] = out["owner"].fillna("").astype(str).map(clean_spaces)
-
-    def _bt(owner: str) -> str:
-        owner = clean_spaces(owner)
-        return bk_map.get(normalize_name_key(owner), "") if owner else ""
-
-    out["business_type"] = out["owner_for_report"].map(_bt).map(clean_spaces)
-    out["bk_found"] = out["business_type"].map(lambda x: x.strip() != "")
+    out["activity_code"] = out["activity_code"].fillna("").astype(str).map(clean_spaces)
+    out["activity_name"] = out["activity_name"].fillna("").astype(str).map(clean_spaces)
 
     out = out.rename(columns={"extrapolation": "эксрополяция"})
     out["samples_24h"] = out["samples_24h"].fillna(0).astype(int)
@@ -378,12 +371,11 @@ def enrich_group_rows(group_rows, sd_df: pd.DataFrame, bk_map: dict):
             "service_id",
             "code",
             "service_name",
-            "owner_for_report",
-            "business_type",
+            "activity_code",
+            "activity_name",
             "samples_24h",
             "эксрополяция",
-            "sd_found",
-            "bk_found",
+            "activity_found",
         ]
     ]
 
@@ -403,38 +395,38 @@ def dedupe_and_add_percent(df: pd.DataFrame) -> pd.DataFrame:
         return out.reindex(columns=REPORT_COLS)
 
     df = df.copy()
-    df["КОД"] = df["КОД"].fillna("").astype(str).map(lambda x: normalize_sid(x))
+    df["Код"] = df["Код"].fillna("").astype(str).map(normalize_sid)
 
-    has_code = df[df["КОД"] != ""].copy()
-    no_code = df[df["КОД"] == ""].copy()
+    has_code = df[df["Код"] != ""].copy()
+    no_code = df[df["Код"] == ""].copy()
 
     if not has_code.empty:
-        has_code = has_code.groupby("КОД", as_index=False).agg(
+        has_code = has_code.groupby("Код", as_index=False).agg(
             {
-                "Тип бизнеса": _first_non_empty,
-                "Наименование сервиса": _first_non_empty,
-                "Владелец сервиса": _first_non_empty,
+                "Имя сервиса": _first_non_empty,
+                "Код активности": _first_non_empty,
+                "Наименование активности": _first_non_empty,
                 "samples_24h": "sum",
                 "эксрополяция": "sum",
             }
         )
 
     if not no_code.empty:
-        no_code = no_code.groupby("Наименование сервиса", as_index=False).agg(
+        no_code = no_code.groupby("Имя сервиса", as_index=False).agg(
             {
-                "Тип бизнеса": _first_non_empty,
-                "КОД": _first_non_empty,
-                "Владелец сервиса": _first_non_empty,
+                "Код": _first_non_empty,
+                "Код активности": _first_non_empty,
+                "Наименование активности": _first_non_empty,
                 "samples_24h": "sum",
                 "эксрополяция": "sum",
             }
         )
         no_code = no_code[
             [
-                "Тип бизнеса",
-                "Наименование сервиса",
-                "КОД",
-                "Владелец сервиса",
+                "Имя сервиса",
+                "Код",
+                "Код активности",
+                "Наименование активности",
                 "samples_24h",
                 "эксрополяция",
             ]
@@ -493,11 +485,9 @@ def main():
     log.info("EXCLUDE_NO_SERVICE_ID_AT_QUERY=%s", EXCLUDE_NO_SERVICE_ID_AT_QUERY)
     log.info("EXTRAPOLATION_DAYS=%s", EXTRAPOLATION_DAYS)
     log.info("BAN_SERVICE_IDS=%s", sorted(ban_service_set) if ban_service_set else "[]")
-    log.info("SD_FILE=%s", SD_FILE)
-    log.info("BK_FILE=%s", BK_FILE)
+    log.info("ACTIVITY_FILE=%s", ACTIVITY_FILE)
 
-    sd_df = read_sd_map(SD_FILE)
-    bk_map = load_bk_business_type_map(BK_FILE)
+    activity_df = read_activity_map(ACTIVITY_FILE)
 
     overrides = {}
     for k, v in (TEAM_SERVICE_ID_OVERRIDES or {}).items():
@@ -514,10 +504,27 @@ def main():
         key = (team or "", service_id or "", metric or "")
         if key in unacc_map:
             return
+
+        sid = normalize_sid(service_id)
+        service_name = ""
+        activity_code = ""
+        activity_name = ""
+
+        if sid and not activity_df.empty:
+            match = activity_df[activity_df["code"].astype(str) == sid]
+            if not match.empty:
+                first = match.iloc[0]
+                service_name = clean_spaces(first.get("service_name", ""))
+                activity_code = clean_spaces(first.get("activity_code", ""))
+                activity_name = clean_spaces(first.get("activity_name", ""))
+
         unacc_map[key] = {
             "stage": stage,
             "team": team or "",
-            "service_id": service_id or "",
+            "service_id": sid,
+            "service_name": service_name,
+            "activity_code": activity_code,
+            "activity_name": activity_name,
             "metric": metric or "",
             "samples_24h": "" if samples_24h is None else int(samples_24h),
             "reason": reason,
@@ -655,7 +662,7 @@ def main():
         time.sleep(SLEEP_SEC)
 
     group_rows = aggregate_to_group(accounted_metric_rows)
-    enriched = enrich_group_rows(group_rows, sd_df, bk_map)
+    enriched = enrich_group_rows(group_rows, activity_df)
 
     if enriched.empty:
         df_report = pd.DataFrame(columns=REPORT_COLS)
@@ -684,77 +691,31 @@ def main():
                     rr["reason"] = reason
                     rr["detail"] = detail
 
-        m_sd_missing = (accounted["code"].fillna("").astype(str).str.strip() != "") & (
-            ~accounted["sd_found"]
-        )
-        for rr in accounted[m_sd_missing].to_dict("records"):
+        m_activity_missing = accounted["activity_found"] == False
+        for rr in accounted[m_activity_missing].to_dict("records"):
             mark_unacc_for_service(
                 rr.get("team", ""),
                 rr.get("service_id", ""),
                 "enrich",
-                "sd_not_found",
-                "code extracted but not found in SD",
+                "activity_mapping_miss",
+                "service_id not found in activity.xlsx",
             )
 
-        m_owner_empty = accounted["owner_for_report"].map(clean_spaces) == ""
-        for rr in accounted[m_owner_empty].to_dict("records"):
-            mark_unacc_for_service(
-                rr.get("team", ""),
-                rr.get("service_id", ""),
-                "enrich",
-                "owner_empty_in_sd",
-                "owner empty after SD merge",
-            )
-
-        m_bk_missing = (~m_owner_empty) & (
-            accounted["business_type"].map(clean_spaces) == ""
-        )
-        for rr in accounted[m_bk_missing].to_dict("records"):
-            mark_unacc_for_service(
-                rr.get("team", ""),
-                rr.get("service_id", ""),
-                "enrich",
-                "owner_not_in_bk",
-                "owner present but business_type not found in BK",
-            )
-
-        if SKIP_EMPTY_BUSINESS_TYPE:
-            m = accounted["business_type"].map(clean_spaces) == ""
-            for rr in accounted[m].to_dict("records"):
-                mark_unacc_for_service(
-                    rr.get("team", ""),
-                    rr.get("service_id", ""),
-                    "filter",
-                    "empty_business_type",
-                    "SKIP_EMPTY_BUSINESS_TYPE=True and business_type empty",
-                )
-            accounted = accounted[~m].copy()
-
-        if ban_business_set:
-            m = accounted["business_type"].map(clean_spaces).isin(ban_business_set)
-            for rr in accounted[m].to_dict("records"):
-                mark_unacc_for_service(
-                    rr.get("team", ""),
-                    rr.get("service_id", ""),
-                    "filter",
-                    "banned_business_type",
-                    "business_type in BAN_BUSINESS_TYPES",
-                )
-            accounted = accounted[~m].copy()
+        accounted = accounted[accounted["activity_found"] == True].copy()
 
         df_for_report = accounted.rename(
             columns={
-                "business_type": "Тип бизнеса",
-                "service_name": "Наименование сервиса",
-                "service_id": "КОД",
-                "owner_for_report": "Владелец сервиса",
+                "service_name": "Имя сервиса",
+                "service_id": "Код",
+                "activity_code": "Код активности",
+                "activity_name": "Наименование активности",
             }
         )[
             [
-                "Тип бизнеса",
-                "Наименование сервиса",
-                "КОД",
-                "Владелец сервиса",
+                "Имя сервиса",
+                "Код",
+                "Код активности",
+                "Наименование активности",
                 "samples_24h",
                 "эксрополяция",
             ]
