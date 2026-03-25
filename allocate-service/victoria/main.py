@@ -691,7 +691,7 @@ def main():
                     rr["reason"] = reason
                     rr["detail"] = detail
 
-        m_activity_missing = accounted["activity_found"] == False
+        m_activity_missing = ~accounted["activity_found"]
         for rr in accounted[m_activity_missing].to_dict("records"):
             mark_unacc_for_service(
                 rr.get("team", ""),
@@ -701,7 +701,7 @@ def main():
                 "service_id not found in activity.xlsx",
             )
 
-        accounted = accounted[accounted["activity_found"] == True].copy()
+        accounted = accounted[accounted["activity_found"]].copy()
 
         df_for_report = accounted.rename(
             columns={

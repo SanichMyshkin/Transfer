@@ -33,9 +33,7 @@ SLEEP_SEC = float(os.getenv("SLEEP_SEC", "0.01"))
 BAN_TEAMS = []
 BAN_SERVICE_IDS = [15473]
 
-TEAM_SERVICE_ID_OVERRIDES = {
-    "service": "1234"
-}
+TEAM_SERVICE_ID_OVERRIDES = {"service": "1234"}
 
 EXCLUDE_NO_SERVICE_ID_AT_QUERY = False
 
@@ -171,7 +169,9 @@ def is_banned_team(team_base: str) -> bool:
 def read_activity_map(path: str) -> pd.DataFrame:
     if not path or not os.path.exists(path):
         log.warning("ACTIVITY_FILE не найден: %s", path)
-        return pd.DataFrame(columns=["code", "service_name", "activity_code", "activity_name"])
+        return pd.DataFrame(
+            columns=["code", "service_name", "activity_code", "activity_name"]
+        )
 
     wb = load_workbook(path, read_only=True, data_only=True)
     ws = wb.worksheets[0]
@@ -195,7 +195,9 @@ def read_activity_map(path: str) -> pd.DataFrame:
 
     out = pd.DataFrame(rows)
     if out.empty:
-        return pd.DataFrame(columns=["code", "service_name", "activity_code", "activity_name"])
+        return pd.DataFrame(
+            columns=["code", "service_name", "activity_code", "activity_name"]
+        )
 
     out = out.drop_duplicates(subset=["code"], keep="first").copy()
     log.info("ACTIVITY loaded: %d", len(out))
@@ -395,7 +397,9 @@ def dedupe_daily_report(df: pd.DataFrame) -> pd.DataFrame:
     df["Код"] = df["Код"].fillna("").astype(str).map(normalize_sid)
     df["Имя сервиса"] = df["Имя сервиса"].fillna("").astype(str).map(clean_spaces)
     df["Код активности"] = df["Код активности"].fillna("").astype(str).map(clean_spaces)
-    df["Наименование активности"] = df["Наименование активности"].fillna("").astype(str).map(clean_spaces)
+    df["Наименование активности"] = (
+        df["Наименование активности"].fillna("").astype(str).map(clean_spaces)
+    )
     df["samples_value"] = df["samples_value"].fillna(0).astype(int)
 
     has_code = df[df["Код"] != ""].copy()
@@ -463,8 +467,12 @@ def dedupe_daily_report(df: pd.DataFrame) -> pd.DataFrame:
     out = pd.concat(out_parts, ignore_index=True)
     out["Имя сервиса"] = out["Имя сервиса"].fillna("").astype(str).map(clean_spaces)
     out["Код"] = out["Код"].fillna("").astype(str).map(normalize_sid)
-    out["Код активности"] = out["Код активности"].fillna("").astype(str).map(clean_spaces)
-    out["Наименование активности"] = out["Наименование активности"].fillna("").astype(str).map(clean_spaces)
+    out["Код активности"] = (
+        out["Код активности"].fillna("").astype(str).map(clean_spaces)
+    )
+    out["Наименование активности"] = (
+        out["Наименование активности"].fillna("").astype(str).map(clean_spaces)
+    )
     out["samples_value"] = out["samples_value"].fillna(0).astype(int)
     return out
 
@@ -788,7 +796,9 @@ def build_period_report(df_period: pd.DataFrame) -> pd.DataFrame:
     df["Код"] = df["service_id"].fillna("").astype(str).map(normalize_sid)
     df["Имя сервиса"] = df["service_name"].fillna("").astype(str).map(clean_spaces)
     df["Код активности"] = df["activity_code"].fillna("").astype(str).map(clean_spaces)
-    df["Наименование активности"] = df["activity_name"].fillna("").astype(str).map(clean_spaces)
+    df["Наименование активности"] = (
+        df["activity_name"].fillna("").astype(str).map(clean_spaces)
+    )
     df["samples_value"] = df["samples_value"].fillna(0).astype(int)
 
     has_code = df[df["Код"] != ""].copy()
@@ -904,7 +914,9 @@ def main():
         log.info("VM_URL=%s", vm_url)
         log.info("WINDOW_HOURS=%s", WINDOW_HOURS)
         log.info("EXCLUDE_NO_SERVICE_ID_AT_QUERY=%s", EXCLUDE_NO_SERVICE_ID_AT_QUERY)
-        log.info("BAN_SERVICE_IDS=%s", sorted(ban_service_set) if ban_service_set else "[]")
+        log.info(
+            "BAN_SERVICE_IDS=%s", sorted(ban_service_set) if ban_service_set else "[]"
+        )
         log.info("ACTIVITY_FILE=%s", ACTIVITY_FILE)
         log.info("DB_BACKEND=%s", DB_BACKEND)
         log.info("SQLITE_DB_FILE=%s", SQLITE_DB_FILE)
@@ -1009,7 +1021,11 @@ def main():
                             detail = "multiple service_id detected for team_base"
                         else:
                             inferred = team_to_sid_map.get(team_base, "")
-                            if (not service_id_raw) and (not sid_from_team) and inferred:
+                            if (
+                                (not service_id_raw)
+                                and (not sid_from_team)
+                                and inferred
+                            ):
                                 service_id_final = inferred
 
                 if is_banned_team(team_base):
@@ -1040,7 +1056,9 @@ def main():
 
                 samples_value = 0
                 try:
-                    samples_value = samples_for_series(vm_url, metric, team_raw, service_id_raw, end_dt)
+                    samples_value = samples_for_series(
+                        vm_url, metric, team_raw, service_id_raw, end_dt
+                    )
                 except Exception as e:
                     add_unacc_once(
                         "samples",
@@ -1102,7 +1120,9 @@ def main():
                     for rr in metrics_audit:
                         if rr.get("status") != "accounted":
                             continue
-                        if (rr.get("team_base") or "") == (team or "") and normalize_sid(
+                        if (rr.get("team_base") or "") == (
+                            team or ""
+                        ) and normalize_sid(
                             rr.get("service_id_final")
                         ) == normalize_sid(sid):
                             add_unacc_once(
@@ -1119,7 +1139,7 @@ def main():
                             rr["reason"] = reason
                             rr["detail"] = detail
 
-                m_activity_missing = accounted["activity_found"] == False
+                m_activity_missing = ~accounted["activity_found"]
                 for rr in accounted[m_activity_missing].to_dict("records"):
                     mark_unacc_for_service(
                         rr.get("team", ""),
@@ -1129,7 +1149,7 @@ def main():
                         "service_id not found in activity.xlsx",
                     )
 
-                accounted = accounted[accounted["activity_found"] == True].copy()
+                accounted = accounted[accounted["activity_found"]].copy()
                 df_daily = build_daily_df_report(accounted)
             else:
                 df_daily = pd.DataFrame(
