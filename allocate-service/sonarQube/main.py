@@ -24,42 +24,13 @@ SONAR_TOKEN = os.getenv("SONAR_TOKEN", "")
 SONAR2_TOKEN = os.getenv("SONAR2_TOKEN", "")
 
 OUT_FILE = os.getenv("OUT_FILE", "sonarQube_report.xlsx")
-SD_FILE = os.getenv("SD_FILE")
-BK_FILE = os.getenv("BK_FILE", "bk_all_users.xlsx")
+ACTIVITY_FILE = os.getenv("ACTIVITY_FILE", "activity.xlsx")
 
-SKIP_IF_CODE_NOT_IN_SD = True
-SKIP_EMPTY_SERVICES = True
-
-BAN_SERVICE_IDS = [15473]
-BAN_BUSINESS_TYPES = []
-SKIP_EMPTY_BUSINESS_TYPE = True
-
-
-def die(msg: str):
-    logger.error(msg)
-    raise SystemExit(2)
-
-
-def build_ban_set(v):
-    if not isinstance(v, (list, tuple, set)):
-        die("BAN_SERVICE_IDS должен быть list/tuple/set")
-    return {str(x).strip() for x in v if str(x).strip()}
-
-
-ban_set = build_ban_set(BAN_SERVICE_IDS)
-ban_business_set = {
-    " ".join(str(x).replace(",", " ").split())
-    for x in BAN_BUSINESS_TYPES
-    if " ".join(str(x).replace(",", " ").split())
-}
+BAN_SERVICE_IDS = {15473}
 
 
 def clean(s):
     return " ".join((s or "").replace(",", " ").split())
-
-
-def norm_key(s):
-    return clean(s).lower()
 
 
 def normalize_code(v):
@@ -78,12 +49,12 @@ def split_service_name_code(prefix: str):
     p = (prefix or "").strip()
     if not p:
         return "", ""
+
     m = CODE_ANYWHERE_RE.search(p)
     if not m:
         return p, ""
 
-    code = m.group(1)
-    return p, code
+    return p, m.group(1)
 
 
 def make_session(token):
@@ -141,56 +112,20 @@ def measure(s, url, key, metric, branch=None, pr=None):
     d = sonar_get(s, url, "/api/measures/component", params)
     m = (d.get("component", {}).get("measures") or [{}])[0]
     v = (m.get("period") or {}).get("value") if pr else m.get("value")
+
     try:
         return int(float(v))
     except Exception:
         return 0
 
 
-def load_sd(path):
-    if not path or not os.path.exists(path):
-        return {}
-
-    wb = load_workbook(path, data_only=True)
-    ws = wb.active
-    m = {}
-
-    for r in ws.iter_rows(min_row=2, values_only=True):
-        code = normalize_code(r[1] if len(r) > 1 else None)
-        if not code:
-            continue
-        m[code] = {
-            "name": clean(r[3] if len(r) > 3 else ""),
-            "owner": clean(r[7] if len(r) > 7 else ""),
-        }
-    return m
-
-
-def load_bk(path):
-    if not path or not os.path.exists(path):
-        return {}
-
-    wb = load_workbook(path, data_only=True)
-    ws = wb.active
-    m = {}
-
-    for r in ws.iter_rows(min_row=2, values_only=True):
-        fio = clean(f"{r[1] or ''} {r[0] or ''} {r[2] or ''}")
-        bt = clean(r[44] if len(r) > 44 else "")
-        if fio:
-            m[norm_key(fio)] = bt
-    return m
-
-
-def pick_bt(bk, owner):
-    return clean(bk.get(norm_key(owner)) if owner else "")
-
-
 def calc_project_tasks_lines(s, url, key, tasks, ncloc_cache, new_cache):
     tcnt, lines = 0, 0
+
     for t in tasks:
         tcnt += 1
         pr, br = t.get("pullRequest"), t.get("branch")
+
         if pr:
             ck = (key, pr)
             if ck not in new_cache:
@@ -204,10 +139,31 @@ def calc_project_tasks_lines(s, url, key, tasks, ncloc_cache, new_cache):
                     s, url, key, "ncloc", branch=None if b == "__main__" else b
                 )
             lines += ncloc_cache[ck]
+
     return tcnt, lines
 
 
-def process_sonar(url, token, sd, bk, acc, unaccounted):
+def load_activity(path):
+    wb = load_workbook(path, read_only=True, data_only=True)
+    ws = wb.active
+
+    m = {}
+
+    for r in ws.iter_rows(values_only=True):
+        code = normalize_code(r[0] if len(r) > 0 else "")
+        if not code:
+            continue
+
+        m[code] = {
+            "service_name": clean(r[1] if len(r) > 1 else ""),
+            "activity_code": clean(r[2] if len(r) > 2 else ""),
+            "activity_name": clean(r[3] if len(r) > 3 else ""),
+        }
+
+    return m
+
+
+def process_sonar(url, token, activity, acc, unacc):
     if not url or not token:
         return
 
@@ -219,34 +175,6 @@ def process_sonar(url, token, sd, bk, acc, unaccounted):
 
     ncloc_cache, new_cache = {}, {}
 
-    def add_unacc(
-        reason,
-        detail,
-        project_key,
-        prefix,
-        svc_guess,
-        code,
-        owner,
-        bt,
-        tasks_total,
-        total_lines,
-    ):
-        unaccounted.append(
-            {
-                "instance": label,
-                "project_key": project_key or "",
-                "prefix": prefix or "",
-                "svc_guess": svc_guess or "",
-                "code": code or "",
-                "owner": owner or "",
-                "business_type": bt or "",
-                "tasks_total": int(tasks_total or 0),
-                "total_lines": int(total_lines or 0),
-                "reason": reason,
-                "detail": detail,
-            }
-        )
-
     for p in projects:
         key = p.get("key")
         if not key:
@@ -255,244 +183,125 @@ def process_sonar(url, token, sd, bk, acc, unaccounted):
         prefix = key.split(":", 1)[0]
         svc_guess, code = split_service_name_code(prefix)
 
-        tasks_total = 0
-        total_lines = 0
-
         if not code:
-            add_unacc(
-                reason="no_code_in_key",
-                detail=f"cannot parse code from prefix={prefix!r} (expected digits somewhere in prefix)",
-                project_key=key,
-                prefix=prefix,
-                svc_guess=svc_guess,
-                code="",
-                owner="",
-                bt="",
-                tasks_total=0,
-                total_lines=0,
+            unacc.append(
+                dict(
+                    instance=label,
+                    project_key=key,
+                    code="",
+                    reason="no_code",
+                    detail="cannot parse service_id",
+                )
             )
             continue
 
-        if code in ban_set:
-            add_unacc(
-                reason="banned_service_id",
-                detail=f"code={code} in BAN_SERVICE_IDS",
-                project_key=key,
-                prefix=prefix,
-                svc_guess=svc_guess,
-                code=code,
-                owner="",
-                bt="",
-                tasks_total=0,
-                total_lines=0,
+        if code in BAN_SERVICE_IDS:
+            unacc.append(
+                dict(
+                    instance=label,
+                    project_key=key,
+                    code=code,
+                    reason="banned_service_id",
+                )
             )
             continue
 
-        if SKIP_IF_CODE_NOT_IN_SD and code not in sd:
-            add_unacc(
-                reason="code_not_in_sd",
-                detail=f"SKIP_IF_CODE_NOT_IN_SD=True and code={code} not found in SD",
-                project_key=key,
-                prefix=prefix,
-                svc_guess=svc_guess,
-                code=code,
-                owner="",
-                bt="",
-                tasks_total=0,
-                total_lines=0,
+        meta = activity.get(code)
+        if not meta:
+            unacc.append(
+                dict(
+                    instance=label,
+                    project_key=key,
+                    code=code,
+                    reason="activity_mapping_miss",
+                )
             )
             continue
-
-        sd_row = sd.get(code, {})
-        svc = sd_row.get("name") or svc_guess
-        owner = sd_row.get("owner") or ""
-        bt = pick_bt(bk, owner)
 
         tasks = get_tasks(s, url, key)
-        tasks_total, total_lines = calc_project_tasks_lines(
+        tcnt, lines = calc_project_tasks_lines(
             s, url, key, tasks, ncloc_cache, new_cache
-        )
-
-        if SKIP_EMPTY_SERVICES and not tasks_total and not total_lines:
-            add_unacc(
-                reason="empty_service_usage",
-                detail="SKIP_EMPTY_SERVICES=True and tasks_total=0 and total_lines=0",
-                project_key=key,
-                prefix=prefix,
-                svc_guess=svc,
-                code=code,
-                owner=owner,
-                bt=bt,
-                tasks_total=tasks_total,
-                total_lines=total_lines,
-            )
-            continue
-
-        if SKIP_EMPTY_BUSINESS_TYPE and not bt:
-            det = (
-                "owner empty in SD"
-                if not owner
-                else "owner not found in BK or BK business_type empty"
-            )
-            add_unacc(
-                reason="empty_business_type",
-                detail=f"SKIP_EMPTY_BUSINESS_TYPE=True and business_type empty ({det})",
-                project_key=key,
-                prefix=prefix,
-                svc_guess=svc,
-                code=code,
-                owner=owner,
-                bt=bt,
-                tasks_total=tasks_total,
-                total_lines=total_lines,
-            )
-            continue
-
-        if ban_business_set and bt in ban_business_set:
-            add_unacc(
-                reason="banned_business_type",
-                detail=f"business_type={bt!r} in BAN_BUSINESS_TYPES",
-                project_key=key,
-                prefix=prefix,
-                svc_guess=svc,
-                code=code,
-                owner=owner,
-                bt=bt,
-                tasks_total=tasks_total,
-                total_lines=total_lines,
-            )
-            continue
-
-        logger.info(
-            '[%s] %s (%s) owner="%s" type="%s" tasks=%d lines=%d',
-            label,
-            svc,
-            code,
-            owner,
-            bt,
-            tasks_total,
-            total_lines,
         )
 
         acc.setdefault(
             code,
-            {
-                "business_type": bt,
-                "service": svc,
-                "code": code,
-                "owner": owner,
-                "tasks_total": 0,
-                "total_lines": 0,
-            },
+            dict(
+                service_name=meta["service_name"],
+                code=code,
+                activity_code=meta["activity_code"],
+                activity_name=meta["activity_name"],
+                tasks_total=0,
+                total_lines=0,
+            ),
         )
 
-        acc[code]["tasks_total"] += tasks_total
-        acc[code]["total_lines"] += total_lines
+        acc[code]["tasks_total"] += tcnt
+        acc[code]["total_lines"] += lines
 
 
-def write_xlsx(rows, unaccounted_rows):
+def write_xlsx(rows, unacc):
     wb = Workbook()
 
     ws = wb.active
     ws.title = "Отчет SonarQube"
 
     headers = [
-        "Тип бизнеса",
-        "Наименование сервиса",
-        "КОД",
-        "Владелец сервиса",
+        "Имя сервиса",
+        "Код",
+        "Код активности",
+        "Наименование активности",
         "Кол-во тасок",
-        "Обработано кол-во строк",
+        "Строки",
         "% потребления",
     ]
     ws.append(headers)
+
     for c in ws[1]:
         c.font = Font(bold=True)
 
-    total_accounted_lines = sum(r["total_lines"] for r in rows) or 0
-    denom = total_accounted_lines if total_accounted_lines > 0 else 1
+    total = sum(r["total_lines"] for r in rows) or 1
 
     for r in rows:
-        pct = (r["total_lines"] / denom) if denom else 0.0
         ws.append(
             [
-                r["business_type"],
-                r["service"],
+                r["service_name"],
                 r["code"],
-                r["owner"],
-                int(r["tasks_total"]),
-                int(r["total_lines"]),
-                pct,
+                r["activity_code"],
+                r["activity_name"],
+                r["tasks_total"],
+                r["total_lines"],
+                r["total_lines"] / total,
             ]
         )
 
-    pct_col = headers.index("% потребления") + 1
-    for rr in range(2, ws.max_row + 1):
-        ws.cell(row=rr, column=pct_col).number_format = "0.0%"
-
     ws2 = wb.create_sheet("Unaccounted")
-    headers2 = [
-        "instance",
-        "project_key",
-        "prefix",
-        "svc_guess",
-        "code",
-        "owner",
-        "business_type",
-        "tasks_total",
-        "total_lines",
-        "reason",
-        "detail",
-    ]
-    ws2.append(headers2)
-    for c in ws2[1]:
-        c.font = Font(bold=True)
+    ws2.append(["instance", "project_key", "code", "reason"])
 
-    for r in unaccounted_rows:
+    for r in unacc:
         ws2.append(
             [
-                r.get("instance", ""),
-                r.get("project_key", ""),
-                r.get("prefix", ""),
-                r.get("svc_guess", ""),
-                r.get("code", ""),
-                r.get("owner", ""),
-                r.get("business_type", ""),
-                int(r.get("tasks_total", 0) or 0),
-                int(r.get("total_lines", 0) or 0),
-                r.get("reason", ""),
-                r.get("detail", ""),
+                r.get("instance"),
+                r.get("project_key"),
+                r.get("code"),
+                r.get("reason"),
             ]
         )
 
     wb.save(OUT_FILE)
-    logger.info("Файл сохранён: %s", OUT_FILE)
-    logger.info(
-        "Totals: accounted_lines=%d unaccounted_lines=%d",
-        total_accounted_lines,
-        sum(r.get("total_lines", 0) for r in unaccounted_rows) or 0,
-    )
 
 
 def main():
-    if not SONAR_URL or not SONAR_TOKEN:
-        die("SONAR_URL / SONAR_TOKEN не заданы")
-
-    sd = load_sd(SD_FILE)
-    bk = load_bk(BK_FILE)
+    activity = load_activity(ACTIVITY_FILE)
 
     services = {}
     unaccounted = []
 
-    process_sonar(SONAR_URL, SONAR_TOKEN, sd, bk, services, unaccounted)
-    process_sonar(SONAR2_URL, SONAR2_TOKEN, sd, bk, services, unaccounted)
+    process_sonar(SONAR_URL, SONAR_TOKEN, activity, services, unaccounted)
+    process_sonar(SONAR2_URL, SONAR2_TOKEN, activity, services, unaccounted)
 
     rows = sorted(services.values(), key=lambda x: x["total_lines"], reverse=True)
-    unaccounted_sorted = sorted(
-        unaccounted, key=lambda x: int(x.get("total_lines", 0) or 0), reverse=True
-    )
 
-    write_xlsx(rows, unaccounted_sorted)
+    write_xlsx(rows, unaccounted)
 
 
 if __name__ == "__main__":
