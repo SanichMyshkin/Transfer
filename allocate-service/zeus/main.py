@@ -8,7 +8,7 @@ import yaml
 import pandas as pd
 from dotenv import load_dotenv
 
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -24,8 +24,7 @@ GITLAB_URL = os.getenv("GITLAB_URL", "").rstrip("/")
 TOKEN = os.getenv("TOKEN", "")
 GROUP_ID = os.getenv("GROUP_ID", "").strip()
 
-SD_FILE = os.getenv("SD_FILE")
-BK_FILE = os.getenv("BK_FILE")
+ACTIVITY_FILE = os.getenv("ACTIVITY_FILE", "activity.xlsx")
 
 OUTPUT_XLSX = "zeus_report.xlsx"
 GIT_REF = "main"
@@ -35,74 +34,59 @@ BAN_SERVICES = [
     "UNAITP",
 ]
 
-BAN_BUSINESS_TYPES = []
+BAN_SERVICE_IDS = [15473]
 
-SKIP_EMPTY_BUSINESS_TYPE = True
 EXCLUDE_ZERO_CODES = True
 
 CPU_WEIGHT = 0.40
 RAM_WEIGHT = 0.60
 
 
-def clean_spaces(s: str) -> str:
-    s = (s or "").strip()
+def clean_spaces(s) -> str:
+    if s is None:
+        return ""
+    s = str(s).strip()
     s = s.replace(",", " ")
     s = " ".join(s.split())
     return s
 
 
-def normalize_name_key(s: str) -> str:
-    return clean_spaces(s).lower()
+def normalize_code(v):
+    if v is None:
+        return ""
+    if isinstance(v, (int, float)):
+        return str(int(v))
+    s = str(v).strip()
+    return s[:-2] if s.endswith(".0") and s[:-2].isdigit() else s
 
 
-def load_sd_people_map(path: str):
-    log.info("Читаем SD (B=КОД, D=Наименование, H=Владелец)...")
+def load_activity_map(path: str):
+    log.info("Читаем activity (A=КОД, B=Наименование сервиса, C=Код активности, D=Наименование активности)...")
 
-    df = pd.read_excel(path, usecols="B,D,H", dtype=str, engine="openpyxl")
-    df.columns = ["service_id", "service_name", "owner"]
-    df = df.fillna("")
+    if not path or not os.path.exists(path):
+        raise RuntimeError(f"ACTIVITY_FILE не найден: {path}")
 
-    df["service_id"] = df["service_id"].astype(str).str.strip()
-    df["service_name"] = df["service_name"].astype(str).map(clean_spaces)
-    df["owner"] = df["owner"].astype(str).map(clean_spaces)
+    wb = load_workbook(path, read_only=True, data_only=True)
+    ws = wb.worksheets[0]
 
-    df = df[df["service_id"] != ""].copy()
-    last = df.drop_duplicates("service_id", keep="last")
+    mp = {}
 
-    mp = {
-        sid: {"service_name": sn, "owner": o}
-        for sid, sn, o in zip(
-            last["service_id"].tolist(),
-            last["service_name"].tolist(),
-            last["owner"].tolist(),
-        )
-    }
+    for row in ws.iter_rows(values_only=True):
+        code = normalize_code(row[0] if len(row) > 0 else None)
+        if not code:
+            continue
 
-    log.info(f"SD: загружено сервисов по КОД: {len(mp)}")
-    return mp
+        if code in mp:
+            continue
 
+        mp[code] = {
+            "service_name": clean_spaces(row[1] if len(row) > 1 else ""),
+            "activity_code": clean_spaces(row[2] if len(row) > 2 else ""),
+            "activity_name": clean_spaces(row[3] if len(row) > 3 else ""),
+        }
 
-def load_bk_business_type_map(path: str):
-    log.info("Читаем BK (A:B:C=ФИО, AS=Тип бизнеса)...")
-
-    df = pd.read_excel(path, usecols="A:C,AS", dtype=str, engine="openpyxl")
-    df = df.fillna("")
-    df.columns = ["c1", "c2", "c3", "business_type"]
-
-    def make_fio(r):
-        fio = " ".join(
-            [clean_spaces(r["c2"]), clean_spaces(r["c1"]), clean_spaces(r["c3"])]
-        )
-        return clean_spaces(fio)
-
-    df["fio_key"] = df.apply(make_fio, axis=1).map(normalize_name_key)
-    df["business_type"] = df["business_type"].astype(str).map(clean_spaces)
-
-    df = df[df["fio_key"] != ""].copy()
-    last = df.drop_duplicates("fio_key", keep="last")
-
-    mp = dict(zip(last["fio_key"], last["business_type"]))
-    log.info(f"BK: загружено ФИО->Тип бизнеса: {len(mp)}")
+    wb.close()
+    log.info("ACTIVITY: загружено сервисов по КОД: %d", len(mp))
     return mp
 
 
@@ -115,10 +99,10 @@ def gl_connect():
 
 
 def get_group_projects(gl):
-    log.info(f"Получаем проекты группы GROUP_ID={GROUP_ID} (включая сабгруппы)...")
+    log.info("Получаем проекты группы GROUP_ID=%s (включая сабгруппы)...", GROUP_ID)
     group = gl.groups.get(GROUP_ID)
     projs = group.projects.list(all=True, include_subgroups=True)
-    log.info(f"Проектов найдено: {len(projs)}")
+    log.info("Проектов найдено: %d", len(projs))
     return projs
 
 
@@ -262,13 +246,19 @@ def is_zero_code(code: str):
     return code and set(code) == {"0"}
 
 
-def collect_rows(gl, projects, sd_people_map, bk_type_map):
-    ban_business_set = {clean_spaces(x) for x in BAN_BUSINESS_TYPES if clean_spaces(x)}
+def build_ban_set(vals):
+    return {str(x).strip() for x in vals if str(x).strip()}
+
+
+def collect_rows(gl, projects, activity_map):
+    ban_service_ids = build_ban_set(BAN_SERVICE_IDS)
     totals = {}
     unaccounted = []
 
     for p in projects:
         proj = gl.projects.get(p.id)
+
+        log.info("PROJECT: %s (%s)", p.path_with_namespace, p.id)
 
         files = find_deployment_files(proj)
 
@@ -278,7 +268,8 @@ def collect_rows(gl, projects, sd_people_map, bk_type_map):
         for path in files:
             try:
                 raw = get_file_text(proj, path, GIT_REF)
-            except Exception:
+            except Exception as e:
+                log.warning("Не удалось прочитать файл %s в проекте %s: %s", path, p.path_with_namespace, e)
                 continue
 
             cpu, mem = parse_deployment_limits(raw)
@@ -287,7 +278,7 @@ def collect_rows(gl, projects, sd_people_map, bk_type_map):
 
         service_from_git, code = split_service_and_code(p.name)
 
-        def add_unacc(reason, detail):
+        def add_unacc(reason, detail, service_name="", activity_code="", activity_name=""):
             unaccounted.append(
                 {
                     "project_id": p.id,
@@ -295,6 +286,9 @@ def collect_rows(gl, projects, sd_people_map, bk_type_map):
                     "path_with_namespace": p.path_with_namespace,
                     "service_guess": service_from_git,
                     "code": code,
+                    "service_name": service_name,
+                    "activity_code": activity_code,
+                    "activity_name": activity_name,
                     "cpu_cores": cpu_total,
                     "mem_mib": bytes_to_mib(mem_total),
                     "deployment_files": len(files),
@@ -304,67 +298,105 @@ def collect_rows(gl, projects, sd_people_map, bk_type_map):
             )
 
         if not code:
+            log.info('UNACCOUNTED project=%s reason=no_code', p.path_with_namespace)
             add_unacc("no_code", "project name does not contain code")
             continue
 
         if EXCLUDE_ZERO_CODES and is_zero_code(code):
+            log.info('UNACCOUNTED project=%s code=%s reason=zero_code', p.path_with_namespace, code)
             add_unacc("zero_code", "code consists of zeros")
             continue
 
-        sd = sd_people_map.get(code, {})
-        service = clean_spaces(sd.get("service_name")) or service_from_git
-        owner = clean_spaces(sd.get("owner"))
+        meta = activity_map.get(code, {})
+        activity_service = clean_spaces(meta.get("service_name", ""))
+        activity_code = clean_spaces(meta.get("activity_code", ""))
+        activity_name = clean_spaces(meta.get("activity_name", ""))
+
+        if code in ban_service_ids:
+            log.info('UNACCOUNTED project=%s code=%s reason=banned_service_id', p.path_with_namespace, code)
+            add_unacc(
+                "banned_service_id",
+                "code in BAN_SERVICE_IDS",
+                service_name=activity_service,
+                activity_code=activity_code,
+                activity_name=activity_name,
+            )
+            continue
+
+        service = activity_service or service_from_git
 
         if service in BAN_SERVICES:
-            add_unacc("banned_service", service)
+            log.info('UNACCOUNTED project=%s code=%s reason=banned_service service=%s', p.path_with_namespace, code, service)
+            add_unacc(
+                "banned_service",
+                service,
+                service_name=activity_service,
+                activity_code=activity_code,
+                activity_name=activity_name,
+            )
             continue
 
-        business_type = bk_type_map.get(normalize_name_key(owner), "") if owner else ""
-
-        if SKIP_EMPTY_BUSINESS_TYPE and not business_type:
-            add_unacc("empty_business_type", "")
-            continue
-
-        if ban_business_set and business_type in ban_business_set:
-            add_unacc("banned_business_type", business_type)
+        if code not in activity_map:
+            log.info('UNACCOUNTED project=%s code=%s reason=activity_mapping_miss', p.path_with_namespace, code)
+            add_unacc(
+                "activity_mapping_miss",
+                "code not found in activity.xlsx",
+                service_name=activity_service,
+                activity_code=activity_code,
+                activity_name=activity_name,
+            )
             continue
 
         if cpu_total <= 0 and mem_total <= 0:
+            log.info('SKIP project=%s code=%s reason=empty_resources', p.path_with_namespace, code)
             continue
 
-        key = (service, code)
+        key = code
 
         if key not in totals:
             totals[key] = {
+                "service": activity_service or service_from_git,
+                "code": code,
+                "activity_code": activity_code,
+                "activity_name": activity_name,
                 "cpu": 0.0,
                 "mem": 0,
-                "owner": owner,
-                "business_type": business_type,
             }
 
         totals[key]["cpu"] += cpu_total
         totals[key]["mem"] += mem_total
+
+        log.info(
+            'ACCOUNTED project=%s code=%s service="%s" activity_code="%s" cpu=%.6f mem_mib=%.2f files=%d',
+            p.path_with_namespace,
+            code,
+            totals[key]["service"],
+            totals[key]["activity_code"],
+            cpu_total,
+            bytes_to_mib(mem_total),
+            len(files),
+        )
 
     total_cpu = sum(v["cpu"] for v in totals.values())
     total_mem = sum(v["mem"] for v in totals.values())
 
     rows = []
 
-    for (service, code), v in totals.items():
+    for code, v in totals.items():
         cpu = v["cpu"]
         mem = v["mem"]
 
-        cpu_pct = (cpu / total_cpu * 100) if total_cpu else 0
-        mem_pct = (mem / total_mem * 100) if total_mem else 0
+        cpu_pct = (cpu / total_cpu * 100.0) if total_cpu else 0.0
+        mem_pct = (mem / total_mem * 100.0) if total_mem else 0.0
 
         pct = cpu_pct * CPU_WEIGHT + mem_pct * RAM_WEIGHT
 
         rows.append(
             {
-                "business_type": v["business_type"],
-                "service": service,
+                "service": v["service"],
                 "code": code,
-                "owner": v["owner"],
+                "activity_code": v["activity_code"],
+                "activity_name": v["activity_name"],
                 "cpu_cores": cpu,
                 "mem_mib": bytes_to_mib(mem),
                 "pct": pct,
@@ -372,6 +404,10 @@ def collect_rows(gl, projects, sd_people_map, bk_type_map):
         )
 
     rows.sort(key=lambda r: r["pct"], reverse=True)
+    unaccounted.sort(
+        key=lambda r: ((r.get("cpu_cores", 0.0) * CPU_WEIGHT) + (r.get("mem_mib", 0.0) * RAM_WEIGHT)),
+        reverse=True,
+    )
 
     return rows, unaccounted
 
@@ -383,10 +419,10 @@ def write_excel(rows, unaccounted_rows, out_file):
     ws.title = "Report"
 
     headers = [
-        "Тип бизнеса",
-        "Наименование сервиса",
-        "КОД",
-        "Владелец сервиса",
+        "Имя сервиса",
+        "Код",
+        "Код активности",
+        "Наименование активности",
         "CPU (cores)",
         "RAM (MiB)",
         "% потребления",
@@ -397,10 +433,10 @@ def write_excel(rows, unaccounted_rows, out_file):
         c.font = Font(bold=True)
 
     for i, r in enumerate(rows, 2):
-        ws.cell(i, 1, r["business_type"])
-        ws.cell(i, 2, r["service"])
-        ws.cell(i, 3, r["code"])
-        ws.cell(i, 4, r["owner"])
+        ws.cell(i, 1, r["service"])
+        ws.cell(i, 2, r["code"])
+        ws.cell(i, 3, r["activity_code"])
+        ws.cell(i, 4, r["activity_name"])
         ws.cell(i, 5, round(r["cpu_cores"], 6))
         ws.cell(i, 6, round(r["mem_mib"], 2))
         ws.cell(i, 7, round(r["pct"], 2))
@@ -413,6 +449,9 @@ def write_excel(rows, unaccounted_rows, out_file):
         "path_with_namespace",
         "service_guess",
         "code",
+        "service_name",
+        "activity_code",
+        "activity_name",
         "CPU (cores)",
         "RAM (MiB)",
         "deployment_files",
@@ -430,24 +469,26 @@ def write_excel(rows, unaccounted_rows, out_file):
         ws2.cell(i, 3, r["path_with_namespace"])
         ws2.cell(i, 4, r["service_guess"])
         ws2.cell(i, 5, r["code"])
-        ws2.cell(i, 6, round(r["cpu_cores"], 6))
-        ws2.cell(i, 7, round(r["mem_mib"], 2))
-        ws2.cell(i, 8, r["deployment_files"])
-        ws2.cell(i, 9, r["reason"])
-        ws2.cell(i, 10, r["detail"])
+        ws2.cell(i, 6, r["service_name"])
+        ws2.cell(i, 7, r["activity_code"])
+        ws2.cell(i, 8, r["activity_name"])
+        ws2.cell(i, 9, round(r["cpu_cores"], 6))
+        ws2.cell(i, 10, round(r["mem_mib"], 2))
+        ws2.cell(i, 11, r["deployment_files"])
+        ws2.cell(i, 12, r["reason"])
+        ws2.cell(i, 13, r["detail"])
 
     wb.save(out_file)
-    log.info(f"Excel отчет создан: {out_file}")
+    log.info("Excel отчет создан: %s", out_file)
 
 
 def main():
-    sd = load_sd_people_map(SD_FILE)
-    bk = load_bk_business_type_map(BK_FILE)
+    activity = load_activity_map(ACTIVITY_FILE)
 
     gl = gl_connect()
     projects = get_group_projects(gl)
 
-    rows, unaccounted = collect_rows(gl, projects, sd, bk)
+    rows, unaccounted = collect_rows(gl, projects, activity)
 
     write_excel(rows, unaccounted, OUTPUT_XLSX)
 
