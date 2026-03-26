@@ -1,12 +1,12 @@
 import os
-import re
 import logging
-from datetime import datetime, timedelta, timezone
 from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 
 from dotenv import load_dotenv
 import psycopg2
 from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Font
 
 load_dotenv()
 
@@ -26,28 +26,32 @@ DB_PASSWORD = os.getenv("DB_PASSWORD")
 SINCE_DAYS = int(os.getenv("SINCE", "90"))
 OUT_XLSX = os.getenv("OUT_XLSX", "sendor_report.xlsx")
 
-SD_FILE = os.getenv("SD_FILE", "sd.xlsx")
-BK_FILE = os.getenv("BK_FILE", "bk_all_users.xlsx")
+ACTIVITY_FILE = os.getenv("ACTIVITY_FILE", "activity.xlsx")
 
 EXCLUDE_SERVICE_IDS = {
     "15473",
 }
 
 ALLOW_ZERO_SERVICE_ID = False
-
-SKIP_EMPTY_BUSINESS_TYPE = False
-SKIP_SD_MAPPING_MISS = False
+SKIP_ACTIVITY_MAPPING_MISS = False
 
 
-def clean_spaces(s: str) -> str:
-    s = (s or "").strip()
+def clean_spaces(s) -> str:
+    if s is None:
+        return ""
+    s = str(s).strip()
     s = s.replace(",", " ")
     s = " ".join(s.split())
     return s
 
 
-def normalize_name_key(s: str) -> str:
-    return clean_spaces(s).lower()
+def normalize_code(v):
+    if v is None:
+        return ""
+    if isinstance(v, (int, float)):
+        return str(int(v))
+    s = str(v).strip()
+    return s[:-2] if s.endswith(".0") and s[:-2].isdigit() else s
 
 
 def is_all_zeros(s: str) -> bool:
@@ -98,12 +102,12 @@ def get_counts_fixture(days: int):
     return rows
 
 
-def read_sd_map(path: str):
+def read_activity_map(path: str):
     if not path or not os.path.exists(path):
-        log.warning(f"SD_FILE не найден: {path}")
+        log.warning("ACTIVITY_FILE не найден: %s", path)
         return {}
 
-    wb = load_workbook(path, data_only=True)
+    wb = load_workbook(path, read_only=True, data_only=True)
     ws = wb.worksheets[0]
 
     out = {}
@@ -113,63 +117,26 @@ def read_sd_map(path: str):
     for r in ws.iter_rows(values_only=True):
         rows += 1
 
-        code_raw = r[1] if len(r) > 1 else ""
-        sd_name = r[3] if len(r) > 3 else ""
-        owner = r[7] if len(r) > 7 else ""
-
-        m = re.search(r"(\d+)", str(code_raw or ""))
-        code = m.group(1) if m else ""
+        code = normalize_code(r[0] if len(r) > 0 else "")
         if not code:
             continue
 
-        out[str(code)] = {
-            "sd_name": clean_spaces(sd_name),
-            "owner": clean_spaces(owner),
+        if code in out:
+            continue
+
+        out[code] = {
+            "service_name": clean_spaces(r[1] if len(r) > 1 else ""),
+            "activity_code": clean_spaces(r[2] if len(r) > 2 else ""),
+            "activity_name": clean_spaces(r[3] if len(r) > 3 else ""),
         }
         ok += 1
 
-    log.info(f"SD: rows={rows} mapped_codes={len(out)} ok_rows={ok}")
+    wb.close()
+    log.info("ACTIVITY: rows=%d mapped_codes=%d ok_rows=%d", rows, len(out), ok)
     return out
 
 
-def load_bk_business_type_map(path: str):
-    if not path or not os.path.exists(path):
-        log.warning(f"BK_FILE не найден: {path}")
-        return {}
-
-    wb = load_workbook(path, data_only=True)
-    ws = wb.worksheets[0]
-
-    out = {}
-    rows = 0
-    ok = 0
-
-    for r in ws.iter_rows(values_only=True):
-        rows += 1
-
-        c1 = r[0] if len(r) > 0 else ""
-        c2 = r[1] if len(r) > 1 else ""
-        c3 = r[2] if len(r) > 2 else ""
-
-        if len(r) <= 44:
-            continue
-        bt = r[44]
-
-        fio = clean_spaces(f"{c2} {c1} {c3}")
-        fio_key = normalize_name_key(fio)
-        bt = clean_spaces(bt)
-
-        if not fio_key:
-            continue
-
-        out[fio_key] = bt
-        ok += 1
-
-    log.info(f"BK: rows={rows} mapped_fio={len(out)} ok_rows={ok}")
-    return out
-
-
-def aggregate_and_enrich(db_rows, exclude_service_ids, sd_map, bk_map):
+def aggregate_and_enrich(db_rows, exclude_service_ids, activity_map):
     include_counts = defaultdict(int)
     unaccounted_rows = []
 
@@ -195,45 +162,101 @@ def aggregate_and_enrich(db_rows, exclude_service_ids, sd_map, bk_map):
 
         include_counts[sid] += c
 
-    total_included = sum(include_counts.values())
-
     rows_main = []
+    rows_for_percent = []
+    skipped_activity_miss = 0
+
     for sid, cnt in sorted(include_counts.items(), key=lambda x: x[1], reverse=True):
-        sd = sd_map.get(str(sid), {})  # service_id == SD "КОД"
-        sd_name = clean_spaces(sd.get("sd_name", ""))
-        owner = clean_spaces(sd.get("owner", ""))
+        meta = activity_map.get(str(sid), {})
+        service_name = clean_spaces(meta.get("service_name", ""))
+        activity_code = clean_spaces(meta.get("activity_code", ""))
+        activity_name = clean_spaces(meta.get("activity_name", ""))
 
-        business_type = ""
-        if owner:
-            business_type = clean_spaces(bk_map.get(normalize_name_key(owner), ""))
-
-        if SKIP_SD_MAPPING_MISS and not sd_name and not owner:
-            unaccounted_rows.append([sid, "", "", "", cnt, "sd_mapping_miss"])
+        if SKIP_ACTIVITY_MAPPING_MISS and not service_name:
+            skipped_activity_miss += 1
+            unaccounted_rows.append(
+                [sid, "", "", "", cnt, "activity_mapping_miss"]
+            )
             continue
 
-        if SKIP_EMPTY_BUSINESS_TYPE and not business_type:
-            unaccounted_rows.append([sid, sd_name, owner, business_type, cnt, "missing_business_type"])
-            continue
+        rows_for_percent.append(cnt)
+        rows_main.append(
+            {
+                "service_id": sid,
+                "service_name": service_name or sid,
+                "activity_code": activity_code,
+                "activity_name": activity_name,
+                "messages_count": int(cnt),
+                "percent_of_all_total": 0.0,
+            }
+        )
 
-        service_name = sd_name if sd_name else sid
+    total_included = sum(rows_for_percent)
+
+    for row in rows_main:
+        cnt = int(row["messages_count"] or 0)
         pct = 0.0 if total_included <= 0 else (cnt * 100.0 / total_included)
+        row["percent_of_all_total"] = pct
 
-        rows_main.append([sid, business_type, service_name, owner, cnt, pct])
+    log.info(
+        "aggregate_and_enrich: included_before=%d main_rows=%d skipped_activity_miss=%d unaccounted=%d total_included=%d",
+        len(include_counts),
+        len(rows_main),
+        skipped_activity_miss,
+        len(unaccounted_rows),
+        total_included,
+    )
 
     return rows_main, unaccounted_rows, total_included
 
 
 def write_excel(path, rows_main, unaccounted_rows):
     wb = Workbook()
+    bold = Font(bold=True)
+
     ws = wb.active
     ws.title = "by_service"
 
-    ws.append(["service_id", "business_type", "service_name", "owner", "messages_count", "percent_of_all_total"])
+    headers = [
+        "service_id",
+        "service_name",
+        "activity_code",
+        "activity_name",
+        "messages_count",
+        "percent_of_all_total",
+    ]
+    ws.append(headers)
+    for c in ws[1]:
+        c.font = bold
+
     for r in rows_main:
-        ws.append(r)
+        ws.append(
+            [
+                r["service_id"],
+                r["service_name"],
+                r["activity_code"],
+                r["activity_name"],
+                int(r["messages_count"]),
+                float(r["percent_of_all_total"]),
+            ]
+        )
+
+    pct_col = headers.index("percent_of_all_total") + 1
+    for rr in range(2, ws.max_row + 1):
+        ws.cell(row=rr, column=pct_col).number_format = "0.00000"
 
     ws2 = wb.create_sheet("unaccounted")
-    ws2.append(["service_id", "service_name", "owner", "business_type", "messages_count", "reason"])
+    headers2 = [
+        "service_id",
+        "service_name",
+        "activity_code",
+        "activity_name",
+        "messages_count",
+        "reason",
+    ]
+    ws2.append(headers2)
+    for c in ws2[1]:
+        c.font = bold
 
     ua_sorted = sorted(
         unaccounted_rows,
@@ -243,35 +266,34 @@ def write_excel(path, rows_main, unaccounted_rows):
         ws2.append(r)
 
     wb.save(path)
-    log.info(f"XLSX saved {path}")
+    log.info("XLSX saved %s", path)
 
 
 def main():
     log.info("START")
-    log.info(f"SINCE_DAYS={SINCE_DAYS}")
-    log.info(f"EXCLUDE_SERVICE_IDS={sorted(EXCLUDE_SERVICE_IDS)}")
-    log.info(f"ALLOW_ZERO_SERVICE_ID={ALLOW_ZERO_SERVICE_ID}")
-    log.info(f"SKIP_EMPTY_BUSINESS_TYPE={SKIP_EMPTY_BUSINESS_TYPE}")
-    log.info(f"SKIP_SD_MAPPING_MISS={SKIP_SD_MAPPING_MISS}")
-    log.info(f"SD_FILE={SD_FILE}")
-    log.info(f"BK_FILE={BK_FILE}")
+    log.info("SINCE_DAYS=%s", SINCE_DAYS)
+    log.info("EXCLUDE_SERVICE_IDS=%s", sorted(EXCLUDE_SERVICE_IDS))
+    log.info("ALLOW_ZERO_SERVICE_ID=%s", ALLOW_ZERO_SERVICE_ID)
+    log.info("SKIP_ACTIVITY_MAPPING_MISS=%s", SKIP_ACTIVITY_MAPPING_MISS)
+    log.info("ACTIVITY_FILE=%s", ACTIVITY_FILE)
 
-    sd_map = read_sd_map(SD_FILE)
-    bk_map = load_bk_business_type_map(BK_FILE)
+    activity_map = read_activity_map(ACTIVITY_FILE)
 
-    # Реальный запрос пока выключен
     # db_rows = get_counts_by_service_since_days_sql(SINCE_DAYS)
-    # Фикстура мужики, рассходимся
     db_rows = get_counts_fixture(SINCE_DAYS)
 
     rows_main, unaccounted_rows, total_included = aggregate_and_enrich(
         db_rows=db_rows,
         exclude_service_ids=EXCLUDE_SERVICE_IDS,
-        sd_map=sd_map,
-        bk_map=bk_map,
+        activity_map=activity_map,
     )
 
-    log.info(f"RESULT: main_rows={len(rows_main)} unaccounted_rows={len(unaccounted_rows)} total_included={total_included}")
+    log.info(
+        "RESULT: main_rows=%d unaccounted_rows=%d total_included=%d",
+        len(rows_main),
+        len(unaccounted_rows),
+        total_included,
+    )
 
     write_excel(OUT_XLSX, rows_main, unaccounted_rows)
     log.info("DONE")
