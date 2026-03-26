@@ -402,17 +402,6 @@ def main():
 
         if amb:
             ambiguous += 1
-            add_unacc(
-                r,
-                "ambiguous_match",
-                f"matched_by={matched_by} and DB has duplicates for key; using last match because USE_LAST_AMBIGUOUS_MATCH=True",
-                service=service,
-                service_id=service_id,
-                service_name=activity_service_name,
-                activity_code=activity_code,
-                activity_name=activity_name,
-                amb=True,
-            )
 
         key = service_id
         if key not in per_service:
