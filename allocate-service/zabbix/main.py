@@ -20,6 +20,7 @@ OUTPUT_XLSX = os.getenv("OUTPUT_XLSX", "zabbix_report.xlsx")
 
 BAN_SERVICE_IDS = [15473]
 SKIP_EMPTY_SERVICE_ID = True
+USE_LAST_AMBIGUOUS_MATCH = True
 
 ZBX_CHUNK = 500
 
@@ -233,6 +234,7 @@ def main():
 
     ban_set = build_ban_set(BAN_SERVICE_IDS)
     logger.info("BAN_SERVICE_IDS=%s", sorted(ban_set) if ban_set else "[]")
+    logger.info("USE_LAST_AMBIGUOUS_MATCH=%s", USE_LAST_AMBIGUOUS_MATCH)
 
     api = ZabbixAPI(url=ZABBIX_URL)
     try:
@@ -268,6 +270,7 @@ def main():
     per_service = {}
     matched_hosts = 0
     ambiguous = 0
+    ambiguous_skipped = 0
     banned_hits = 0
     skipped_empty = 0
     activity_miss = 0
@@ -334,6 +337,22 @@ def main():
         activity_code = meta.get("activity_code", "")
         activity_name = meta.get("activity_name", "")
 
+        if amb and not USE_LAST_AMBIGUOUS_MATCH:
+            ambiguous += 1
+            ambiguous_skipped += 1
+            add_unacc(
+                r,
+                "ambiguous_match",
+                f"matched_by={matched_by} and DB has duplicates for key; skipped because USE_LAST_AMBIGUOUS_MATCH=False",
+                service=service,
+                service_id=service_id,
+                service_name=activity_service_name,
+                activity_code=activity_code,
+                activity_name=activity_name,
+                amb=True,
+            )
+            continue
+
         if SKIP_EMPTY_SERVICE_ID and not service_id:
             skipped_empty += 1
             add_unacc(
@@ -386,7 +405,7 @@ def main():
             add_unacc(
                 r,
                 "ambiguous_match",
-                f"matched_by={matched_by} and DB has duplicates for key",
+                f"matched_by={matched_by} and DB has duplicates for key; using last match because USE_LAST_AMBIGUOUS_MATCH=True",
                 service=service,
                 service_id=service_id,
                 service_name=activity_service_name,
@@ -482,6 +501,7 @@ def main():
     logger.info("Активных хостов: %d", total_active)
     logger.info("Установлено/определено хостов: %d (%.2f%%)", matched_hosts, installed_pct)
     logger.info("Сомнительных совпадений: %d", ambiguous)
+    logger.info("Сомнительных совпадений, исключенных из отчета: %d", ambiguous_skipped)
     logger.info("Скип по бан-листу (service_id): %d", banned_hits)
     logger.info("Скип пустых service_id: %d", skipped_empty)
     logger.info("Скип по отсутствию в activity.xlsx: %d", activity_miss)
