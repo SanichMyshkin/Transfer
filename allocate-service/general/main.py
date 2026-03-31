@@ -6,11 +6,9 @@ import requests
 import urllib3
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, Alignment
 from openpyxl.utils import get_column_letter
-
-from reference_loader import load_reference_rows
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 load_dotenv()
@@ -27,8 +25,8 @@ CONF_PAGE_ID = os.getenv("CONF_PAGE_ID")
 CONF_USER = os.getenv("CONF_USER")
 CONF_PASS = os.getenv("CONF_PASS")
 
-REFERENCES_DIR = "references"
-OUT_FILE = "employees.xlsx"
+REFERENCES_DIR = os.getenv("REFERENCES_DIR", "references")
+OUT_FILE = os.getenv("OUT_FILE", "employees.xlsx")
 
 
 def set_bold_row(ws, row, cols):
@@ -36,10 +34,32 @@ def set_bold_row(ws, row, cols):
         ws.cell(row=row, column=col).font = Font(bold=True)
 
 
-def try_parse_percent(value):
+def clean_spaces(value):
+    if value is None:
+        return ""
+    return " ".join(str(value).strip().split())
 
+
+def normalize_code(value):
+    if value is None:
+        return ""
+    if isinstance(value, (int, float)):
+        return str(int(value))
+    s = str(value).strip()
+    if s.endswith(".0") and s[:-2].isdigit():
+        return s[:-2]
+    return s
+
+
+def try_parse_percent(value):
     if value is None:
         return None
+
+    if isinstance(value, (int, float)):
+        num = float(value)
+        if num > 1:
+            return num / 100
+        return num
 
     s = str(value).strip().replace(",", ".")
 
@@ -64,7 +84,6 @@ def try_parse_percent(value):
 
 
 def fetch_confluence_table():
-
     url = f"{CONF_URL.rstrip('/')}/rest/api/content/{CONF_PAGE_ID}"
     params = {"expand": "body.storage"}
 
@@ -77,14 +96,12 @@ def fetch_confluence_table():
         timeout=30,
         verify=False,
     )
-
     r.raise_for_status()
 
     html = r.json()["body"]["storage"]["value"]
 
     soup = BeautifulSoup(html, "html.parser")
     table = soup.find("table")
-
     rows = table.find_all("tr")
 
     headers = [c.get_text(strip=True) for c in rows[0].find_all(["th", "td"])]
@@ -93,7 +110,6 @@ def fetch_confluence_table():
     data_rows = []
 
     for tr in rows[1:]:
-
         cols = [c.get_text(strip=True) for c in tr.find_all(["th", "td"])]
 
         if not cols:
@@ -101,11 +117,10 @@ def fetch_confluence_table():
 
         employee = cols[0]
         load_value = cols[1] if len(cols) > 1 else ""
-
         service_values = cols[3:]
 
         if len(service_values) < len(service_headers):
-            service_values += [""] * (len(service_headers) - len(service_values))
+            service_values += [""] * (len(service_values) - len(service_headers))
 
         data_rows.append(
             {
@@ -119,7 +134,6 @@ def fetch_confluence_table():
 
 
 def write_employees_sheet(ws, headers, service_headers, data_rows):
-
     ws.append(headers)
     set_bold_row(ws, 1, len(headers))
 
@@ -132,7 +146,6 @@ def write_employees_sheet(ws, headers, service_headers, data_rows):
         platform_col_map[service] = idx
 
     for row_idx, item in enumerate(data_rows, start=2):
-
         row = [item["employee"], item["load"], None]
 
         for service in service_headers:
@@ -150,13 +163,10 @@ def write_employees_sheet(ws, headers, service_headers, data_rows):
         total_cell.number_format = "0%"
 
     sum_row = ws.max_row + 1
-
     ws.cell(row=sum_row, column=1, value="SUM")
 
     for col in range(service_start, service_end + 1):
-
         col_letter = get_column_letter(col)
-
         cell = ws.cell(row=sum_row, column=col)
         cell.value = f"=SUM({col_letter}2:{col_letter}{sum_row - 1})"
         cell.number_format = "0%"
@@ -166,23 +176,89 @@ def write_employees_sheet(ws, headers, service_headers, data_rows):
     return platform_col_map, sum_row
 
 
-def build_source_rows(rows, source_name):
+def get_cell(row, idx_1_based):
+    if not idx_1_based or idx_1_based < 1:
+        return None
+    pos = idx_1_based - 1
+    if pos >= len(row):
+        return None
+    return row[pos]
+
+
+def load_reference_rows(
+    file_path,
+    service_id_col,
+    service_name_col,
+    activity_code_col,
+    activity_name_col,
+    percent_col,
+    header_row=1,
+):
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"File not found: {file_path}")
+
+    wb = load_workbook(file_path, read_only=True, data_only=True)
+    ws = wb.worksheets[0]
 
     result = []
+    rows_seen = 0
 
-    for r in rows:
+    for row_idx, row in enumerate(ws.iter_rows(values_only=True), start=1):
+        if row_idx < header_row + 1:
+            continue
 
-        service_name = str(r.get("service_name", "")).strip()
-        service_code = str(r.get("service_code", "")).strip()
-        percent = r.get("percent")
+        rows_seen += 1
 
-        if not service_name:
+        service_id = normalize_code(get_cell(row, service_id_col))
+        service_name = clean_spaces(get_cell(row, service_name_col))
+        activity_code = clean_spaces(get_cell(row, activity_code_col))
+        activity_name = clean_spaces(get_cell(row, activity_name_col))
+        percent = try_parse_percent(get_cell(row, percent_col))
+
+        if not service_id and not service_name:
             continue
 
         result.append(
             {
+                "service_id": service_id,
                 "service_name": service_name,
-                "service_code": service_code,
+                "activity_code": activity_code,
+                "activity_name": activity_name,
+                "percent": percent,
+            }
+        )
+
+    wb.close()
+
+    log.info(
+        "Loaded rows from %s: scanned=%d loaded=%d",
+        file_path,
+        rows_seen,
+        len(result),
+    )
+
+    return result
+
+
+def build_source_rows(rows, source_name):
+    result = []
+
+    for r in rows:
+        service_id = normalize_code(r.get("service_id", ""))
+        service_name = clean_spaces(r.get("service_name", ""))
+        activity_code = clean_spaces(r.get("activity_code", ""))
+        activity_name = clean_spaces(r.get("activity_name", ""))
+        percent = r.get("percent")
+
+        if not service_id and not service_name:
+            continue
+
+        result.append(
+            {
+                "service_id": service_id,
+                "service_name": service_name,
+                "activity_code": activity_code,
+                "activity_name": activity_name,
                 f"{source_name}_percent": percent,
             }
         )
@@ -191,42 +267,47 @@ def build_source_rows(rows, source_name):
 
 
 def merge_source_rows(rows_list):
-
     merged = {}
 
     for rows in rows_list:
-
         for item in rows:
-
-            key = (item["service_name"], item["service_code"])
+            key = (
+                item["service_id"],
+                item["service_name"],
+                item["activity_code"],
+                item["activity_name"],
+            )
 
             if key not in merged:
                 merged[key] = {
+                    "service_id": item["service_id"],
                     "service_name": item["service_name"],
-                    "service_code": item["service_code"],
+                    "activity_code": item["activity_code"],
+                    "activity_name": item["activity_name"],
                 }
 
             for k, v in item.items():
-                if k in ("service_name", "service_code"):
+                if k in ("service_id", "service_name", "activity_code", "activity_name"):
                     continue
-
                 merged[key][k] = v
 
     return list(merged.values())
 
 
 def write_sources_sheet(ws, merged_rows, source_configs, platform_map, sum_row):
-
     ws.merge_cells(start_row=1, start_column=1, end_row=2, end_column=1)
     ws.merge_cells(start_row=1, start_column=2, end_row=2, end_column=2)
+    ws.merge_cells(start_row=1, start_column=3, end_row=2, end_column=3)
+    ws.merge_cells(start_row=1, start_column=4, end_row=2, end_column=4)
 
-    ws.cell(row=1, column=1, value="Service name").font = Font(bold=True)
-    ws.cell(row=1, column=2, value="Code").font = Font(bold=True)
+    ws.cell(row=1, column=1, value="service_id").font = Font(bold=True)
+    ws.cell(row=1, column=2, value="service_name").font = Font(bold=True)
+    ws.cell(row=1, column=3, value="activity_code").font = Font(bold=True)
+    ws.cell(row=1, column=4, value="activity_name").font = Font(bold=True)
 
-    current_col = 3
+    current_col = 5
 
     for cfg in source_configs:
-
         source = cfg["name"]
         subtitle = cfg["subtitle"]
 
@@ -241,42 +322,34 @@ def write_sources_sheet(ws, merged_rows, source_configs, platform_map, sum_row):
         head.font = Font(bold=True)
         head.alignment = Alignment(horizontal="center")
 
-        ws.merge_cells(
-            start_row=2,
-            start_column=current_col,
-            end_row=2,
-            end_column=current_col + 1,
-        )
+        ws.cell(row=2, column=current_col, value=subtitle).alignment = Alignment(horizontal="center")
+        ws.cell(row=2, column=current_col + 1, value="weight").alignment = Alignment(horizontal="center")
 
-        desc = ws.cell(row=2, column=current_col, value=subtitle)
-        desc.alignment = Alignment(horizontal="center")
+        ws.cell(row=2, column=current_col).font = Font(bold=True)
+        ws.cell(row=2, column=current_col + 1).font = Font(bold=True)
 
         current_col += 2
 
     for row_idx, item in enumerate(merged_rows, start=3):
+        ws.cell(row=row_idx, column=1, value=item["service_id"])
+        ws.cell(row=row_idx, column=2, value=item["service_name"])
+        ws.cell(row=row_idx, column=3, value=item["activity_code"])
+        ws.cell(row=row_idx, column=4, value=item["activity_name"])
 
-        ws.cell(row=row_idx, column=1, value=item["service_name"])
-        ws.cell(row=row_idx, column=2, value=item["service_code"])
-
-        current_col = 3
+        current_col = 5
 
         for cfg in source_configs:
-
             source = cfg["name"]
-
             percent_value = item.get(f"{source}_percent")
 
             percent_cell = ws.cell(row=row_idx, column=current_col, value=percent_value)
-
             if isinstance(percent_value, (int, float)):
-                percent_cell.number_format = "0.0000"
+                percent_cell.number_format = "0.00000"
 
             weight_cell = ws.cell(row=row_idx, column=current_col + 1)
 
             platform_col = platform_map.get(source)
-
             if platform_col:
-
                 platform_letter = get_column_letter(platform_col)
                 percent_letter = get_column_letter(current_col)
 
@@ -284,52 +357,78 @@ def write_sources_sheet(ws, merged_rows, source_configs, platform_map, sum_row):
                     f"=Employees!{platform_letter}{sum_row}"
                     f"*{percent_letter}{row_idx}"
                 )
-
-                weight_cell.number_format = "0.0000"
+                weight_cell.number_format = "0.00000"
 
             current_col += 2
 
 
 def main():
-
     headers, service_headers, employees = fetch_confluence_table()
-
-    log.info("Loading Nexus data")
-
-    nexus_rows = load_reference_rows(
-        file_path=os.path.join(REFERENCES_DIR, "nexus.xlsx"),
-        service_name_col=2,
-        service_code_col=3,
-        owner_col=4,
-        percent_col=6,
-        header_row=1,
-    )
-
-    log.info("Loading Gitlab data")
-
-    gitlab_rows = load_reference_rows(
-        file_path=os.path.join(REFERENCES_DIR, "gitlab.xlsx"),
-        service_name_col=2,
-        service_code_col=3,
-        owner_col=4,
-        percent_col=11,
-        header_row=1,
-    )
 
     source_configs = [
         {
             "name": "Nexus",
             "subtitle": "Объем репозиториев",
-            "rows": build_source_rows(nexus_rows, "Nexus"),
+            "file_name": "nexus.xlsx",
+            "service_id_col": 3,
+            "service_name_col": 2,
+            "activity_code_col": 4,
+            "activity_name_col": 5,
+            "percent_col": 6,
+            "header_row": 1,
         },
         {
             "name": "Gitlab",
             "subtitle": "Объем проектов",
-            "rows": build_source_rows(gitlab_rows, "Gitlab"),
+            "file_name": "gitlab.xlsx",
+            "service_id_col": 3,
+            "service_name_col": 2,
+            "activity_code_col": 4,
+            "activity_name_col": 5,
+            "percent_col": 11,
+            "header_row": 1,
+        },
+        {
+            "name": "Sender",
+            "subtitle": "Сообщения",
+            "file_name": "sender.xlsx",
+            "service_id_col": 1,
+            "service_name_col": 2,
+            "activity_code_col": 3,
+            "activity_name_col": 4,
+            "percent_col": 8,
+            "header_row": 1,
         },
     ]
 
-    merged_rows = merge_source_rows([c["rows"] for c in source_configs])
+    all_rows_for_merge = []
+
+    for cfg in source_configs:
+        log.info("Loading %s data", cfg["name"])
+
+        raw_rows = load_reference_rows(
+            file_path=os.path.join(REFERENCES_DIR, cfg["file_name"]),
+            service_id_col=cfg["service_id_col"],
+            service_name_col=cfg["service_name_col"],
+            activity_code_col=cfg["activity_code_col"],
+            activity_name_col=cfg["activity_name_col"],
+            percent_col=cfg["percent_col"],
+            header_row=cfg["header_row"],
+        )
+
+        cfg["rows"] = build_source_rows(raw_rows, cfg["name"])
+        all_rows_for_merge.append(cfg["rows"])
+
+    merged_rows = merge_source_rows(all_rows_for_merge)
+
+    merged_rows.sort(
+        key=lambda x: (
+            x["service_name"] or "",
+            x["service_id"] or "",
+            x["activity_code"] or "",
+            x["activity_name"] or "",
+        )
+    )
 
     wb = Workbook()
 
@@ -354,7 +453,6 @@ def main():
     )
 
     wb.save(OUT_FILE)
-
     log.info("Report saved to %s", OUT_FILE)
 
 
