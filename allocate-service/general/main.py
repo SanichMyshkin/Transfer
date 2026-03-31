@@ -295,10 +295,10 @@ def merge_source_rows(rows_list):
 
 
 def write_sources_sheet(ws, merged_rows, source_configs, platform_map, sum_row):
-    ws.merge_cells(start_row=1, start_column=1, end_row=3, end_column=1)
-    ws.merge_cells(start_row=1, start_column=2, end_row=3, end_column=2)
-    ws.merge_cells(start_row=1, start_column=3, end_row=3, end_column=3)
-    ws.merge_cells(start_row=1, start_column=4, end_row=3, end_column=4)
+    ws.merge_cells(start_row=1, start_column=1, end_row=2, end_column=1)
+    ws.merge_cells(start_row=1, start_column=2, end_row=2, end_column=2)
+    ws.merge_cells(start_row=1, start_column=3, end_row=2, end_column=3)
+    ws.merge_cells(start_row=1, start_column=4, end_row=2, end_column=4)
 
     ws.cell(row=1, column=1, value="service_id").font = Font(bold=True)
     ws.cell(row=1, column=2, value="service_name").font = Font(bold=True)
