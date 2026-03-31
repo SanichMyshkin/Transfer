@@ -75,14 +75,37 @@ def get_counts_by_service_since_days_sql(days: int):
             with conn.cursor() as cur:
                 cur.execute(
                     """
+                    with raw as (
+                        select
+                            'express'::text as source_type,
+                            nullif(
+                                substring(metadata_source_id from 'id:([0-9]+)'),
+                                ''
+                            )::bigint as service_id
+                        from sender.express_event_history
+                        where created >= %s
+
+                        union all
+
+                        select
+                            'mail'::text as source_type,
+                            nullif(
+                                substring(metadata_source_id from 'id:([0-9]+)'),
+                                ''
+                            )::bigint as service_id
+                        from sender.mail_event_history
+                        where created >= %s
+                    )
                     select
-                        nullif((metadata->>'service_id')::text, '')::bigint as service_id,
-                        count(*) as cnt
-                    from sender.telegram_events_history
-                    where created >= %s
+                        service_id,
+                        count(*) filter (where source_type = 'mail') as mail_cnt,
+                        count(*) filter (where source_type = 'express') as express_cnt,
+                        count(*) as total_cnt
+                    from raw
                     group by 1
+                    order by 4 desc
                     """,
-                    (since_dt,),
+                    (since_dt, since_dt),
                 )
                 return cur.fetchall()
     finally:
@@ -91,12 +114,12 @@ def get_counts_by_service_since_days_sql(days: int):
 
 def get_counts_fixture(days: int):
     rows = [
-        (11203, 1740),
-        (99999, 321),
-        (5531, 10),
-        (15473, 777),
-        (0, 50),
-        (None, 77),
+        (11203, 1200, 540, 1740),
+        (99999, 300, 21, 321),
+        (5531, 4, 6, 10),
+        (15473, 700, 77, 777),
+        (0, 20, 30, 50),
+        (None, 40, 37, 77),
     ]
     log.info("FIXTURE используется")
     return rows
@@ -137,36 +160,47 @@ def read_activity_map(path: str):
 
 
 def aggregate_and_enrich(db_rows, exclude_service_ids, activity_map):
-    include_counts = defaultdict(int)
+    include_counts = defaultdict(lambda: {"mail": 0, "express": 0, "total": 0})
     unaccounted_rows = []
 
-    for service_id, cnt in db_rows:
-        c = int(cnt or 0)
+    for service_id, mail_cnt, express_cnt, total_cnt in db_rows:
+        mail_c = int(mail_cnt or 0)
+        express_c = int(express_cnt or 0)
+        total_c = int(total_cnt or 0)
+
+        if total_c <= 0:
+            continue
 
         if service_id is None:
-            unaccounted_rows.append(["", "", "", "", c, "missing_service_id"])
+            unaccounted_rows.append(["", "", "", "", mail_c, express_c, total_c, "missing_service_id"])
             continue
 
         sid = str(service_id).strip()
         if not sid:
-            unaccounted_rows.append(["", "", "", "", c, "missing_service_id"])
+            unaccounted_rows.append(["", "", "", "", mail_c, express_c, total_c, "missing_service_id"])
             continue
 
         if is_all_zeros(sid) and not ALLOW_ZERO_SERVICE_ID:
-            unaccounted_rows.append([sid, "", "", "", c, "zero_service_id"])
+            unaccounted_rows.append([sid, "", "", "", mail_c, express_c, total_c, "zero_service_id"])
             continue
 
         if sid in exclude_service_ids:
-            unaccounted_rows.append([sid, "", "", "", c, "excluded_by_config"])
+            unaccounted_rows.append([sid, "", "", "", mail_c, express_c, total_c, "excluded_by_config"])
             continue
 
-        include_counts[sid] += c
+        include_counts[sid]["mail"] += mail_c
+        include_counts[sid]["express"] += express_c
+        include_counts[sid]["total"] += total_c
 
     rows_main = []
-    rows_for_percent = []
+    total_included = 0
     skipped_activity_miss = 0
 
-    for sid, cnt in sorted(include_counts.items(), key=lambda x: x[1], reverse=True):
+    for sid, counts in sorted(
+        include_counts.items(),
+        key=lambda x: x[1]["total"],
+        reverse=True,
+    ):
         meta = activity_map.get(str(sid), {})
         service_name = clean_spaces(meta.get("service_name", ""))
         activity_code = clean_spaces(meta.get("activity_code", ""))
@@ -175,26 +209,36 @@ def aggregate_and_enrich(db_rows, exclude_service_ids, activity_map):
         if SKIP_ACTIVITY_MAPPING_MISS and not service_name:
             skipped_activity_miss += 1
             unaccounted_rows.append(
-                [sid, "", "", "", cnt, "activity_mapping_miss"]
+                [
+                    sid,
+                    "",
+                    "",
+                    "",
+                    int(counts["mail"]),
+                    int(counts["express"]),
+                    int(counts["total"]),
+                    "activity_mapping_miss",
+                ]
             )
             continue
 
-        rows_for_percent.append(cnt)
+        total_included += int(counts["total"])
+
         rows_main.append(
             {
                 "service_id": sid,
                 "service_name": service_name or sid,
                 "activity_code": activity_code,
                 "activity_name": activity_name,
-                "messages_count": int(cnt),
+                "mail_messages_count": int(counts["mail"]),
+                "express_messages_count": int(counts["express"]),
+                "total_messages_count": int(counts["total"]),
                 "percent_of_all_total": 0.0,
             }
         )
 
-    total_included = sum(rows_for_percent)
-
     for row in rows_main:
-        cnt = int(row["messages_count"] or 0)
+        cnt = int(row["total_messages_count"] or 0)
         pct = 0.0 if total_included <= 0 else (cnt * 100.0 / total_included)
         row["percent_of_all_total"] = pct
 
@@ -222,7 +266,9 @@ def write_excel(path, rows_main, unaccounted_rows):
         "service_name",
         "activity_code",
         "activity_name",
-        "messages_count",
+        "mail_messages_count",
+        "express_messages_count",
+        "total_messages_count",
         "percent_of_all_total",
     ]
     ws.append(headers)
@@ -236,7 +282,9 @@ def write_excel(path, rows_main, unaccounted_rows):
                 r["service_name"],
                 r["activity_code"],
                 r["activity_name"],
-                int(r["messages_count"]),
+                int(r["mail_messages_count"]),
+                int(r["express_messages_count"]),
+                int(r["total_messages_count"]),
                 float(r["percent_of_all_total"]),
             ]
         )
@@ -251,7 +299,9 @@ def write_excel(path, rows_main, unaccounted_rows):
         "service_name",
         "activity_code",
         "activity_name",
-        "messages_count",
+        "mail_messages_count",
+        "express_messages_count",
+        "total_messages_count",
         "reason",
     ]
     ws2.append(headers2)
@@ -260,7 +310,7 @@ def write_excel(path, rows_main, unaccounted_rows):
 
     ua_sorted = sorted(
         unaccounted_rows,
-        key=lambda r: (str(r[5]), -int(r[4] or 0), str(r[0])),
+        key=lambda r: (str(r[7]), -int(r[6] or 0), str(r[0])),
     )
     for r in ua_sorted:
         ws2.append(r)
@@ -279,8 +329,8 @@ def main():
 
     activity_map = read_activity_map(ACTIVITY_FILE)
 
-    # db_rows = get_counts_by_service_since_days_sql(SINCE_DAYS)
-    db_rows = get_counts_fixture(SINCE_DAYS)
+    db_rows = get_counts_by_service_since_days_sql(SINCE_DAYS)
+    # db_rows = get_counts_fixture(SINCE_DAYS)
 
     rows_main, unaccounted_rows, total_included = aggregate_and_enrich(
         db_rows=db_rows,
