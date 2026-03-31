@@ -224,7 +224,7 @@ def load_reference_rows(
                 "service_name": service_name,
                 "activity_code": activity_code,
                 "activity_name": activity_name,
-                "percent": percent,
+                "percent": 0.0 if percent is None else percent,
             }
         )
 
@@ -259,7 +259,7 @@ def build_source_rows(rows, source_name):
                 "service_name": service_name,
                 "activity_code": activity_code,
                 "activity_name": activity_name,
-                f"{source_name}_percent": percent,
+                f"{source_name}_percent": 0.0 if percent is None else percent,
             }
         )
 
@@ -289,21 +289,26 @@ def merge_source_rows(rows_list):
             for k, v in item.items():
                 if k in ("service_id", "service_name", "activity_code", "activity_name"):
                     continue
-                merged[key][k] = v
+                merged[key][k] = 0.0 if v is None else v
 
     return list(merged.values())
 
 
 def write_sources_sheet(ws, merged_rows, source_configs, platform_map, sum_row):
-    ws.merge_cells(start_row=1, start_column=1, end_row=2, end_column=1)
-    ws.merge_cells(start_row=1, start_column=2, end_row=2, end_column=2)
-    ws.merge_cells(start_row=1, start_column=3, end_row=2, end_column=3)
-    ws.merge_cells(start_row=1, start_column=4, end_row=2, end_column=4)
+    ws.merge_cells(start_row=1, start_column=1, end_row=3, end_column=1)
+    ws.merge_cells(start_row=1, start_column=2, end_row=3, end_column=2)
+    ws.merge_cells(start_row=1, start_column=3, end_row=3, end_column=3)
+    ws.merge_cells(start_row=1, start_column=4, end_row=3, end_column=4)
 
     ws.cell(row=1, column=1, value="service_id").font = Font(bold=True)
     ws.cell(row=1, column=2, value="service_name").font = Font(bold=True)
     ws.cell(row=1, column=3, value="activity_code").font = Font(bold=True)
     ws.cell(row=1, column=4, value="activity_name").font = Font(bold=True)
+
+    ws.cell(row=1, column=1).alignment = Alignment(horizontal="center", vertical="center")
+    ws.cell(row=1, column=2).alignment = Alignment(horizontal="center", vertical="center")
+    ws.cell(row=1, column=3).alignment = Alignment(horizontal="center", vertical="center")
+    ws.cell(row=1, column=4).alignment = Alignment(horizontal="center", vertical="center")
 
     current_col = 5
 
@@ -317,16 +322,20 @@ def write_sources_sheet(ws, merged_rows, source_configs, platform_map, sum_row):
             end_row=1,
             end_column=current_col + 1,
         )
+        ws.merge_cells(
+            start_row=2,
+            start_column=current_col,
+            end_row=2,
+            end_column=current_col + 1,
+        )
 
         head = ws.cell(row=1, column=current_col, value=source)
         head.font = Font(bold=True)
-        head.alignment = Alignment(horizontal="center")
+        head.alignment = Alignment(horizontal="center", vertical="center")
 
-        ws.cell(row=2, column=current_col, value=subtitle).alignment = Alignment(horizontal="center")
-        ws.cell(row=2, column=current_col + 1, value="weight").alignment = Alignment(horizontal="center")
-
-        ws.cell(row=2, column=current_col).font = Font(bold=True)
-        ws.cell(row=2, column=current_col + 1).font = Font(bold=True)
+        desc = ws.cell(row=2, column=current_col, value=subtitle)
+        desc.font = Font(bold=True)
+        desc.alignment = Alignment(horizontal="center", vertical="center")
 
         current_col += 2
 
@@ -340,11 +349,13 @@ def write_sources_sheet(ws, merged_rows, source_configs, platform_map, sum_row):
 
         for cfg in source_configs:
             source = cfg["name"]
+
             percent_value = item.get(f"{source}_percent")
+            if percent_value is None:
+                percent_value = 0.0
 
             percent_cell = ws.cell(row=row_idx, column=current_col, value=percent_value)
-            if isinstance(percent_value, (int, float)):
-                percent_cell.number_format = "0.00000"
+            percent_cell.number_format = "0.00000"
 
             weight_cell = ws.cell(row=row_idx, column=current_col + 1)
 
@@ -352,12 +363,14 @@ def write_sources_sheet(ws, merged_rows, source_configs, platform_map, sum_row):
             if platform_col:
                 platform_letter = get_column_letter(platform_col)
                 percent_letter = get_column_letter(current_col)
-
                 weight_cell.value = (
                     f"=Employees!{platform_letter}{sum_row}"
                     f"*{percent_letter}{row_idx}"
                 )
-                weight_cell.number_format = "0.00000"
+            else:
+                weight_cell.value = 0.0
+
+            weight_cell.number_format = "0.00000"
 
             current_col += 2
 
@@ -420,6 +433,12 @@ def main():
         all_rows_for_merge.append(cfg["rows"])
 
     merged_rows = merge_source_rows(all_rows_for_merge)
+
+    for item in merged_rows:
+        for cfg in source_configs:
+            key = f"{cfg['name']}_percent"
+            if key not in item or item[key] is None:
+                item[key] = 0.0
 
     merged_rows.sort(
         key=lambda x: (
