@@ -28,7 +28,7 @@ load_dotenv()
 
 OUTPUT_FILE = os.getenv("OUT_FILE", "victoria_report.xlsx")
 HTTP_TIMEOUT_SEC = int(os.getenv("HTTP_TIMEOUT_SEC", "30"))
-SLEEP_SEC = float(os.getenv("SLEEP_SEC", "0.1"))
+SLEEP_SEC = float(os.getenv("SLEEP_SEC", "0"))
 VERBOSE_LOG = (os.getenv("VERBOSE_LOG", "true").strip().lower() == "true")
 
 BAN_TEAMS = []
@@ -133,55 +133,30 @@ def http_query(vm_url: str, query: str, at_ts: float | None = None):
     if at_ts is not None:
         params["time"] = at_ts
 
-    log.info("VM query | query=%s", query)
+    log.info("QUERY | %s", query)
 
-    started = time.time()
     r = requests.get(url, params=params, verify=False, timeout=HTTP_TIMEOUT_SEC)
-    elapsed = time.time() - started
-
-    log.info(
-        "VM response | status_code=%s | elapsed=%.3fs | rows=%s",
-        r.status_code,
-        elapsed,
-        "unknown",
-    )
-
     r.raise_for_status()
     data = r.json()
 
     if data.get("status") != "success":
-        log.error("VM query failed payload=%s", data)
         raise RuntimeError(data)
 
-    result = data["data"]["result"]
-    log.info("VM result | rows=%d", len(result))
-    return result
+    return data["data"]["result"]
 
 
 def http_label_values(vm_url: str, label_name: str):
     url = vm_url.rstrip("/") + f"/api/v1/label/{label_name}/values"
-    log.info("VM label values start | label=%s", label_name)
+    log.info("QUERY | label_values(%s)", label_name)
 
-    started = time.time()
     r = requests.get(url, verify=False, timeout=HTTP_TIMEOUT_SEC)
-    elapsed = time.time() - started
-
-    log.info(
-        "VM label values response | label=%s | status_code=%s | elapsed=%.3fs",
-        label_name,
-        r.status_code,
-        elapsed,
-    )
-
     r.raise_for_status()
     data = r.json()
+
     if data.get("status") != "success":
-        log.error("VM label values failed | label=%s | payload=%s", label_name, data)
         raise RuntimeError(data)
 
-    values = data.get("data") or []
-    log.info("VM label values loaded | label=%s | count=%d", label_name, len(values))
-    return values
+    return data.get("data") or []
 
 
 def label(metric: dict, key: str) -> str:
@@ -248,9 +223,7 @@ def read_activity_map(path: str) -> pd.DataFrame:
     return out
 
 
-def discover_series(vm_url: str):
-    started_at = time.time()
-
+def load_metric_names(vm_url: str):
     metric_names = http_label_values(vm_url, "__name__")
     metric_names = [x for x in metric_names if is_valid_metric_name(x)]
     metric_names.sort()
@@ -258,14 +231,109 @@ def discover_series(vm_url: str):
     if MAX_METRICS > 0:
         metric_names = metric_names[:MAX_METRICS]
 
-    total_metrics = len(metric_names)
-    log.info(
-        "Discovery start | metric_names=%d | MAX_METRICS=%s",
-        total_metrics,
-        MAX_METRICS if MAX_METRICS > 0 else "ALL",
-    )
+    log.info("Metric names loaded: %d", len(metric_names))
+    return metric_names
 
-    out = []
+
+def preload_team_sid_index(vm_url: str, metric_names: list[str]):
+    at_ts = datetime.now(timezone.utc).timestamp()
+    team_sids = defaultdict(set)
+    total_metrics = len(metric_names)
+
+    for idx, metric_name in enumerate(metric_names, 1):
+        q = (
+            f"sum by (team, service_id, __name__) "
+            f"(count_over_time({metric_name}[{WINDOW_HOURS}h]))"
+        )
+
+        try:
+            rows = http_query(vm_url, q, at_ts=at_ts)
+        except Exception as e:
+            log.warning("Preload failed | metric=%s | err=%s", metric_name, e)
+            continue
+
+        for r in rows or []:
+            m = r.get("metric", {}) or {}
+            team_raw = label(m, "team")
+            service_id_raw = normalize_sid(label(m, "service_id"))
+            team_base, sid_from_team = split_team_tail_id(team_raw)
+            sid_from_team = normalize_sid(sid_from_team)
+            sid_seed = pick_better_sid(service_id_raw, sid_from_team)
+
+            if team_base and sid_seed:
+                team_sids[team_base].add(sid_seed)
+
+        if idx % 100 == 0 or idx == total_metrics:
+            left = total_metrics - idx
+            log.info("Preload progress | processed=%d | left=%d", idx, left)
+
+        if SLEEP_SEC > 0:
+            time.sleep(SLEEP_SEC)
+
+    team_to_sid = {}
+    ambiguous_teams = set()
+
+    for team_base, sids in team_sids.items():
+        if len(sids) == 1:
+            team_to_sid[team_base] = next(iter(sids))
+        elif len(sids) > 1:
+            ambiguous_teams.add(team_base)
+
+    log.info(
+        "Preload done | team_to_sid=%d | ambiguous_teams=%d",
+        len(team_to_sid),
+        len(ambiguous_teams),
+    )
+    return team_to_sid, ambiguous_teams
+
+
+def discover_and_route_series(
+    vm_url: str,
+    metric_names: list[str],
+    team_to_sid_map: dict,
+    ambiguous_teams: set,
+    overrides: dict,
+    activity_df: pd.DataFrame,
+):
+    activity_map = {}
+    if activity_df is not None and not activity_df.empty:
+        for row in activity_df.to_dict("records"):
+            code = normalize_sid(row.get("code", ""))
+            if code and code not in activity_map:
+                activity_map[code] = {
+                    "service_name": clean_spaces(row.get("service_name", "")),
+                    "activity_code": clean_spaces(row.get("activity_code", "")),
+                    "activity_name": clean_spaces(row.get("activity_name", "")),
+                }
+
+    grouped_samples = defaultdict(int)
+    grouped_meta = {}
+    unacc_map = {}
+
+    def add_unacc_once(
+        stage, team, service_id, metric, reason, detail, samples_value=None
+    ):
+        key = (team or "", normalize_sid(service_id), metric or "")
+        if key in unacc_map:
+            return
+
+        sid = normalize_sid(service_id)
+        activity = activity_map.get(sid, {}) if sid else {}
+
+        unacc_map[key] = {
+            "stage": stage,
+            "team": team or "",
+            "service_id": sid,
+            "service_name": activity.get("service_name", ""),
+            "activity_code": activity.get("activity_code", ""),
+            "activity_name": activity.get("activity_name", ""),
+            "metric": metric or "",
+            "samples_value": "" if samples_value is None else int(samples_value),
+            "reason": reason,
+            "detail": detail,
+        }
+
+    total_metrics = len(metric_names)
     at_ts = datetime.now(timezone.utc).timestamp()
 
     for idx, metric_name in enumerate(metric_names, 1):
@@ -274,22 +342,11 @@ def discover_series(vm_url: str):
             f"(count_over_time({metric_name}[{WINDOW_HOURS}h]))"
         )
 
-        log.info("Metric start | idx=%d/%d | metric=%s", idx, total_metrics, metric_name)
-
         try:
             rows = http_query(vm_url, q, at_ts=at_ts)
         except Exception as e:
-            log.warning(
-                "Metric failed | idx=%d/%d | metric=%s | err=%s",
-                idx,
-                total_metrics,
-                metric_name,
-                e,
-            )
-            time.sleep(SLEEP_SEC)
+            log.warning("Collect failed | metric=%s | err=%s", metric_name, e)
             continue
-
-        rows_added = 0
 
         for r in rows or []:
             m = r.get("metric", {}) or {}
@@ -308,83 +365,101 @@ def discover_series(vm_url: str):
                     samples_value = 0
 
             team_base, sid_from_team = split_team_tail_id(team_raw)
+            team_base = (team_base or "").strip()
             sid_from_team = normalize_sid(sid_from_team)
             sid_seed = pick_better_sid(service_id_raw, sid_from_team)
 
-            out.append(
-                {
-                    "team_raw": team_raw,
-                    "team_base": (team_base or "").strip(),
-                    "service_id_raw": service_id_raw,
-                    "sid_from_team": sid_from_team,
-                    "sid_seed": sid_seed,
-                    "metric": metric,
-                    "samples_value": samples_value,
-                }
-            )
-            rows_added += 1
+            service_id_final = sid_seed
+            status = "accounted"
+            stage = ""
+            reason = ""
+            detail = ""
 
-        elapsed = time.time() - started_at
-        rate = idx / elapsed if elapsed > 0 else 0.0
+            ov = overrides.get(team_base)
+            if ov:
+                service_id_final = ov
+            else:
+                if not service_id_final:
+                    if (
+                        (not service_id_raw)
+                        and (not sid_from_team)
+                        and (team_base in ambiguous_teams)
+                    ):
+                        status = "unaccounted"
+                        stage = "infer"
+                        reason = "ambiguous_service_id"
+                        detail = "multiple service_id detected for team_base"
+                    else:
+                        inferred = team_to_sid_map.get(team_base, "")
+                        if (not service_id_raw) and (not sid_from_team) and inferred:
+                            service_id_final = inferred
 
-        log.info(
-            "Metric done | idx=%d/%d | metric=%s | rows_added=%d | total_rows=%d | rate=%.2f m/s",
-            idx,
-            total_metrics,
-            metric_name,
-            rows_added,
-            len(out),
-            rate,
-        )
+            if is_banned_team(team_base):
+                status = "unaccounted"
+                stage = "discover"
+                reason = "banned_team"
+                detail = "team in BAN_TEAMS"
 
-        time.sleep(SLEEP_SEC)
+            if (
+                status == "accounted"
+                and service_id_final
+                and service_id_final in ban_service_set
+            ):
+                status = "unaccounted"
+                stage = "discover"
+                reason = "banned_service_id"
+                detail = "service_id in BAN_SERVICE_IDS"
 
-    log.info("Discovery finished | total_rows=%d", len(out))
-    return out
+            if status == "accounted" and not service_id_final:
+                status = "unaccounted"
+                stage = "discover"
+                reason = "excluded_no_service_id"
+                detail = "service_id empty"
 
+            if status == "unaccounted":
+                add_unacc_once(
+                    stage,
+                    team_base,
+                    service_id_final,
+                    metric,
+                    reason,
+                    detail,
+                    samples_value=samples_value,
+                )
+            else:
+                key = (team_base, service_id_final)
+                grouped_samples[key] += samples_value
+                if key not in grouped_meta:
+                    grouped_meta[key] = {
+                        "team": team_base,
+                        "service_id": service_id_final,
+                    }
 
-def build_team_to_sid_maps(series_rows):
-    team_sids = defaultdict(set)
-    for r in series_rows:
-        team_base = (r.get("team_base") or "").strip()
-        sid = normalize_sid(r.get("sid_seed"))
-        if team_base and sid:
-            team_sids[team_base].add(sid)
+        if idx % 100 == 0 or idx == total_metrics:
+            left = total_metrics - idx
+            log.info("Collect progress | processed=%d | left=%d", idx, left)
 
-    team_to_sid = {}
-    ambiguous_teams = set()
+        if SLEEP_SEC > 0:
+            time.sleep(SLEEP_SEC)
 
-    for team_base, sids in team_sids.items():
-        if len(sids) == 1:
-            team_to_sid[team_base] = next(iter(sids))
-        elif len(sids) > 1:
-            ambiguous_teams.add(team_base)
-
-    return team_to_sid, ambiguous_teams
-
-
-def aggregate_to_group(metric_rows):
-    acc = {}
-    for r in metric_rows:
-        team_base = (r.get("team_base") or "").strip()
-        sid = normalize_sid(r.get("service_id_final"))
-        samples = int(r.get("samples_value", 0) or 0)
-
-        key = (team_base, sid)
-        if key not in acc:
-            acc[key] = {"team_base": team_base, "service_id": sid, "samples_value": 0}
-        acc[key]["samples_value"] += samples
-
-    out = []
-    for _, v in acc.items():
-        out.append(
+    group_rows = []
+    for key, samples in grouped_samples.items():
+        meta = grouped_meta[key]
+        group_rows.append(
             {
-                "team": v["team_base"],
-                "service_id": v["service_id"],
-                "samples_value": int(v["samples_value"]),
+                "team": meta["team"],
+                "service_id": meta["service_id"],
+                "samples_value": int(samples),
             }
         )
-    return out
+
+    df_unacc = pd.DataFrame(list(unacc_map.values()), columns=UNACC_COLS)
+    log.info(
+        "Collect done | grouped_rows=%d | unaccounted_rows=%d",
+        len(group_rows),
+        len(df_unacc),
+    )
+    return group_rows, df_unacc
 
 
 def enrich_group_rows(group_rows, activity_df: pd.DataFrame):
@@ -1046,7 +1121,6 @@ def main():
         log.info("VM_URL=%s", vm_url)
         log.info("WINDOW_HOURS=%s", WINDOW_HOURS)
         log.info("MAX_METRICS=%s", MAX_METRICS if MAX_METRICS > 0 else "ALL")
-        log.info("VERBOSE_LOG=%s", VERBOSE_LOG)
         log.info(
             "BAN_SERVICE_IDS=%s", sorted(ban_service_set) if ban_service_set else "[]"
         )
@@ -1064,42 +1138,7 @@ def main():
                 overrides[kk] = vv
 
         today_snapshot = datetime.now(timezone.utc).date().isoformat()
-
-        unacc_map = {}
         collected_unacc_today = False
-
-        def add_unacc_once(
-            stage, team, service_id, metric, reason, detail, samples_value=None
-        ):
-            key = (team or "", service_id or "", metric or "")
-            if key in unacc_map:
-                return
-
-            sid = normalize_sid(service_id)
-            service_name = ""
-            activity_code = ""
-            activity_name = ""
-
-            if sid and not activity_df.empty:
-                match = activity_df[activity_df["code"].astype(str) == sid]
-                if not match.empty:
-                    first = match.iloc[0]
-                    service_name = clean_spaces(first.get("service_name", ""))
-                    activity_code = clean_spaces(first.get("activity_code", ""))
-                    activity_name = clean_spaces(first.get("activity_name", ""))
-
-            unacc_map[key] = {
-                "stage": stage,
-                "team": team or "",
-                "service_id": sid,
-                "service_name": service_name,
-                "activity_code": activity_code,
-                "activity_name": activity_name,
-                "metric": metric or "",
-                "samples_value": "" if samples_value is None else int(samples_value),
-                "reason": reason,
-                "detail": detail,
-            }
 
         if db.has_snapshot(today_snapshot):
             log.info("Snapshot for today already exists: %s", today_snapshot)
@@ -1107,176 +1146,62 @@ def main():
         else:
             log.info("No snapshot for today, starting heavy Victoria collection")
 
-            log.info("Discover series ...")
-            series_rows = discover_series(vm_url)
-            log.info("Series found: %d", len(series_rows))
+            metric_names = load_metric_names(vm_url)
+            team_to_sid_map, ambiguous_teams = preload_team_sid_index(
+                vm_url, metric_names
+            )
 
-            team_to_sid_map, ambiguous_teams = build_team_to_sid_maps(series_rows)
-            log.info("Team->SID inferred map size: %d", len(team_to_sid_map))
-            log.info("Ambiguous teams: %d", len(ambiguous_teams))
-            log.info("Overrides: %d", len(overrides))
-
-            metrics_audit = []
-            accounted_metric_rows = []
-
-            for idx, r in enumerate(series_rows, 1):
-                team_raw = (r.get("team_raw") or "").strip()
-                team_base = (r.get("team_base") or "").strip()
-                service_id_raw = normalize_sid(r.get("service_id_raw"))
-                sid_from_team = normalize_sid(r.get("sid_from_team"))
-                sid_seed = normalize_sid(r.get("sid_seed"))
-                metric = (r.get("metric") or "").strip()
-
-                if not metric:
-                    continue
-
-                service_id_final = sid_seed
-                stage = ""
-                reason = ""
-                detail = ""
-                status = "accounted"
-
-                ov = overrides.get(team_base)
-                if ov:
-                    service_id_final = ov
-                else:
-                    if not service_id_final:
-                        if (
-                            (not service_id_raw)
-                            and (not sid_from_team)
-                            and (team_base in ambiguous_teams)
-                        ):
-                            status = "unaccounted"
-                            stage = "infer"
-                            reason = "ambiguous_service_id"
-                            detail = "multiple service_id detected for team_base"
-                        else:
-                            inferred = team_to_sid_map.get(team_base, "")
-                            if (
-                                (not service_id_raw)
-                                and (not sid_from_team)
-                                and inferred
-                            ):
-                                service_id_final = inferred
-
-                if is_banned_team(team_base):
-                    status = "unaccounted"
-                    stage = "discover"
-                    reason = "banned_team"
-                    detail = "team in BAN_TEAMS"
-
-                if (
-                    status == "accounted"
-                    and service_id_final
-                    and service_id_final in ban_service_set
-                ):
-                    status = "unaccounted"
-                    stage = "discover"
-                    reason = "banned_service_id"
-                    detail = "service_id in BAN_SERVICE_IDS"
-
-                if status == "accounted" and not service_id_final:
-                    status = "unaccounted"
-                    stage = "discover"
-                    reason = "excluded_no_service_id"
-                    detail = "service_id empty"
-
-                samples_value = int(r.get("samples_value", 0) or 0)
-
-                if status == "unaccounted":
-                    log.info(
-                        "Metric route | metric=%s | destination=unaccounted | samples=%s",
-                        metric,
-                        samples_value,
-                    )
-
-                    add_unacc_once(
-                        stage,
-                        team_base,
-                        service_id_final,
-                        metric,
-                        reason,
-                        detail,
-                        samples_value=samples_value,
-                    )
-                else:
-                    log.info(
-                        "Metric route | metric=%s | destination=report | samples=%s",
-                        metric,
-                        samples_value,
-                    )
-
-                    accounted_metric_rows.append(
-                        {
-                            "team_base": team_base,
-                            "service_id_final": service_id_final,
-                            "samples_value": int(samples_value),
-                        }
-                    )
-
-                metrics_audit.append(
-                    {
-                        "team_base": team_base,
-                        "team_raw": team_raw,
-                        "service_id_raw": service_id_raw,
-                        "service_id_final": service_id_final,
-                        "metric": metric,
-                        "samples_value": int(samples_value),
-                        "status": status,
-                        "stage": stage,
-                        "reason": reason,
-                        "detail": detail,
-                    }
-                )
-
-                if idx % 1000 == 0:
-                    log.info("Processed: %d/%d", idx, len(series_rows))
-
-                #time.sleep(SLEEP_SEC)
-
-            group_rows = aggregate_to_group(accounted_metric_rows)
-            log.info("Aggregate done | grouped_rows=%d", len(group_rows))
+            group_rows, df_unacc_new = discover_and_route_series(
+                vm_url=vm_url,
+                metric_names=metric_names,
+                team_to_sid_map=team_to_sid_map,
+                ambiguous_teams=ambiguous_teams,
+                overrides=overrides,
+                activity_df=activity_df,
+            )
 
             enriched = enrich_group_rows(group_rows, activity_df)
-            log.info("Enrich done | enriched_rows=%d", len(enriched))
+            log.info("Enrich done | rows=%d", len(enriched))
 
             if not enriched.empty:
-                accounted = enriched.copy()
+                missing_activity = enriched[~enriched["activity_found"]].copy()
+                accounted = enriched[enriched["activity_found"]].copy()
 
-                def mark_unacc_for_service(team, sid, stage, reason, detail):
-                    for rr in metrics_audit:
-                        if rr.get("status") != "accounted":
-                            continue
-                        if (rr.get("team_base") or "") == (
-                            team or ""
-                        ) and normalize_sid(
-                            rr.get("service_id_final")
-                        ) == normalize_sid(sid):
-                            add_unacc_once(
-                                stage,
-                                rr.get("team_base", ""),
-                                rr.get("service_id_final", ""),
-                                rr.get("metric", ""),
-                                reason,
-                                detail,
-                                samples_value=int(rr.get("samples_value", 0) or 0),
-                            )
-                            rr["status"] = "unaccounted"
-                            rr["stage"] = stage
-                            rr["reason"] = reason
-                            rr["detail"] = detail
+                if not missing_activity.empty:
+                    extra_unacc = []
+                    for row in missing_activity.to_dict("records"):
+                        extra_unacc.append(
+                            {
+                                "stage": "enrich",
+                                "team": row.get("team", ""),
+                                "service_id": normalize_sid(row.get("service_id", "")),
+                                "service_name": clean_spaces(
+                                    row.get("service_name", "")
+                                ),
+                                "activity_code": clean_spaces(
+                                    row.get("activity_code", "")
+                                ),
+                                "activity_name": clean_spaces(
+                                    row.get("activity_name", "")
+                                ),
+                                "metric": "",
+                                "samples_value": int(row.get("samples_value", 0) or 0),
+                                "reason": "activity_mapping_miss",
+                                "detail": "service_id not found in activity.xlsx",
+                            }
+                        )
 
-                m_activity_missing = ~accounted["activity_found"]
-                for rr in accounted[m_activity_missing].to_dict("records"):
-                    mark_unacc_for_service(
-                        rr.get("team", ""),
-                        rr.get("service_id", ""),
-                        "enrich",
-                        "activity_mapping_miss",
-                        "service_id not found in activity.xlsx",
-                    )
+                    if df_unacc_new is None or df_unacc_new.empty:
+                        df_unacc_new = pd.DataFrame(extra_unacc, columns=UNACC_COLS)
+                    else:
+                        df_unacc_new = pd.concat(
+                            [
+                                df_unacc_new,
+                                pd.DataFrame(extra_unacc, columns=UNACC_COLS),
+                            ],
+                            ignore_index=True,
+                        )
 
-                accounted = accounted[accounted["activity_found"]].copy()
                 log.info("Accounted after activity filter | rows=%d", len(accounted))
                 df_daily = build_daily_df_report(accounted)
             else:
@@ -1290,15 +1215,9 @@ def main():
                     ]
                 )
 
-            log.info(
-                "DB save daily snapshot | snapshot_date=%s | rows=%d",
-                today_snapshot,
-                len(df_daily),
-            )
             db.save_daily_snapshot(today_snapshot, df_daily)
 
-            df_unacc_new = pd.DataFrame(list(unacc_map.values()))
-            if not df_unacc_new.empty:
+            if df_unacc_new is not None and not df_unacc_new.empty:
                 df_unacc_new = df_unacc_new.reindex(columns=UNACC_COLS).fillna("")
                 df_unacc_new = df_unacc_new.sort_values(
                     ["stage", "reason", "team", "service_id", "metric"]
@@ -1306,16 +1225,10 @@ def main():
             else:
                 df_unacc_new = pd.DataFrame(columns=UNACC_COLS)
 
-            log.info(
-                "DB replace unaccounted | snapshot_date=%s | rows=%d",
-                today_snapshot,
-                len(df_unacc_new),
-            )
             db.replace_daily_unaccounted(today_snapshot, df_unacc_new)
             collected_unacc_today = True
 
         df_period = db.load_period_rows(SNAPSHOT_LOOKBACK_DAYS)
-
         log.info("Period rows loaded: %d", len(df_period))
         log.info("Period distance days: %d", calc_period_distance_days(df_period))
 
@@ -1331,9 +1244,8 @@ def main():
         log.info("Unaccounted loaded from DB: %d", len(df_unacc))
         log.info("Collected unaccounted today in current run: %s", collected_unacc_today)
 
-        log.info("Saving report: %s", OUTPUT_FILE)
         write_report(df_report, df_unacc)
-        log.info("✔ Done")
+        log.info("Done")
     finally:
         db.close()
 
