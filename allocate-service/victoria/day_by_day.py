@@ -10,9 +10,8 @@ from collections import defaultdict
 import requests
 import urllib3
 from dotenv import load_dotenv
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font
-from openpyxl import load_workbook
 import pandas as pd
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -218,6 +217,7 @@ def read_activity_map(path: str) -> pd.DataFrame:
         )
 
     out = out.drop_duplicates(subset=["code"], keep="first").copy()
+    out["code"] = out["code"].astype(str).map(normalize_sid)
     log.info("ACTIVITY loaded: %d", len(out))
     return out
 
@@ -523,6 +523,32 @@ def build_daily_df_report(accounted: pd.DataFrame) -> pd.DataFrame:
     return dedupe_daily_report(df_for_report)
 
 
+def normalize_unacc_df(df_unacc: pd.DataFrame) -> pd.DataFrame:
+    if df_unacc is None or df_unacc.empty:
+        return pd.DataFrame(columns=UNACC_COLS)
+
+    df = df_unacc.copy()
+    for col in UNACC_COLS:
+        if col not in df.columns:
+            df[col] = ""
+
+    df["stage"] = df["stage"].fillna("").astype(str).map(clean_spaces)
+    df["team"] = df["team"].fillna("").astype(str).map(clean_spaces)
+    df["service_id"] = df["service_id"].fillna("").astype(str).map(normalize_sid)
+    df["service_name"] = df["service_name"].fillna("").astype(str).map(clean_spaces)
+    df["activity_code"] = df["activity_code"].fillna("").astype(str).map(clean_spaces)
+    df["activity_name"] = df["activity_name"].fillna("").astype(str).map(clean_spaces)
+    df["metric"] = df["metric"].fillna("").astype(str).map(clean_spaces)
+    df["samples_value"] = pd.to_numeric(df["samples_value"], errors="coerce").fillna(0).astype(int)
+    df["reason"] = df["reason"].fillna("").astype(str).map(clean_spaces)
+    df["detail"] = df["detail"].fillna("").astype(str).map(clean_spaces)
+
+    df = df[UNACC_COLS].copy()
+    df = df.drop_duplicates(subset=["stage", "team", "service_id", "metric", "reason", "detail"])
+    df = df.sort_values(["stage", "reason", "team", "service_id", "metric"]).reset_index(drop=True)
+    return df
+
+
 class BaseDb:
     def init_schema(self):
         raise NotImplementedError
@@ -534,6 +560,18 @@ class BaseDb:
         raise NotImplementedError
 
     def load_period_rows(self, lookback_days: int) -> pd.DataFrame:
+        raise NotImplementedError
+
+    def clear_unaccounted_snapshot(self, snapshot_date: str):
+        raise NotImplementedError
+
+    def save_unaccounted_snapshot(self, snapshot_date: str, df_unacc: pd.DataFrame):
+        raise NotImplementedError
+
+    def load_unaccounted_snapshot(self, snapshot_date: str) -> pd.DataFrame:
+        raise NotImplementedError
+
+    def load_snapshot_dates(self, lookback_days: int) -> list[str]:
         raise NotImplementedError
 
     def close(self):
@@ -578,6 +616,34 @@ class SqliteDb(BaseDb):
 
         cur.execute(
             """
+            CREATE TABLE IF NOT EXISTS daily_unaccounted_samples (
+                snapshot_date TEXT NOT NULL,
+                stage TEXT NOT NULL DEFAULT '',
+                team TEXT NOT NULL DEFAULT '',
+                service_id TEXT NOT NULL DEFAULT '',
+                service_name TEXT NOT NULL DEFAULT '',
+                activity_code TEXT NOT NULL DEFAULT '',
+                activity_name TEXT NOT NULL DEFAULT '',
+                metric TEXT NOT NULL DEFAULT '',
+                samples_value INTEGER NOT NULL DEFAULT 0,
+                reason TEXT NOT NULL DEFAULT '',
+                detail TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (
+                    snapshot_date,
+                    stage,
+                    team,
+                    service_id,
+                    metric,
+                    reason,
+                    detail
+                )
+            )
+            """
+        )
+
+        cur.execute(
+            """
             CREATE INDEX IF NOT EXISTS idx_daily_activity_samples_snapshot_date
             ON daily_activity_samples (snapshot_date)
             """
@@ -587,6 +653,13 @@ class SqliteDb(BaseDb):
             """
             CREATE INDEX IF NOT EXISTS idx_daily_activity_samples_service_id
             ON daily_activity_samples (service_id)
+            """
+        )
+
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_daily_unaccounted_samples_snapshot_date
+            ON daily_unaccounted_samples (snapshot_date)
             """
         )
 
@@ -676,6 +749,64 @@ class SqliteDb(BaseDb):
             self.conn.rollback()
             raise
 
+    def clear_unaccounted_snapshot(self, snapshot_date: str):
+        cur = self.conn.cursor()
+        cur.execute(
+            "DELETE FROM daily_unaccounted_samples WHERE snapshot_date = ?",
+            (snapshot_date,),
+        )
+        self.conn.commit()
+        log.info("Unaccounted cleared for snapshot_date=%s", snapshot_date)
+
+    def save_unaccounted_snapshot(self, snapshot_date: str, df_unacc: pd.DataFrame):
+        df_unacc = normalize_unacc_df(df_unacc)
+        now_str = datetime.now(timezone.utc).isoformat()
+        cur = self.conn.cursor()
+
+        rows = []
+        for row in df_unacc.to_dict("records"):
+            rows.append(
+                (
+                    snapshot_date,
+                    clean_spaces(row.get("stage", "")),
+                    clean_spaces(row.get("team", "")),
+                    normalize_sid(row.get("service_id", "")),
+                    clean_spaces(row.get("service_name", "")),
+                    clean_spaces(row.get("activity_code", "")),
+                    clean_spaces(row.get("activity_name", "")),
+                    clean_spaces(row.get("metric", "")),
+                    int(row.get("samples_value", 0) or 0),
+                    clean_spaces(row.get("reason", "")),
+                    clean_spaces(row.get("detail", "")),
+                    now_str,
+                )
+            )
+
+        if rows:
+            cur.executemany(
+                """
+                INSERT OR REPLACE INTO daily_unaccounted_samples (
+                    snapshot_date,
+                    stage,
+                    team,
+                    service_id,
+                    service_name,
+                    activity_code,
+                    activity_name,
+                    metric,
+                    samples_value,
+                    reason,
+                    detail,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+            self.conn.commit()
+
+        log.info("Unaccounted saved into DB: %s rows=%d", snapshot_date, len(rows))
+
     def _period_start_date(self, lookback_days: int) -> str | None:
         if lookback_days <= 0:
             return None
@@ -698,6 +829,7 @@ class SqliteDb(BaseDb):
                     samples_value,
                     window_hours
                 FROM daily_activity_samples
+                ORDER BY snapshot_date, service_name, activity_code
                 """
             )
         else:
@@ -713,6 +845,7 @@ class SqliteDb(BaseDb):
                     window_hours
                 FROM daily_activity_samples
                 WHERE snapshot_date >= ?
+                ORDER BY snapshot_date, service_name, activity_code
                 """,
                 (start_date,),
             )
@@ -731,6 +864,57 @@ class SqliteDb(BaseDb):
                 ]
             )
         return pd.DataFrame(rows)
+
+    def load_unaccounted_snapshot(self, snapshot_date: str) -> pd.DataFrame:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            SELECT
+                stage,
+                team,
+                service_id,
+                service_name,
+                activity_code,
+                activity_name,
+                metric,
+                samples_value,
+                reason,
+                detail
+            FROM daily_unaccounted_samples
+            WHERE snapshot_date = ?
+            ORDER BY stage, reason, team, service_id, metric
+            """,
+            (snapshot_date,),
+        )
+        rows = [dict(x) for x in cur.fetchall()]
+        if not rows:
+            return pd.DataFrame(columns=UNACC_COLS)
+        return normalize_unacc_df(pd.DataFrame(rows))
+
+    def load_snapshot_dates(self, lookback_days: int) -> list[str]:
+        cur = self.conn.cursor()
+        start_date = self._period_start_date(lookback_days)
+
+        if start_date is None:
+            cur.execute(
+                """
+                SELECT DISTINCT snapshot_date
+                FROM snapshot_runs
+                ORDER BY snapshot_date
+                """
+            )
+        else:
+            cur.execute(
+                """
+                SELECT DISTINCT snapshot_date
+                FROM snapshot_runs
+                WHERE snapshot_date >= ?
+                ORDER BY snapshot_date
+                """,
+                (start_date,),
+            )
+
+        return [str(x["snapshot_date"]) for x in cur.fetchall()]
 
     def close(self):
         if getattr(self, "conn", None) is not None:
@@ -755,6 +939,18 @@ class PostgresDb(BaseDb):
         raise NotImplementedError
 
     def load_period_rows(self, lookback_days: int) -> pd.DataFrame:
+        raise NotImplementedError
+
+    def clear_unaccounted_snapshot(self, snapshot_date: str):
+        raise NotImplementedError
+
+    def save_unaccounted_snapshot(self, snapshot_date: str, df_unacc: pd.DataFrame):
+        raise NotImplementedError
+
+    def load_unaccounted_snapshot(self, snapshot_date: str) -> pd.DataFrame:
+        raise NotImplementedError
+
+    def load_snapshot_dates(self, lookback_days: int) -> list[str]:
         raise NotImplementedError
 
     def close(self):
@@ -786,9 +982,25 @@ def calc_period_distance_days(df_period: pd.DataFrame) -> int:
     return int(delta_days)
 
 
+def get_period_bounds(df_period: pd.DataFrame) -> tuple[str, str, int]:
+    if df_period is None or df_period.empty or "snapshot_date" not in df_period.columns:
+        return "", "", 1
+
+    dates = pd.to_datetime(df_period["snapshot_date"], errors="coerce").dropna()
+    if dates.empty:
+        return "", "", 1
+
+    min_dt = dates.min().date().isoformat()
+    max_dt = dates.max().date().isoformat()
+    delta_days = (pd.to_datetime(max_dt).date() - pd.to_datetime(min_dt).date()).days + 1
+    if delta_days <= 0:
+        delta_days = 1
+    return min_dt, max_dt, int(delta_days)
+
+
 def build_period_samples_col_name(df_period: pd.DataFrame) -> str:
-    days_distance = calc_period_distance_days(df_period)
-    return f"samples_за_{days_distance}d"
+    _, _, days_distance = get_period_bounds(df_period)
+    return f"samples_{days_distance}_d"
 
 
 def build_period_report(df_period: pd.DataFrame) -> pd.DataFrame:
@@ -881,7 +1093,28 @@ def build_period_report(df_period: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def write_report(df_report: pd.DataFrame, df_unacc: pd.DataFrame):
+def build_snapshots_info_df(df_period: pd.DataFrame, snapshot_dates: list[str], lookback_days: int) -> pd.DataFrame:
+    min_dt, max_dt, days_distance = get_period_bounds(df_period)
+    actual_snapshot_count = len(snapshot_dates)
+
+    if lookback_days > 0:
+        lookback_label = str(lookback_days)
+    else:
+        lookback_label = "all"
+
+    rows = [
+        {"Параметр": "lookback_days", "Значение": lookback_label},
+        {"Параметр": "period_start", "Значение": min_dt},
+        {"Параметр": "period_end", "Значение": max_dt},
+        {"Параметр": "period_days", "Значение": str(days_distance)},
+        {"Параметр": "snapshot_count", "Значение": str(actual_snapshot_count)},
+        {"Параметр": "snapshots_used", "Значение": ", ".join(snapshot_dates)},
+    ]
+
+    return pd.DataFrame(rows, columns=["Параметр", "Значение"])
+
+
+def write_report(df_report: pd.DataFrame, df_unacc: pd.DataFrame, df_snapshots: pd.DataFrame):
     wb = Workbook()
     bold = Font(bold=True)
 
@@ -902,8 +1135,9 @@ def write_report(df_report: pd.DataFrame, df_unacc: pd.DataFrame):
 
     ws2 = wb.create_sheet("Unaccounted")
     if df_unacc is None or df_unacc.empty:
-        ws2.append(["No data"])
-        ws2["A1"].font = bold
+        ws2.append(list(UNACC_COLS))
+        for c in ws2[1]:
+            c.font = bold
     else:
         df_unacc = df_unacc.reindex(columns=UNACC_COLS)
         ws2.append(list(df_unacc.columns))
@@ -911,6 +1145,13 @@ def write_report(df_report: pd.DataFrame, df_unacc: pd.DataFrame):
             c.font = bold
         for row in df_unacc.itertuples(index=False):
             ws2.append(list(row))
+
+    ws3 = wb.create_sheet("Snapshots")
+    ws3.append(list(df_snapshots.columns))
+    for c in ws3[1]:
+        c.font = bold
+    for row in df_snapshots.itertuples(index=False):
+        ws3.append(list(row))
 
     wb.save(OUTPUT_FILE)
 
@@ -948,46 +1189,56 @@ def main():
 
         today_snapshot = datetime.now(timezone.utc).date().isoformat()
 
-        unacc_map = {}
-
-        def add_unacc_once(
-            stage, team, service_id, metric, reason, detail, samples_value=None
-        ):
-            key = (team or "", service_id or "", metric or "")
-            if key in unacc_map:
-                return
-
-            sid = normalize_sid(service_id)
-            service_name = ""
-            activity_code = ""
-            activity_name = ""
-
-            if sid and not activity_df.empty:
-                match = activity_df[activity_df["code"].astype(str) == sid]
-                if not match.empty:
-                    first = match.iloc[0]
-                    service_name = clean_spaces(first.get("service_name", ""))
-                    activity_code = clean_spaces(first.get("activity_code", ""))
-                    activity_name = clean_spaces(first.get("activity_name", ""))
-
-            unacc_map[key] = {
-                "stage": stage,
-                "team": team or "",
-                "service_id": sid,
-                "service_name": service_name,
-                "activity_code": activity_code,
-                "activity_name": activity_name,
-                "metric": metric or "",
-                "samples_value": "" if samples_value is None else int(samples_value),
-                "reason": reason,
-                "detail": detail,
-            }
+        df_unacc = pd.DataFrame(columns=UNACC_COLS)
 
         if db.has_snapshot(today_snapshot):
             log.info("Snapshot for today already exists: %s", today_snapshot)
             log.info("Heavy Victoria collection skipped")
+            df_unacc = db.load_unaccounted_snapshot(today_snapshot)
+            log.info("Unaccounted loaded from DB: %d", len(df_unacc))
         else:
             log.info("No snapshot for today, starting heavy Victoria collection")
+
+            unacc_map = {}
+
+            def add_unacc_once(
+                stage, team, service_id, metric, reason, detail, samples_value=None
+            ):
+                key = (
+                    clean_spaces(team or ""),
+                    normalize_sid(service_id or ""),
+                    clean_spaces(metric or ""),
+                    clean_spaces(reason or ""),
+                    clean_spaces(detail or ""),
+                )
+                if key in unacc_map:
+                    return
+
+                sid = normalize_sid(service_id)
+                service_name = ""
+                activity_code = ""
+                activity_name = ""
+
+                if sid and not activity_df.empty:
+                    match = activity_df[activity_df["code"].astype(str) == sid]
+                    if not match.empty:
+                        first = match.iloc[0]
+                        service_name = clean_spaces(first.get("service_name", ""))
+                        activity_code = clean_spaces(first.get("activity_code", ""))
+                        activity_name = clean_spaces(first.get("activity_name", ""))
+
+                unacc_map[key] = {
+                    "stage": clean_spaces(stage),
+                    "team": clean_spaces(team),
+                    "service_id": sid,
+                    "service_name": service_name,
+                    "activity_code": activity_code,
+                    "activity_name": activity_name,
+                    "metric": clean_spaces(metric),
+                    "samples_value": 0 if samples_value is None else int(samples_value),
+                    "reason": clean_spaces(reason),
+                    "detail": clean_spaces(detail),
+                }
 
             metric_names = http_label_values(vm_url, "__name__")
             metric_names = [str(x).strip() for x in metric_names if str(x).strip()]
@@ -1169,24 +1420,30 @@ def main():
                     ]
                 )
 
+            df_unacc = normalize_unacc_df(pd.DataFrame(list(unacc_map.values())))
+
+            db.clear_unaccounted_snapshot(today_snapshot)
+            db.save_unaccounted_snapshot(today_snapshot, df_unacc)
             db.save_daily_snapshot(today_snapshot, df_daily)
 
         df_period = db.load_period_rows(SNAPSHOT_LOOKBACK_DAYS)
+        snapshot_dates = db.load_snapshot_dates(SNAPSHOT_LOOKBACK_DAYS)
 
         log.info("Period rows loaded: %d", len(df_period))
         log.info("Period distance days: %d", calc_period_distance_days(df_period))
+        log.info("Snapshots used: %s", ", ".join(snapshot_dates) if snapshot_dates else "none")
 
         df_report = build_period_report(df_period)
+        df_snapshots = build_snapshots_info_df(
+            df_period=df_period,
+            snapshot_dates=snapshot_dates,
+            lookback_days=SNAPSHOT_LOOKBACK_DAYS,
+        )
 
-        df_unacc = pd.DataFrame(list(unacc_map.values()))
-        if not df_unacc.empty:
-            df_unacc = df_unacc.reindex(columns=UNACC_COLS).fillna("")
-            df_unacc = df_unacc.sort_values(
-                ["stage", "reason", "team", "service_id", "metric"]
-            ).reset_index(drop=True)
+        df_unacc = normalize_unacc_df(df_unacc)
 
         log.info("Saving report: %s", OUTPUT_FILE)
-        write_report(df_report, df_unacc)
+        write_report(df_report, df_unacc, df_snapshots)
         log.info("✔ Done")
     finally:
         db.close()
