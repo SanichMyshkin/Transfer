@@ -29,6 +29,7 @@ load_dotenv()
 OUTPUT_FILE = os.getenv("OUT_FILE", "victoria_report.xlsx")
 HTTP_TIMEOUT_SEC = int(os.getenv("HTTP_TIMEOUT_SEC", "30"))
 SLEEP_SEC = float(os.getenv("SLEEP_SEC", "0.1"))
+VERBOSE_LOG = (os.getenv("VERBOSE_LOG", "true").strip().lower() == "true")
 
 BAN_TEAMS = []
 BAN_SERVICE_IDS = [15473]
@@ -131,24 +132,55 @@ def http_query(vm_url: str, query: str, at_ts: float | None = None):
     params = {"query": query}
     if at_ts is not None:
         params["time"] = at_ts
+
+    log.info("VM query start | url=%s | time=%s | query=%s", url, at_ts, query)
+
+    started = time.time()
     r = requests.get(url, params=params, verify=False, timeout=HTTP_TIMEOUT_SEC)
+    elapsed = time.time() - started
+
+    log.info(
+        "VM query response | status_code=%s | elapsed=%.3fs | query=%s",
+        r.status_code,
+        elapsed,
+        query,
+    )
+
     r.raise_for_status()
     data = r.json()
+
     if data.get("status") != "success":
+        log.error("VM query failed payload=%s", data)
         raise RuntimeError(data)
-    return data["data"]["result"]
+
+    result = data["data"]["result"]
+    log.info("VM query result rows=%d | query=%s", len(result), query)
+    return result
 
 
 def http_label_values(vm_url: str, label_name: str):
     url = vm_url.rstrip("/") + f"/api/v1/label/{label_name}/values"
-    log.info("Fetch label values: %s", label_name)
+    log.info("VM label values start | label=%s | url=%s", label_name, url)
+
+    started = time.time()
     r = requests.get(url, verify=False, timeout=HTTP_TIMEOUT_SEC)
+    elapsed = time.time() - started
+
+    log.info(
+        "VM label values response | label=%s | status_code=%s | elapsed=%.3fs",
+        label_name,
+        r.status_code,
+        elapsed,
+    )
+
     r.raise_for_status()
     data = r.json()
     if data.get("status") != "success":
+        log.error("VM label values failed | label=%s | payload=%s", label_name, data)
         raise RuntimeError(data)
+
     values = data.get("data") or []
-    log.info("Label values fetched: %s count=%d", label_name, len(values))
+    log.info("VM label values loaded | label=%s | count=%d", label_name, len(values))
     return values
 
 
@@ -227,11 +259,13 @@ def discover_series(vm_url: str):
         metric_names = metric_names[:MAX_METRICS]
 
     total_metrics = len(metric_names)
-    log.info("Metric names after filter: %d", total_metrics)
-    log.info("MAX_METRICS=%s", MAX_METRICS if MAX_METRICS > 0 else "ALL")
+    log.info(
+        "Discovery start | metric_names=%d | MAX_METRICS=%s",
+        total_metrics,
+        MAX_METRICS if MAX_METRICS > 0 else "ALL",
+    )
 
     out = []
-
     at_ts = datetime.now(timezone.utc).timestamp()
 
     for idx, metric_name in enumerate(metric_names, 1):
@@ -240,23 +274,42 @@ def discover_series(vm_url: str):
             f"(count_over_time({metric_name}[{WINDOW_HOURS}h]))"
         )
 
+        log.info(
+            "Metric start | idx=%d/%d | metric=%s",
+            idx,
+            total_metrics,
+            metric_name,
+        )
+
         try:
             rows = http_query(vm_url, q, at_ts=at_ts)
         except Exception as e:
-            log.warning("Metric failed: metric=%s err=%s", metric_name, e)
+            log.warning(
+                "Metric failed | idx=%d/%d | metric=%s | err=%s",
+                idx,
+                total_metrics,
+                metric_name,
+                e,
+            )
             time.sleep(SLEEP_SEC)
             continue
 
+        log.info(
+            "Metric rows fetched | idx=%d/%d | metric=%s | rows=%d",
+            idx,
+            total_metrics,
+            metric_name,
+            len(rows),
+        )
+
         rows_added = 0
 
-        for r in rows or []:
+        for row_idx, r in enumerate(rows or [], 1):
             m = r.get("metric", {}) or {}
+
             team_raw = label(m, "team")
             service_id_raw = normalize_sid(label(m, "service_id"))
             metric = label(m, "__name__") or metric_name
-
-            if not metric:
-                continue
 
             v = r.get("value")
             if not isinstance(v, list) or len(v) < 2:
@@ -284,22 +337,36 @@ def discover_series(vm_url: str):
             )
             rows_added += 1
 
-        if idx % 50 == 0 or idx == total_metrics:
-            elapsed = time.time() - started_at
-            rate = idx / elapsed if elapsed > 0 else 0.0
-            log.info(
-                "Progress: %d/%d metrics | last=%s | rows_added=%d | total_rows=%d | rate=%.2f m/s",
-                idx,
-                total_metrics,
-                metric_name,
-                rows_added,
-                len(out),
-                rate,
-            )
+            if VERBOSE_LOG:
+                log.info(
+                    "Metric row parsed | metric=%s | row=%d/%d | team_raw=%s | team_base=%s | service_id_raw=%s | sid_from_team=%s | sid_seed=%s | samples=%s",
+                    metric,
+                    row_idx,
+                    len(rows),
+                    team_raw,
+                    team_base,
+                    service_id_raw,
+                    sid_from_team,
+                    sid_seed,
+                    samples_value,
+                )
+
+        elapsed = time.time() - started_at
+        rate = idx / elapsed if elapsed > 0 else 0.0
+
+        log.info(
+            "Metric done | idx=%d/%d | metric=%s | rows_added=%d | total_rows=%d | rate=%.2f m/s",
+            idx,
+            total_metrics,
+            metric_name,
+            rows_added,
+            len(out),
+            rate,
+        )
 
         time.sleep(SLEEP_SEC)
 
-    log.info("Discovery finished: total_rows=%d", len(out))
+    log.info("Discovery finished | total_rows=%d", len(out))
     return out
 
 
@@ -1006,6 +1073,7 @@ def main():
         log.info("VM_URL=%s", vm_url)
         log.info("WINDOW_HOURS=%s", WINDOW_HOURS)
         log.info("MAX_METRICS=%s", MAX_METRICS if MAX_METRICS > 0 else "ALL")
+        log.info("VERBOSE_LOG=%s", VERBOSE_LOG)
         log.info(
             "BAN_SERVICE_IDS=%s", sorted(ban_service_set) if ban_service_set else "[]"
         )
@@ -1032,6 +1100,13 @@ def main():
         ):
             key = (team or "", service_id or "", metric or "")
             if key in unacc_map:
+                if VERBOSE_LOG:
+                    log.info(
+                        "Unaccounted skip duplicate | team=%s | service_id=%s | metric=%s",
+                        team,
+                        service_id,
+                        metric,
+                    )
                 return
 
             sid = normalize_sid(service_id)
@@ -1059,6 +1134,18 @@ def main():
                 "reason": reason,
                 "detail": detail,
             }
+
+            if VERBOSE_LOG:
+                log.info(
+                    "Unaccounted add | stage=%s | team=%s | service_id=%s | metric=%s | reason=%s | detail=%s | samples=%s",
+                    stage,
+                    team,
+                    sid,
+                    metric,
+                    reason,
+                    detail,
+                    samples_value,
+                )
 
         if db.has_snapshot(today_snapshot):
             log.info("Snapshot for today already exists: %s", today_snapshot)
@@ -1142,7 +1229,34 @@ def main():
 
                 samples_value = int(r.get("samples_value", 0) or 0)
 
+                if VERBOSE_LOG:
+                    log.info(
+                        "Metric decision | metric=%s | team_raw=%s | team_base=%s | service_id_raw=%s | sid_from_team=%s | sid_seed=%s | service_id_final=%s | samples=%s | status=%s | stage=%s | reason=%s",
+                        metric,
+                        team_raw,
+                        team_base,
+                        service_id_raw,
+                        sid_from_team,
+                        sid_seed,
+                        service_id_final,
+                        samples_value,
+                        status,
+                        stage,
+                        reason,
+                    )
+
                 if status == "unaccounted":
+                    if VERBOSE_LOG:
+                        log.info(
+                            "Metric routed | destination=unaccounted | metric=%s | team=%s | service_id=%s | reason=%s | detail=%s | samples=%s",
+                            metric,
+                            team_base,
+                            service_id_final,
+                            reason,
+                            detail,
+                            samples_value,
+                        )
+
                     add_unacc_once(
                         stage,
                         team_base,
@@ -1153,6 +1267,15 @@ def main():
                         samples_value=samples_value,
                     )
                 else:
+                    if VERBOSE_LOG:
+                        log.info(
+                            "Metric routed | destination=accounted_metric_rows | metric=%s | team=%s | service_id=%s | samples=%s",
+                            metric,
+                            team_base,
+                            service_id_final,
+                            samples_value,
+                        )
+
                     accounted_metric_rows.append(
                         {
                             "team_base": team_base,
@@ -1181,8 +1304,18 @@ def main():
 
                 time.sleep(SLEEP_SEC)
 
+            log.info(
+                "Metric routing summary | total_series=%d | accounted_metric_rows=%d | unaccounted_rows=%d",
+                len(series_rows),
+                len(accounted_metric_rows),
+                len(unacc_map),
+            )
+
             group_rows = aggregate_to_group(accounted_metric_rows)
+            log.info("Aggregate done | grouped_rows=%d", len(group_rows))
+
             enriched = enrich_group_rows(group_rows, activity_df)
+            log.info("Enrich done | enriched_rows=%d", len(enriched))
 
             if not enriched.empty:
                 accounted = enriched.copy()
@@ -1196,6 +1329,15 @@ def main():
                         ) and normalize_sid(
                             rr.get("service_id_final")
                         ) == normalize_sid(sid):
+                            if VERBOSE_LOG:
+                                log.info(
+                                    "Enrich re-route | metric=%s | team=%s | service_id=%s | reason=%s",
+                                    rr.get("metric", ""),
+                                    rr.get("team_base", ""),
+                                    rr.get("service_id_final", ""),
+                                    reason,
+                                )
+
                             add_unacc_once(
                                 stage,
                                 rr.get("team_base", ""),
@@ -1221,6 +1363,7 @@ def main():
                     )
 
                 accounted = accounted[accounted["activity_found"]].copy()
+                log.info("Accounted after activity filter | rows=%d", len(accounted))
                 df_daily = build_daily_df_report(accounted)
             else:
                 df_daily = pd.DataFrame(
@@ -1233,6 +1376,11 @@ def main():
                     ]
                 )
 
+            log.info(
+                "DB save daily snapshot | snapshot_date=%s | rows=%d",
+                today_snapshot,
+                len(df_daily),
+            )
             db.save_daily_snapshot(today_snapshot, df_daily)
 
             df_unacc_new = pd.DataFrame(list(unacc_map.values()))
@@ -1244,6 +1392,11 @@ def main():
             else:
                 df_unacc_new = pd.DataFrame(columns=UNACC_COLS)
 
+            log.info(
+                "DB replace unaccounted | snapshot_date=%s | rows=%d",
+                today_snapshot,
+                len(df_unacc_new),
+            )
             db.replace_daily_unaccounted(today_snapshot, df_unacc_new)
             collected_unacc_today = True
 
