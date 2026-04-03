@@ -1229,17 +1229,10 @@ def main():
                     }
                 )
 
-                if idx % 200 == 0:
+                if idx % 1000 == 0:
                     log.info("Processed: %d/%d", idx, len(series_rows))
 
-                time.sleep(SLEEP_SEC)
-
-            log.info(
-                "Metric routing summary | total_series=%d | accounted_metric_rows=%d | unaccounted_rows=%d",
-                len(series_rows),
-                len(accounted_metric_rows),
-                len(unacc_map),
-            )
+                #time.sleep(SLEEP_SEC)
 
             group_rows = aggregate_to_group(accounted_metric_rows)
             log.info("Aggregate done | grouped_rows=%d", len(group_rows))
