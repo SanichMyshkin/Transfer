@@ -149,6 +149,34 @@ def http_query(vm_url: str, query: str, at_ts: float | None = None):
     return data["data"]["result"]
 
 
+def http_get(vm_url: str, path: str, params: dict | None = None):
+    url = vm_url.rstrip("/") + path
+    r = requests.get(url, params=params or {}, verify=False, timeout=HTTP_TIMEOUT_SEC)
+    r.raise_for_status()
+    data = r.json()
+    if data.get("status") != "success":
+        raise RuntimeError(data)
+    return data.get("data")
+
+
+def get_label_values(vm_url: str, label_name: str) -> list[str]:
+    data = http_get(vm_url, f"/api/v1/label/{label_name}/values")
+    if not isinstance(data, list):
+        return []
+    out = []
+    for v in data:
+        s = "" if v is None else str(v).strip()
+        if s:
+            out.append(s)
+    return sorted(set(out))
+
+
+def vm_quote(value: str) -> str:
+    value = "" if value is None else str(value)
+    value = value.replace("\\", "\\\\").replace('"', '\\"')
+    return value
+
+
 def label(metric: dict, key: str) -> str:
     v = metric.get(key)
     return "" if v is None else str(v).strip()
@@ -208,15 +236,14 @@ def discover_series(vm_url: str):
     out = []
     seen = set()
 
-    queries = [
-        'count by (team, service_id, __name__) ({team=~".+", service_id=~".+"})',
-        'count by (team, service_id, __name__) ({team!~".+", service_id=~".+"})',
-        'count by (team, service_id, __name__) ({team=~".+", service_id!~".+"})',
-        'count by (team, service_id, __name__) ({team!~".+", service_id!~".+"})',
-    ]
+    log.info("Loading team label values ...")
+    teams = get_label_values(vm_url, "team")
+    log.info("Non-empty teams found: %d", len(teams))
 
-    for q in queries:
-        rows = http_query(vm_url, q)
+    total_queries = len(teams) * 2 + 2
+    q_idx = 0
+
+    def handle_rows(rows):
         for r in rows or []:
             m = r.get("metric", {}) or {}
             team_raw = label(m, "team")
@@ -245,6 +272,31 @@ def discover_series(vm_url: str):
                 }
             )
 
+    for team in teams:
+        team_q = vm_quote(team)
+
+        queries = [
+            f'count by (team, service_id, __name__) ({{team="{team_q}", service_id=~".+"}})',
+            f'count by (team, service_id, __name__) ({{team="{team_q}", service_id!~".+"}})',
+        ]
+
+        for q in queries:
+            q_idx += 1
+            log.info("Discover query %d/%d", q_idx, total_queries)
+            rows = http_query(vm_url, q)
+            handle_rows(rows)
+            time.sleep(SLEEP_SEC)
+
+    empty_team_queries = [
+        'count by (team, service_id, __name__) ({team!~".+", service_id=~".+"})',
+        'count by (team, service_id, __name__) ({team!~".+", service_id!~".+"})',
+    ]
+
+    for q in empty_team_queries:
+        q_idx += 1
+        log.info("Discover query %d/%d", q_idx, total_queries)
+        rows = http_query(vm_url, q)
+        handle_rows(rows)
         time.sleep(SLEEP_SEC)
 
     return out
@@ -273,17 +325,17 @@ def build_team_to_sid_maps(series_rows):
 def build_matchers_raw(team_raw: str, service_id_raw: str, metric_name: str) -> str:
     parts = []
     if (team_raw or "").strip():
-        parts.append(f'team="{team_raw}"')
+        parts.append(f'team="{vm_quote(team_raw)}"')
     else:
         parts.append('team!~".+"')
 
     service_id_raw = normalize_sid(service_id_raw)
     if service_id_raw:
-        parts.append(f'service_id="{service_id_raw}"')
+        parts.append(f'service_id="{vm_quote(service_id_raw)}"')
     else:
         parts.append('service_id!~".+"')
 
-    parts.append(f'__name__="{metric_name}"')
+    parts.append(f'__name__="{vm_quote(metric_name)}"')
     return ", ".join(parts)
 
 
