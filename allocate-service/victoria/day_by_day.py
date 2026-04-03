@@ -48,6 +48,9 @@ SQLITE_DB_FILE = os.getenv("SQLITE_DB_FILE", "victoria_daily.sqlite")
 
 SNAPSHOT_LOOKBACK_DAYS = int(os.getenv("SNAPSHOT_LOOKBACK_DAYS", "0"))
 
+METRIC_NAME_BATCH_SIZE = int(os.getenv("METRIC_NAME_BATCH_SIZE", "200"))
+DISCOVERY_SERIES_LIMIT = int(os.getenv("DISCOVERY_SERIES_LIMIT", "0"))
+
 PG_HOST = os.getenv("PG_HOST", "").strip()
 PG_PORT = int(os.getenv("PG_PORT", "5432"))
 PG_USER = os.getenv("PG_USER", "").strip()
@@ -149,32 +152,35 @@ def http_query(vm_url: str, query: str, at_ts: float | None = None):
     return data["data"]["result"]
 
 
-def http_get(vm_url: str, path: str, params: dict | None = None):
-    url = vm_url.rstrip("/") + path
-    r = requests.get(url, params=params or {}, verify=False, timeout=HTTP_TIMEOUT_SEC)
+def http_label_values(vm_url: str, label_name: str):
+    url = vm_url.rstrip("/") + f"/api/v1/label/{label_name}/values"
+    log.info("LABEL VALUES: %s", label_name)
+    r = requests.get(url, verify=False, timeout=HTTP_TIMEOUT_SEC)
     r.raise_for_status()
     data = r.json()
     if data.get("status") != "success":
         raise RuntimeError(data)
-    return data.get("data")
+    return data["data"] or []
 
 
-def get_label_values(vm_url: str, label_name: str) -> list[str]:
-    data = http_get(vm_url, f"/api/v1/label/{label_name}/values")
-    if not isinstance(data, list):
-        return []
-    out = []
-    for v in data:
-        s = "" if v is None else str(v).strip()
-        if s:
-            out.append(s)
-    return sorted(set(out))
+def http_series_multi(vm_url: str, matchers: list[str]):
+    url = vm_url.rstrip("/") + "/api/v1/series"
+    params = []
+    for m in matchers:
+        params.append(("match[]", m))
+
+    log.info("SERIES BATCH: matchers=%d", len(matchers))
+    r = requests.get(url, params=params, verify=False, timeout=HTTP_TIMEOUT_SEC)
+    r.raise_for_status()
+    data = r.json()
+    if data.get("status") != "success":
+        raise RuntimeError(data)
+    return data["data"] or []
 
 
-def vm_quote(value: str) -> str:
-    value = "" if value is None else str(value)
-    value = value.replace("\\", "\\\\").replace('"', '\\"')
-    return value
+def chunked(seq, size: int):
+    for i in range(0, len(seq), size):
+        yield seq[i : i + size]
 
 
 def label(metric: dict, key: str) -> str:
@@ -232,71 +238,64 @@ def read_activity_map(path: str) -> pd.DataFrame:
     return out
 
 
+def append_series_row(out, seen, metric_labels: dict):
+    team_raw = label(metric_labels, "team")
+    service_id_raw = normalize_sid(label(metric_labels, "service_id"))
+    metric = label(metric_labels, "__name__")
+    if not metric:
+        return
+
+    team_base, sid_from_team = split_team_tail_id(team_raw)
+    sid_from_team = normalize_sid(sid_from_team)
+    sid_seed = pick_better_sid(service_id_raw, sid_from_team)
+
+    key = (team_raw, service_id_raw, metric)
+    if key in seen:
+        return
+    seen.add(key)
+
+    out.append(
+        {
+            "team_raw": team_raw,
+            "team_base": (team_base or "").strip(),
+            "service_id_raw": service_id_raw,
+            "sid_from_team": sid_from_team,
+            "sid_seed": sid_seed,
+            "metric": metric,
+        }
+    )
+
+
 def discover_series(vm_url: str):
     out = []
     seen = set()
 
-    log.info("Loading team label values ...")
-    teams = get_label_values(vm_url, "team")
-    log.info("Non-empty teams found: %d", len(teams))
+    metric_names = http_label_values(vm_url, "__name__")
+    metric_names = [str(x).strip() for x in metric_names if str(x).strip()]
+    metric_names.sort()
 
-    total_queries = len(teams) * 2 + 2
-    q_idx = 0
+    log.info("Metric names found: %d", len(metric_names))
 
-    def handle_rows(rows):
-        for r in rows or []:
-            m = r.get("metric", {}) or {}
-            team_raw = label(m, "team")
-            service_id_raw = normalize_sid(label(m, "service_id"))
-            metric = label(m, "__name__")
-            if not metric:
-                continue
+    processed_metrics = 0
 
-            team_base, sid_from_team = split_team_tail_id(team_raw)
-            sid_from_team = normalize_sid(sid_from_team)
-            sid_seed = pick_better_sid(service_id_raw, sid_from_team)
+    for batch in chunked(metric_names, METRIC_NAME_BATCH_SIZE):
+        matchers = [f'{{__name__="{name}"}}' for name in batch]
+        rows = http_series_multi(vm_url, matchers)
 
-            key = (team_raw, service_id_raw, metric)
-            if key in seen:
-                continue
-            seen.add(key)
+        for m in rows:
+            append_series_row(out, seen, m)
 
-            out.append(
-                {
-                    "team_raw": team_raw,
-                    "team_base": (team_base or "").strip(),
-                    "service_id_raw": service_id_raw,
-                    "sid_from_team": sid_from_team,
-                    "sid_seed": sid_seed,
-                    "metric": metric,
-                }
-            )
+            if DISCOVERY_SERIES_LIMIT > 0 and len(out) >= DISCOVERY_SERIES_LIMIT:
+                log.warning("DISCOVERY_SERIES_LIMIT reached: %d", DISCOVERY_SERIES_LIMIT)
+                return out
 
-    for team in teams:
-        team_q = vm_quote(team)
-
-        queries = [
-            f'count by (team, service_id, __name__) ({{team="{team_q}", service_id=~".+"}})',
-            f'count by (team, service_id, __name__) ({{team="{team_q}", service_id!~".+"}})',
-        ]
-
-        for q in queries:
-            q_idx += 1
-            log.info("Discover query %d/%d", q_idx, total_queries)
-            rows = http_query(vm_url, q)
-            handle_rows(rows)
-            time.sleep(SLEEP_SEC)
-
-    empty_team_queries = [
-        'count by (team, service_id, __name__) ({team!~".+", service_id=~".+"})',
-        'count by (team, service_id, __name__) ({team!~".+", service_id!~".+"})',
-    ]
-
-    for q in empty_team_queries:
-        q_idx += 1
-        log.info("Discover query %d/%d", q_idx, total_queries)
-        rows = http_query(vm_url, q)
-        handle_rows(rows)
+        processed_metrics += len(batch)
+        log.info(
+            "Discovery progress: metrics=%d/%d, unique_series=%d",
+            processed_metrics,
+            len(metric_names),
+            len(out),
+        )
         time.sleep(SLEEP_SEC)
 
     return out
@@ -325,17 +324,17 @@ def build_team_to_sid_maps(series_rows):
 def build_matchers_raw(team_raw: str, service_id_raw: str, metric_name: str) -> str:
     parts = []
     if (team_raw or "").strip():
-        parts.append(f'team="{vm_quote(team_raw)}"')
+        parts.append(f'team="{team_raw}"')
     else:
         parts.append('team!~".+"')
 
     service_id_raw = normalize_sid(service_id_raw)
     if service_id_raw:
-        parts.append(f'service_id="{vm_quote(service_id_raw)}"')
+        parts.append(f'service_id="{service_id_raw}"')
     else:
         parts.append('service_id!~".+"')
 
-    parts.append(f'__name__="{vm_quote(metric_name)}"')
+    parts.append(f'__name__="{metric_name}"')
     return ", ".join(parts)
 
 
@@ -973,6 +972,8 @@ def main():
         log.info("DB_BACKEND=%s", DB_BACKEND)
         log.info("SQLITE_DB_FILE=%s", SQLITE_DB_FILE)
         log.info("SNAPSHOT_LOOKBACK_DAYS=%s", SNAPSHOT_LOOKBACK_DAYS)
+        log.info("METRIC_NAME_BATCH_SIZE=%s", METRIC_NAME_BATCH_SIZE)
+        log.info("DISCOVERY_SERIES_LIMIT=%s", DISCOVERY_SERIES_LIMIT)
 
         activity_df = read_activity_map(ACTIVITY_FILE)
 
