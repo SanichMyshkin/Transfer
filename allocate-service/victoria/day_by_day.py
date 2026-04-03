@@ -40,6 +40,7 @@ EXCLUDE_NO_SERVICE_ID_AT_QUERY = False
 ACTIVITY_FILE = os.getenv("ACTIVITY_FILE", "activity.xlsx")
 
 TEAM_TAIL_ID_RE = re.compile(r"^(.*)-(\d+)$")
+METRIC_NAME_RE = re.compile(r"^[a-zA-Z_:][a-zA-Z0-9_:]*$")
 
 WINDOW_HOURS = int(os.getenv("WINDOW_HOURS", "24"))
 
@@ -47,7 +48,6 @@ DB_BACKEND = (os.getenv("DB_BACKEND", "sqlite") or "sqlite").strip().lower()
 SQLITE_DB_FILE = os.getenv("SQLITE_DB_FILE", "victoria_daily.sqlite")
 
 SNAPSHOT_LOOKBACK_DAYS = int(os.getenv("SNAPSHOT_LOOKBACK_DAYS", "0"))
-
 METRIC_NAME_LIMIT = int(os.getenv("METRIC_NAME_LIMIT", "0"))
 
 PG_HOST = os.getenv("PG_HOST", "").strip()
@@ -137,6 +137,11 @@ def pick_better_sid(a: str, b: str) -> str:
     return b if sid_rank(b) > sid_rank(a) else a
 
 
+def is_valid_metric_name(metric_name: str) -> bool:
+    metric_name = (metric_name or "").strip()
+    return bool(METRIC_NAME_RE.match(metric_name))
+
+
 def http_query(vm_url: str, query: str, at_ts: float | None = None):
     url = vm_url.rstrip("/") + "/api/v1/query"
     log.info("QUERY: %s", query)
@@ -218,9 +223,14 @@ def read_activity_map(path: str) -> pd.DataFrame:
 
 
 def samples_for_metric(vm_url: str, metric_name: str, end_dt: datetime):
+    metric_name = (metric_name or "").strip()
+
+    if not is_valid_metric_name(metric_name):
+        raise ValueError(f"invalid metric name: {metric_name!r}")
+
     q = (
-        f'sum by (team, service_id, __name__) '
-        f'(count_over_time({{__name__="{metric_name}"}}[{WINDOW_HOURS}h]))'
+        f"sum by (team, service_id, __name__) "
+        f"(count_over_time({metric_name}[{WINDOW_HOURS}h]))"
     )
     return http_query(vm_url, q, at_ts=end_dt.timestamp())
 
@@ -230,6 +240,12 @@ def collect_metric_rows(vm_url: str, metric_names: list[str], end_dt: datetime):
     seen = set()
 
     for idx, metric_name in enumerate(metric_names, 1):
+        metric_name = (metric_name or "").strip()
+
+        if not is_valid_metric_name(metric_name):
+            log.warning("Skip invalid metric name: %r", metric_name)
+            continue
+
         try:
             rows = samples_for_metric(vm_url, metric_name, end_dt)
         except Exception as e:
@@ -975,6 +991,7 @@ def main():
 
             metric_names = http_label_values(vm_url, "__name__")
             metric_names = [str(x).strip() for x in metric_names if str(x).strip()]
+            metric_names = [x for x in metric_names if is_valid_metric_name(x)]
             metric_names.sort()
 
             if METRIC_NAME_LIMIT > 0:
