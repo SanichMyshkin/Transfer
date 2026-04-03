@@ -48,8 +48,7 @@ SQLITE_DB_FILE = os.getenv("SQLITE_DB_FILE", "victoria_daily.sqlite")
 
 SNAPSHOT_LOOKBACK_DAYS = int(os.getenv("SNAPSHOT_LOOKBACK_DAYS", "0"))
 
-METRIC_NAME_BATCH_SIZE = int(os.getenv("METRIC_NAME_BATCH_SIZE", "200"))
-DISCOVERY_SERIES_LIMIT = int(os.getenv("DISCOVERY_SERIES_LIMIT", "0"))
+METRIC_NAME_LIMIT = int(os.getenv("METRIC_NAME_LIMIT", "0"))
 
 PG_HOST = os.getenv("PG_HOST", "").strip()
 PG_PORT = int(os.getenv("PG_PORT", "5432"))
@@ -163,26 +162,6 @@ def http_label_values(vm_url: str, label_name: str):
     return data["data"] or []
 
 
-def http_series_multi(vm_url: str, matchers: list[str]):
-    url = vm_url.rstrip("/") + "/api/v1/series"
-    params = []
-    for m in matchers:
-        params.append(("match[]", m))
-
-    log.info("SERIES BATCH: matchers=%d", len(matchers))
-    r = requests.get(url, params=params, verify=False, timeout=HTTP_TIMEOUT_SEC)
-    r.raise_for_status()
-    data = r.json()
-    if data.get("status") != "success":
-        raise RuntimeError(data)
-    return data["data"] or []
-
-
-def chunked(seq, size: int):
-    for i in range(0, len(seq), size):
-        yield seq[i : i + size]
-
-
 def label(metric: dict, key: str) -> str:
     v = metric.get(key)
     return "" if v is None else str(v).strip()
@@ -238,72 +217,74 @@ def read_activity_map(path: str) -> pd.DataFrame:
     return out
 
 
-def append_series_row(out, seen, metric_labels: dict):
-    team_raw = label(metric_labels, "team")
-    service_id_raw = normalize_sid(label(metric_labels, "service_id"))
-    metric = label(metric_labels, "__name__")
-    if not metric:
-        return
-
-    team_base, sid_from_team = split_team_tail_id(team_raw)
-    sid_from_team = normalize_sid(sid_from_team)
-    sid_seed = pick_better_sid(service_id_raw, sid_from_team)
-
-    key = (team_raw, service_id_raw, metric)
-    if key in seen:
-        return
-    seen.add(key)
-
-    out.append(
-        {
-            "team_raw": team_raw,
-            "team_base": (team_base or "").strip(),
-            "service_id_raw": service_id_raw,
-            "sid_from_team": sid_from_team,
-            "sid_seed": sid_seed,
-            "metric": metric,
-        }
+def samples_for_metric(vm_url: str, metric_name: str, end_dt: datetime):
+    q = (
+        f'sum by (team, service_id, __name__) '
+        f'(count_over_time({{__name__="{metric_name}"}}[{WINDOW_HOURS}h]))'
     )
+    return http_query(vm_url, q, at_ts=end_dt.timestamp())
 
 
-def discover_series(vm_url: str):
+def collect_metric_rows(vm_url: str, metric_names: list[str], end_dt: datetime):
     out = []
     seen = set()
 
-    metric_names = http_label_values(vm_url, "__name__")
-    metric_names = [str(x).strip() for x in metric_names if str(x).strip()]
-    metric_names.sort()
+    for idx, metric_name in enumerate(metric_names, 1):
+        try:
+            rows = samples_for_metric(vm_url, metric_name, end_dt)
+        except Exception as e:
+            log.warning("Metric failed: %s | err=%s", metric_name, e)
+            continue
 
-    log.info("Metric names found: %d", len(metric_names))
+        for r in rows or []:
+            m = r.get("metric", {}) or {}
 
-    processed_metrics = 0
+            team_raw = label(m, "team")
+            service_id_raw = normalize_sid(label(m, "service_id"))
+            metric = label(m, "__name__")
+            if not metric:
+                continue
 
-    for batch in chunked(metric_names, METRIC_NAME_BATCH_SIZE):
-        matchers = [f'{{__name__="{name}"}}' for name in batch]
-        rows = http_series_multi(vm_url, matchers)
+            team_base, sid_from_team = split_team_tail_id(team_raw)
+            sid_from_team = normalize_sid(sid_from_team)
+            sid_seed = pick_better_sid(service_id_raw, sid_from_team)
 
-        for m in rows:
-            append_series_row(out, seen, m)
+            v = r.get("value")
+            samples_value = 0
+            if isinstance(v, list) and len(v) >= 2:
+                try:
+                    samples_value = int(float(v[1]))
+                except Exception:
+                    samples_value = 0
 
-            if DISCOVERY_SERIES_LIMIT > 0 and len(out) >= DISCOVERY_SERIES_LIMIT:
-                log.warning("DISCOVERY_SERIES_LIMIT reached: %d", DISCOVERY_SERIES_LIMIT)
-                return out
+            key = (team_raw, service_id_raw, metric)
+            if key in seen:
+                continue
+            seen.add(key)
 
-        processed_metrics += len(batch)
-        log.info(
-            "Discovery progress: metrics=%d/%d, unique_series=%d",
-            processed_metrics,
-            len(metric_names),
-            len(out),
-        )
+            out.append(
+                {
+                    "team_raw": team_raw,
+                    "team_base": (team_base or "").strip(),
+                    "service_id_raw": service_id_raw,
+                    "sid_from_team": sid_from_team,
+                    "sid_seed": sid_seed,
+                    "metric": metric,
+                    "samples_value": samples_value,
+                }
+            )
+
+        if idx % 200 == 0:
+            log.info("Metrics processed: %d/%d", idx, len(metric_names))
+
         time.sleep(SLEEP_SEC)
 
     return out
 
 
-def build_team_to_sid_maps(series_rows):
+def build_team_to_sid_maps(metric_rows):
     team_sids = defaultdict(set)
-    for r in series_rows:
+    for r in metric_rows:
         team_base = (r.get("team_base") or "").strip()
         sid = normalize_sid(r.get("sid_seed"))
         if team_base and sid:
@@ -319,40 +300,6 @@ def build_team_to_sid_maps(series_rows):
             ambiguous_teams.add(team_base)
 
     return team_to_sid, ambiguous_teams
-
-
-def build_matchers_raw(team_raw: str, service_id_raw: str, metric_name: str) -> str:
-    parts = []
-    if (team_raw or "").strip():
-        parts.append(f'team="{team_raw}"')
-    else:
-        parts.append('team!~".+"')
-
-    service_id_raw = normalize_sid(service_id_raw)
-    if service_id_raw:
-        parts.append(f'service_id="{service_id_raw}"')
-    else:
-        parts.append('service_id!~".+"')
-
-    parts.append(f'__name__="{metric_name}"')
-    return ", ".join(parts)
-
-
-def samples_for_series(
-    vm_url: str, metric_name: str, team_raw: str, service_id_raw: str, end_dt: datetime
-) -> int:
-    m = build_matchers_raw(team_raw, service_id_raw, metric_name)
-    q = f"sum(count_over_time({{{m}}}[{WINDOW_HOURS}h]))"
-    res = http_query(vm_url, q, at_ts=end_dt.timestamp())
-    if not res:
-        return 0
-    v = res[0].get("value")
-    if not isinstance(v, list) or len(v) < 2:
-        return 0
-    try:
-        return int(float(v[1]))
-    except Exception:
-        return 0
 
 
 def aggregate_to_group(metric_rows):
@@ -972,8 +919,7 @@ def main():
         log.info("DB_BACKEND=%s", DB_BACKEND)
         log.info("SQLITE_DB_FILE=%s", SQLITE_DB_FILE)
         log.info("SNAPSHOT_LOOKBACK_DAYS=%s", SNAPSHOT_LOOKBACK_DAYS)
-        log.info("METRIC_NAME_BATCH_SIZE=%s", METRIC_NAME_BATCH_SIZE)
-        log.info("DISCOVERY_SERIES_LIMIT=%s", DISCOVERY_SERIES_LIMIT)
+        log.info("METRIC_NAME_LIMIT=%s", METRIC_NAME_LIMIT)
 
         activity_df = read_activity_map(ACTIVITY_FILE)
 
@@ -1027,27 +973,35 @@ def main():
         else:
             log.info("No snapshot for today, starting heavy Victoria collection")
 
-            log.info("Discover series ...")
-            series_rows = discover_series(vm_url)
-            log.info("Series found: %d", len(series_rows))
+            metric_names = http_label_values(vm_url, "__name__")
+            metric_names = [str(x).strip() for x in metric_names if str(x).strip()]
+            metric_names.sort()
 
-            team_to_sid_map, ambiguous_teams = build_team_to_sid_maps(series_rows)
+            if METRIC_NAME_LIMIT > 0:
+                metric_names = metric_names[:METRIC_NAME_LIMIT]
+
+            log.info("Metric names found: %d", len(metric_names))
+
+            end_dt = datetime.now(timezone.utc)
+            metric_rows = collect_metric_rows(vm_url, metric_names, end_dt)
+            log.info("Metric rows collected: %d", len(metric_rows))
+
+            team_to_sid_map, ambiguous_teams = build_team_to_sid_maps(metric_rows)
             log.info("Team->SID inferred map size: %d", len(team_to_sid_map))
             log.info("Ambiguous teams: %d", len(ambiguous_teams))
             log.info("Overrides: %d", len(overrides))
 
-            end_dt = datetime.now(timezone.utc)
-
             metrics_audit = []
             accounted_metric_rows = []
 
-            for idx, r in enumerate(series_rows, 1):
+            for idx, r in enumerate(metric_rows, 1):
                 team_raw = (r.get("team_raw") or "").strip()
                 team_base = (r.get("team_base") or "").strip()
                 service_id_raw = normalize_sid(r.get("service_id_raw"))
                 sid_from_team = normalize_sid(r.get("sid_from_team"))
                 sid_seed = normalize_sid(r.get("sid_seed"))
                 metric = (r.get("metric") or "").strip()
+                samples_value = int(r.get("samples_value", 0) or 0)
 
                 if not metric:
                     continue
@@ -1107,23 +1061,6 @@ def main():
                     reason = "excluded_no_service_id"
                     detail = "EXCLUDE_NO_SERVICE_ID_AT_QUERY=True and service_id empty"
 
-                samples_value = 0
-                try:
-                    samples_value = samples_for_series(
-                        vm_url, metric, team_raw, service_id_raw, end_dt
-                    )
-                except Exception as e:
-                    add_unacc_once(
-                        "samples",
-                        team_base,
-                        service_id_final,
-                        metric,
-                        "samples_failed",
-                        str(e),
-                        samples_value=None,
-                    )
-                    samples_value = 0
-
                 if status == "unaccounted":
                     add_unacc_once(
                         stage,
@@ -1139,7 +1076,7 @@ def main():
                         {
                             "team_base": team_base,
                             "service_id_final": service_id_final,
-                            "samples_value": int(samples_value),
+                            "samples_value": samples_value,
                         }
                     )
 
@@ -1150,7 +1087,7 @@ def main():
                         "service_id_raw": service_id_raw,
                         "service_id_final": service_id_final,
                         "metric": metric,
-                        "samples_value": int(samples_value),
+                        "samples_value": samples_value,
                         "status": status,
                         "stage": stage,
                         "reason": reason,
@@ -1158,8 +1095,8 @@ def main():
                     }
                 )
 
-                if idx % 200 == 0:
-                    log.info("Processed: %d/%d", idx, len(series_rows))
+                if idx % 500 == 0:
+                    log.info("Rows processed: %d/%d", idx, len(metric_rows))
 
                 time.sleep(SLEEP_SEC)
 
