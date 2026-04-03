@@ -133,17 +133,17 @@ def http_query(vm_url: str, query: str, at_ts: float | None = None):
     if at_ts is not None:
         params["time"] = at_ts
 
-    log.info("VM query start | url=%s | time=%s | query=%s", url, at_ts, query)
+    log.info("VM query | query=%s", query)
 
     started = time.time()
     r = requests.get(url, params=params, verify=False, timeout=HTTP_TIMEOUT_SEC)
     elapsed = time.time() - started
 
     log.info(
-        "VM query response | status_code=%s | elapsed=%.3fs | query=%s",
+        "VM response | status_code=%s | elapsed=%.3fs | rows=%s",
         r.status_code,
         elapsed,
-        query,
+        "unknown",
     )
 
     r.raise_for_status()
@@ -154,13 +154,13 @@ def http_query(vm_url: str, query: str, at_ts: float | None = None):
         raise RuntimeError(data)
 
     result = data["data"]["result"]
-    log.info("VM query result rows=%d | query=%s", len(result), query)
+    log.info("VM result | rows=%d", len(result))
     return result
 
 
 def http_label_values(vm_url: str, label_name: str):
     url = vm_url.rstrip("/") + f"/api/v1/label/{label_name}/values"
-    log.info("VM label values start | label=%s | url=%s", label_name, url)
+    log.info("VM label values start | label=%s", label_name)
 
     started = time.time()
     r = requests.get(url, verify=False, timeout=HTTP_TIMEOUT_SEC)
@@ -274,12 +274,7 @@ def discover_series(vm_url: str):
             f"(count_over_time({metric_name}[{WINDOW_HOURS}h]))"
         )
 
-        log.info(
-            "Metric start | idx=%d/%d | metric=%s",
-            idx,
-            total_metrics,
-            metric_name,
-        )
+        log.info("Metric start | idx=%d/%d | metric=%s", idx, total_metrics, metric_name)
 
         try:
             rows = http_query(vm_url, q, at_ts=at_ts)
@@ -294,17 +289,9 @@ def discover_series(vm_url: str):
             time.sleep(SLEEP_SEC)
             continue
 
-        log.info(
-            "Metric rows fetched | idx=%d/%d | metric=%s | rows=%d",
-            idx,
-            total_metrics,
-            metric_name,
-            len(rows),
-        )
-
         rows_added = 0
 
-        for row_idx, r in enumerate(rows or [], 1):
+        for r in rows or []:
             m = r.get("metric", {}) or {}
 
             team_raw = label(m, "team")
@@ -336,20 +323,6 @@ def discover_series(vm_url: str):
                 }
             )
             rows_added += 1
-
-            if VERBOSE_LOG:
-                log.info(
-                    "Metric row parsed | metric=%s | row=%d/%d | team_raw=%s | team_base=%s | service_id_raw=%s | sid_from_team=%s | sid_seed=%s | samples=%s",
-                    metric,
-                    row_idx,
-                    len(rows),
-                    team_raw,
-                    team_base,
-                    service_id_raw,
-                    sid_from_team,
-                    sid_seed,
-                    samples_value,
-                )
 
         elapsed = time.time() - started_at
         rate = idx / elapsed if elapsed > 0 else 0.0
@@ -1100,13 +1073,6 @@ def main():
         ):
             key = (team or "", service_id or "", metric or "")
             if key in unacc_map:
-                if VERBOSE_LOG:
-                    log.info(
-                        "Unaccounted skip duplicate | team=%s | service_id=%s | metric=%s",
-                        team,
-                        service_id,
-                        metric,
-                    )
                 return
 
             sid = normalize_sid(service_id)
@@ -1134,18 +1100,6 @@ def main():
                 "reason": reason,
                 "detail": detail,
             }
-
-            if VERBOSE_LOG:
-                log.info(
-                    "Unaccounted add | stage=%s | team=%s | service_id=%s | metric=%s | reason=%s | detail=%s | samples=%s",
-                    stage,
-                    team,
-                    sid,
-                    metric,
-                    reason,
-                    detail,
-                    samples_value,
-                )
 
         if db.has_snapshot(today_snapshot):
             log.info("Snapshot for today already exists: %s", today_snapshot)
@@ -1229,33 +1183,12 @@ def main():
 
                 samples_value = int(r.get("samples_value", 0) or 0)
 
-                if VERBOSE_LOG:
-                    log.info(
-                        "Metric decision | metric=%s | team_raw=%s | team_base=%s | service_id_raw=%s | sid_from_team=%s | sid_seed=%s | service_id_final=%s | samples=%s | status=%s | stage=%s | reason=%s",
-                        metric,
-                        team_raw,
-                        team_base,
-                        service_id_raw,
-                        sid_from_team,
-                        sid_seed,
-                        service_id_final,
-                        samples_value,
-                        status,
-                        stage,
-                        reason,
-                    )
-
                 if status == "unaccounted":
-                    if VERBOSE_LOG:
-                        log.info(
-                            "Metric routed | destination=unaccounted | metric=%s | team=%s | service_id=%s | reason=%s | detail=%s | samples=%s",
-                            metric,
-                            team_base,
-                            service_id_final,
-                            reason,
-                            detail,
-                            samples_value,
-                        )
+                    log.info(
+                        "Metric route | metric=%s | destination=unaccounted | samples=%s",
+                        metric,
+                        samples_value,
+                    )
 
                     add_unacc_once(
                         stage,
@@ -1267,14 +1200,11 @@ def main():
                         samples_value=samples_value,
                     )
                 else:
-                    if VERBOSE_LOG:
-                        log.info(
-                            "Metric routed | destination=accounted_metric_rows | metric=%s | team=%s | service_id=%s | samples=%s",
-                            metric,
-                            team_base,
-                            service_id_final,
-                            samples_value,
-                        )
+                    log.info(
+                        "Metric route | metric=%s | destination=report | samples=%s",
+                        metric,
+                        samples_value,
+                    )
 
                     accounted_metric_rows.append(
                         {
@@ -1329,15 +1259,6 @@ def main():
                         ) and normalize_sid(
                             rr.get("service_id_final")
                         ) == normalize_sid(sid):
-                            if VERBOSE_LOG:
-                                log.info(
-                                    "Enrich re-route | metric=%s | team=%s | service_id=%s | reason=%s",
-                                    rr.get("metric", ""),
-                                    rr.get("team_base", ""),
-                                    rr.get("service_id_final", ""),
-                                    reason,
-                                )
-
                             add_unacc_once(
                                 stage,
                                 rr.get("team_base", ""),
