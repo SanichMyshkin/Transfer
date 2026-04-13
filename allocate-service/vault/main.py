@@ -25,6 +25,7 @@ OUT_FILE = os.getenv("OUT_FILE", "vault_report.xlsx")
 BAN_SERVICE_IDS = [15473]
 
 SKIP_EMPTY_SECRETS = True
+SKIP_ZERO_SERVICE_IDS = True
 
 
 def die(msg: str, code: int = 2):
@@ -125,6 +126,7 @@ def main():
     log.info("==== START ====")
     log.info("VAULT_ADDR=%s", VAULT_ADDR)
     log.info("SKIP_EMPTY_SECRETS=%s", SKIP_EMPTY_SECRETS)
+    log.info("SKIP_ZERO_SERVICE_IDS=%s", SKIP_ZERO_SERVICE_IDS)
     log.info("BAN_SERVICE_IDS=%s", sorted(ban_set) if ban_set else "[]")
 
     activity_df = read_activity_map(ACTIVITY_FILE)
@@ -141,6 +143,7 @@ def main():
 
     base_df["code"] = base_df["kv"].astype(str).str.extract(r"(\d+)$", expand=False)
 
+    # --- no_code ---
     no_code = base_df[base_df["code"].isna()].copy()
     if not no_code.empty:
         no_code["reason"] = "no_code_in_kv"
@@ -154,6 +157,19 @@ def main():
     df = base_df[base_df["code"].notna()].copy()
     df["code"] = df["code"].astype(str)
 
+    # --- zero_service_id ---
+    if SKIP_ZERO_SERVICE_IDS:
+        zero_code = df[df["code"].str.fullmatch(r"0+")].copy()
+        if not zero_code.empty:
+            zero_code = zero_code.merge(activity_df, on="code", how="left")
+            zero_code["reason"] = "zero_service_id"
+            zero_code["detail"] = "service_id consists only of zeros"
+            unacc_rows.append(zero_code)
+            log.info("Unaccounted zero_service_id: %d", len(zero_code))
+
+        df = df[~df["code"].str.fullmatch(r"0+")].copy()
+
+    # --- banned ---
     banned = df[df["code"].isin(ban_set)].copy()
     if not banned.empty:
         banned = banned.merge(activity_df, on="code", how="left")
@@ -164,6 +180,7 @@ def main():
 
     df = df[~df["code"].isin(ban_set)].copy()
 
+    # --- empty secrets ---
     if SKIP_EMPTY_SECRETS:
         empty_sec = df[df["secrets"] <= 0].copy()
         if not empty_sec.empty:
@@ -175,51 +192,7 @@ def main():
         df = df[df["secrets"] > 0].copy()
 
     if df.empty:
-        unaccounted = (
-            pd.concat(unacc_rows, ignore_index=True) if unacc_rows else pd.DataFrame()
-        )
-        if not unaccounted.empty:
-            if "service_name" not in unaccounted.columns:
-                unaccounted["service_name"] = ""
-            if "activity_code" not in unaccounted.columns:
-                unaccounted["activity_code"] = ""
-            if "activity_name" not in unaccounted.columns:
-                unaccounted["activity_name"] = ""
-
-            unaccounted = unaccounted.rename(
-                columns={
-                    "kv": "kv",
-                    "code": "Код",
-                    "service_name": "Имя сервиса",
-                    "activity_code": "Код активности",
-                    "activity_name": "Наименование активности",
-                    "secrets": "Кол-во секретов",
-                }
-            )
-            unaccounted = unaccounted[
-                [
-                    "kv",
-                    "Код",
-                    "Имя сервиса",
-                    "Код активности",
-                    "Наименование активности",
-                    "Кол-во секретов",
-                    "reason",
-                    "detail",
-                ]
-            ]
-
-        with pd.ExcelWriter(OUT_FILE, engine="openpyxl") as writer:
-            pd.DataFrame([{"msg": "Нет данных после фильтров"}]).to_excel(
-                writer, index=False, sheet_name="Отчет Vault"
-            )
-            if not unaccounted.empty:
-                unaccounted.to_excel(writer, index=False, sheet_name="Unaccounted")
-                ws_u = writer.book["Unaccounted"]
-                for c in ws_u[1]:
-                    c.font = Font(bold=True)
-
-        die("Нет данных KV после всех фильтров (учтённых)")
+        die("Нет данных KV после фильтров")
 
     out = df.merge(activity_df, on="code", how="left")
 
@@ -233,22 +206,10 @@ def main():
     out = out[out["service_name"].map(clean_spaces) != ""].copy()
 
     if out.empty:
-        die("Нет данных после маппинга activity.xlsx (всё ушло в Unaccounted)")
+        die("Нет данных после маппинга activity.xlsx")
 
     total = int(out["secrets"].sum()) or 1
     out["percent"] = out["secrets"] / total
-
-    for _, r in out.iterrows():
-        log.info(
-            'AGG kv="%s" code=%s -> service="%s" activity_code="%s" activity_name="%s" secrets=%d pct=%.4f',
-            r["kv"],
-            r["code"],
-            r["service_name"],
-            r["activity_code"] or "—",
-            r["activity_name"] or "—",
-            int(r["secrets"]),
-            float(r["percent"]),
-        )
 
     out = out.rename(
         columns={
@@ -261,68 +222,11 @@ def main():
         }
     )
 
-    out = out[
-        [
-            "Имя сервиса",
-            "Код",
-            "Код активности",
-            "Наименование активности",
-            "Кол-во секретов",
-            "% потребления",
-        ]
-    ].copy()
-
     out = out.sort_values("Кол-во секретов", ascending=False).reset_index(drop=True)
 
     unaccounted = (
         pd.concat(unacc_rows, ignore_index=True) if unacc_rows else pd.DataFrame()
     )
-
-    if not unaccounted.empty:
-        if "service_name" not in unaccounted.columns:
-            unaccounted["service_name"] = ""
-        if "activity_code" not in unaccounted.columns:
-            unaccounted["activity_code"] = ""
-        if "activity_name" not in unaccounted.columns:
-            unaccounted["activity_name"] = ""
-
-        unaccounted = unaccounted.rename(
-            columns={
-                "kv": "kv",
-                "code": "Код",
-                "service_name": "Имя сервиса",
-                "activity_code": "Код активности",
-                "activity_name": "Наименование активности",
-                "secrets": "Кол-во секретов",
-            }
-        )
-
-        cols = [
-            "kv",
-            "Код",
-            "Имя сервиса",
-            "Код активности",
-            "Наименование активности",
-            "Кол-во секретов",
-            "reason",
-            "detail",
-        ]
-        for c in cols:
-            if c not in unaccounted.columns:
-                unaccounted[c] = ""
-
-        unaccounted = unaccounted[cols].copy()
-
-        unaccounted["__secrets_sort"] = (
-            pd.to_numeric(unaccounted["Кол-во секретов"], errors="coerce")
-            .fillna(0)
-            .astype(int)
-        )
-        unaccounted = (
-            unaccounted.sort_values("__secrets_sort", ascending=False)
-            .drop(columns=["__secrets_sort"])
-            .reset_index(drop=True)
-        )
 
     with pd.ExcelWriter(OUT_FILE, engine="openpyxl") as writer:
         out.to_excel(writer, index=False, sheet_name="Отчет Vault")
@@ -330,22 +234,12 @@ def main():
         for c in ws[1]:
             c.font = Font(bold=True)
 
-        pct_col = list(out.columns).index("% потребления") + 1
-        for rr in range(2, ws.max_row + 1):
-            ws.cell(row=rr, column=pct_col).number_format = "0.0000%"
-
         if not unaccounted.empty:
             unaccounted.to_excel(writer, index=False, sheet_name="Unaccounted")
             ws_u = writer.book["Unaccounted"]
             for c in ws_u[1]:
                 c.font = Font(bold=True)
 
-    log.info(
-        "Итог: учтено строк=%d, unaccounted=%d, файл=%s",
-        len(out),
-        len(unaccounted),
-        OUT_FILE,
-    )
     log.info("==== DONE ====")
 
 
