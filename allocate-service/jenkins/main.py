@@ -26,8 +26,6 @@ JENKINS_URL = os.getenv("JENKINS_URL")
 USER = os.getenv("USER")
 TOKEN = os.getenv("TOKEN")
 
-EXCLUDE_PROJECTS_WITHOUT_TEAM_NUMBER = True
-
 ACTIVITY_FILE = os.getenv("ACTIVITY_FILE", "activity.xlsx")
 OUTPUT_XLSX = os.getenv("OUTPUT_XLSX", "jenkins_report.xlsx")
 
@@ -101,9 +99,6 @@ def validate_env_and_files():
         os.makedirs(out_dir, exist_ok=True)
 
     logger.info(f"Бан-лист (КОД): {sorted(ban_set) if ban_set else 'пусто'}")
-    logger.info(
-        f"EXCLUDE_PROJECTS_WITHOUT_TEAM_NUMBER={EXCLUDE_PROJECTS_WITHOUT_TEAM_NUMBER}"
-    )
     logger.info("ENV/файлы ок.")
 
 
@@ -142,7 +137,9 @@ def normalize_number(x):
 
 
 def load_activity_mapping(path: str):
-    logger.info("Читаем ACTIVITY (A=КОД, B=Наименование сервиса, C=Код активности, D=Наименование активности)...")
+    logger.info(
+        "Читаем ACTIVITY (A=КОД, B=Наименование сервиса, C=Код активности, D=Наименование активности)..."
+    )
 
     df = pd.read_excel(path, dtype=str, engine="openpyxl").fillna("")
 
@@ -170,9 +167,7 @@ def load_activity_mapping(path: str):
     return map_by_number
 
 
-def aggregate_builds_by_service(
-    data, activity_map, exclude_without_team=True
-):
+def aggregate_builds_by_service(data, activity_map):
     logger.info("Агрегируем билды по сервису...")
 
     acc = defaultdict(int)
@@ -218,18 +213,18 @@ def aggregate_builds_by_service(
         proj, team_number = split_project_and_team(root)
         builds = int(j.get("buildCount") or 0)
 
-        if exclude_without_team and not team_number:
+        if not team_number:
             add_unaccounted(
                 root_project=proj or root,
                 team_number="",
                 full_name=full_name,
                 builds=builds,
                 reason="no_team_number",
-                detail="root project name does not end with -<digits> (or exclude_without_team=True)",
+                detail="root project name does not end with -<digits>",
             )
             continue
 
-        if team_number and team_number in ban_set:
+        if team_number in ban_set:
             meta = activity_map.get(team_number, {})
             add_unaccounted(
                 root_project=proj or root,
@@ -241,17 +236,6 @@ def aggregate_builds_by_service(
                 service_name=meta.get("service_name", ""),
                 activity_code=meta.get("activity_code", ""),
                 activity_name=meta.get("activity_name", ""),
-            )
-            continue
-
-        if not team_number:
-            add_unaccounted(
-                root_project=proj or root,
-                team_number="",
-                full_name=full_name,
-                builds=builds,
-                reason="no_team_number_included",
-                detail="team_number is empty but exclude_without_team=False; not attributable to service",
             )
             continue
 
@@ -391,7 +375,6 @@ def main():
         rows, unaccounted = aggregate_builds_by_service(
             data,
             activity_map=activity_map,
-            exclude_without_team=EXCLUDE_PROJECTS_WITHOUT_TEAM_NUMBER,
         )
 
         export_excel(rows, unaccounted, OUTPUT_XLSX)
