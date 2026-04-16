@@ -24,12 +24,11 @@ DB_USER = os.getenv("DB_USER")
 DB_PASSWORD = os.getenv("DB_PASSWORD")
 
 SINCE_DAYS = int(os.getenv("SINCE", "90"))
-OUT_XLSX = os.getenv("OUT_XLSX", "sendor_report.xlsx")
-
+OUT_XLSX = os.getenv("OUT_XLSX", "sender_report.xlsx")
 ACTIVITY_FILE = os.getenv("ACTIVITY_FILE", "activity.xlsx")
 
 EXCLUDE_SERVICE_IDS = {
-    "15473",
+    # "15473",
 }
 
 ALLOW_ZERO_SERVICE_ID = False
@@ -48,10 +47,10 @@ def clean_spaces(s) -> str:
 def normalize_code(v):
     if v is None:
         return ""
-    if isinstance(v, (int, float)):
-        return str(int(v))
     s = str(v).strip()
-    return s[:-2] if s.endswith(".0") and s[:-2].isdigit() else s
+    if not s:
+        return ""
+    return "".join(ch for ch in s if ch.isdigit())
 
 
 def is_all_zeros(s: str) -> bool:
@@ -60,7 +59,6 @@ def is_all_zeros(s: str) -> bool:
 
 def get_counts_by_service_since_days_sql(days: int):
     since_dt = datetime.now(timezone.utc) - timedelta(days=days)
-
     conn = psycopg2.connect(
         host=DB_HOST,
         port=DB_PORT,
@@ -69,7 +67,6 @@ def get_counts_by_service_since_days_sql(days: int):
         password=DB_PASSWORD,
     )
     conn.set_session(readonly=True)
-
     try:
         with conn:
             with conn.cursor() as cur:
@@ -82,7 +79,7 @@ def get_counts_by_service_since_days_sql(days: int):
                                 substring(metadata_source_id from 'id:([0-9]+)'),
                                 ''
                             )::bigint as service_id
-                        from sender.express_event_history
+                        from sender.express_events_history
                         where created >= %s
 
                         union all
@@ -93,7 +90,7 @@ def get_counts_by_service_since_days_sql(days: int):
                                 substring(metadata_source_id from 'id:([0-9]+)'),
                                 ''
                             )::bigint as service_id
-                        from sender.mail_event_history
+                        from sender.mail_events_history
                         where created >= %s
                     )
                     select
@@ -107,22 +104,19 @@ def get_counts_by_service_since_days_sql(days: int):
                     """,
                     (since_dt, since_dt),
                 )
-                return cur.fetchall()
+                rows = cur.fetchall()
+                log.info("DB rows fetched: %d", len(rows))
+                for service_id, mail_cnt, express_cnt, total_cnt in rows[:20]:
+                    log.info(
+                        "DB sample row: service_id=%r mail=%s express=%s total=%s",
+                        service_id,
+                        mail_cnt,
+                        express_cnt,
+                        total_cnt,
+                    )
+                return rows
     finally:
         conn.close()
-
-
-def get_counts_fixture(days: int):
-    rows = [
-        (11203, 1200, 540, 1740),
-        (99999, 300, 21, 321),
-        (5531, 4, 6, 10),
-        (15473, 700, 77, 777),
-        (0, 20, 30, 50),
-        (None, 40, 37, 77),
-    ]
-    log.info("FIXTURE используется")
-    return rows
 
 
 def read_activity_map(path: str):
@@ -131,14 +125,19 @@ def read_activity_map(path: str):
         return {}
 
     wb = load_workbook(path, read_only=True, data_only=True)
+    log.info("ACTIVITY workbook sheets: %s", wb.sheetnames)
     ws = wb.worksheets[0]
 
     out = {}
     rows = 0
     ok = 0
 
-    for r in ws.iter_rows(values_only=True):
+    for i, r in enumerate(ws.iter_rows(values_only=True), start=1):
         rows += 1
+
+        if i == 1:
+            log.info("ACTIVITY header: %s", r)
+            continue
 
         code = normalize_code(r[0] if len(r) > 0 else "")
         if not code:
@@ -155,7 +154,13 @@ def read_activity_map(path: str):
         ok += 1
 
     wb.close()
+
+    log.info("ACTIVITY_FILE exists=%s path=%s", os.path.exists(path), path)
     log.info("ACTIVITY: rows=%d mapped_codes=%d ok_rows=%d", rows, len(out), ok)
+    log.info("ACTIVITY_MAP has 15473=%s", "15473" in out)
+    log.info("ACTIVITY_MAP[15473]=%s", out.get("15473"))
+    log.info("ACTIVITY sample keys: %s", list(out.keys())[:20])
+
     return out
 
 
@@ -172,20 +177,29 @@ def aggregate_and_enrich(db_rows, exclude_service_ids, activity_map):
             continue
 
         if service_id is None:
-            unaccounted_rows.append(["", "", "", "", mail_c, express_c, total_c, "missing_service_id"])
+            unaccounted_rows.append(
+                ["", "", "", "", mail_c, express_c, total_c, "missing_service_id"]
+            )
             continue
 
         sid = str(service_id).strip()
+
         if not sid:
-            unaccounted_rows.append(["", "", "", "", mail_c, express_c, total_c, "missing_service_id"])
+            unaccounted_rows.append(
+                ["", "", "", "", mail_c, express_c, total_c, "missing_service_id"]
+            )
             continue
 
         if is_all_zeros(sid) and not ALLOW_ZERO_SERVICE_ID:
-            unaccounted_rows.append([sid, "", "", "", mail_c, express_c, total_c, "zero_service_id"])
+            unaccounted_rows.append(
+                [sid, "", "", "", mail_c, express_c, total_c, "zero_service_id"]
+            )
             continue
 
         if sid in exclude_service_ids:
-            unaccounted_rows.append([sid, "", "", "", mail_c, express_c, total_c, "excluded_by_config"])
+            unaccounted_rows.append(
+                [sid, "", "", "", mail_c, express_c, total_c, "ban_service_id"]
+            )
             continue
 
         include_counts[sid]["mail"] += mail_c
@@ -201,7 +215,10 @@ def aggregate_and_enrich(db_rows, exclude_service_ids, activity_map):
         key=lambda x: x[1]["total"],
         reverse=True,
     ):
-        meta = activity_map.get(str(sid), {})
+        meta = activity_map.get(sid, {})
+        if not meta:
+            log.info("activity miss sid=%r", sid)
+
         service_name = clean_spaces(meta.get("service_name", ""))
         activity_code = clean_spaces(meta.get("activity_code", ""))
         activity_name = clean_spaces(meta.get("activity_name", ""))
@@ -223,11 +240,10 @@ def aggregate_and_enrich(db_rows, exclude_service_ids, activity_map):
             continue
 
         total_included += int(counts["total"])
-
         rows_main.append(
             {
-                "service_id": sid,
                 "service_name": service_name or sid,
+                "service_id": sid,
                 "activity_code": activity_code,
                 "activity_name": activity_name,
                 "mail_messages_count": int(counts["mail"]),
@@ -259,17 +275,17 @@ def write_excel(path, rows_main, unaccounted_rows):
     bold = Font(bold=True)
 
     ws = wb.active
-    ws.title = "by_service"
+    ws.title = "Отчет Sender"
 
     headers = [
-        "service_id",
-        "service_name",
-        "activity_code",
-        "activity_name",
-        "mail_messages_count",
-        "express_messages_count",
-        "total_messages_count",
-        "percent_of_all_total",
+        "Наименование сервиса",
+        "Код сервиса",
+        "Код активности",
+        "Наименование активности",
+        "Кол-во писем (Outlook)",
+        "Кол-во сообщений (Express)",
+        "Сумма сообщений",
+        "% потребления",
     ]
     ws.append(headers)
     for c in ws[1]:
@@ -278,8 +294,8 @@ def write_excel(path, rows_main, unaccounted_rows):
     for r in rows_main:
         ws.append(
             [
-                r["service_id"],
                 r["service_name"],
+                r["service_id"],
                 r["activity_code"],
                 r["activity_name"],
                 int(r["mail_messages_count"]),
@@ -289,7 +305,7 @@ def write_excel(path, rows_main, unaccounted_rows):
             ]
         )
 
-    pct_col = headers.index("percent_of_all_total") + 1
+    pct_col = headers.index("% потребления") + 1
     for rr in range(2, ws.max_row + 1):
         ws.cell(row=rr, column=pct_col).number_format = "0.00000"
 
@@ -330,7 +346,6 @@ def main():
     activity_map = read_activity_map(ACTIVITY_FILE)
 
     db_rows = get_counts_by_service_since_days_sql(SINCE_DAYS)
-    # db_rows = get_counts_fixture(SINCE_DAYS)
 
     rows_main, unaccounted_rows, total_included = aggregate_and_enrich(
         db_rows=db_rows,
