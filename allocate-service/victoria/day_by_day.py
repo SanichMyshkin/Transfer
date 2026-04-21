@@ -2,7 +2,6 @@ import os
 import sys
 import time
 import logging
-import sqlite3
 from datetime import datetime, timezone, timedelta
 import re
 from collections import defaultdict
@@ -14,6 +13,8 @@ from openpyxl import Workbook
 from openpyxl.styles import Font
 from openpyxl import load_workbook
 import pandas as pd
+import psycopg2
+import psycopg2.extras
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -42,10 +43,14 @@ TEAM_TAIL_ID_RE = re.compile(r"^(.*)-(\d+)$")
 
 WINDOW_HOURS = int(os.getenv("WINDOW_HOURS", "24"))
 MAX_METRICS = int(os.getenv("MAX_METRICS", "0"))
-
-SQLITE_DB_FILE = os.getenv("SQLITE_DB_FILE", "victoria_daily.sqlite")
-
 SNAPSHOT_LOOKBACK_DAYS = int(os.getenv("SNAPSHOT_LOOKBACK_DAYS", "0"))
+
+PG_HOST = os.getenv("PG_HOST", "").strip()
+PG_PORT = int(os.getenv("PG_PORT", "5432"))
+PG_DB = os.getenv("PG_DB", "").strip()
+PG_USER = os.getenv("PG_USER", "").strip()
+PG_PASSWORD = os.getenv("PG_PASSWORD", "")
+PG_SCHEMA = os.getenv("PG_SCHEMA", "public").strip() or "public"
 
 UNACC_COLS = [
     "stage",
@@ -617,11 +622,19 @@ def build_daily_df_report(accounted: pd.DataFrame) -> pd.DataFrame:
     return dedupe_daily_report(df_for_report)
 
 
-class SqliteDb:
-    def __init__(self, path: str):
-        self.path = path
-        self.conn = sqlite3.connect(path)
-        self.conn.row_factory = sqlite3.Row
+class PostgresDb:
+    def __init__(self):
+        self.schema = PG_SCHEMA
+        self.conn = psycopg2.connect(
+            host=PG_HOST,
+            port=PG_PORT,
+            dbname=PG_DB,
+            user=PG_USER,
+            password=PG_PASSWORD,
+            cursor_factory=psycopg2.extras.RealDictCursor,
+            options=f"-c search_path={self.schema}",
+        )
+        self.conn.autocommit = False
 
     def init_schema(self):
         cur = self.conn.cursor()
@@ -698,7 +711,7 @@ class SqliteDb:
     def has_snapshot(self, snapshot_date: str) -> bool:
         cur = self.conn.cursor()
         cur.execute(
-            "SELECT 1 FROM snapshot_runs WHERE snapshot_date = ? LIMIT 1",
+            "SELECT 1 FROM snapshot_runs WHERE snapshot_date = %s LIMIT 1",
             (snapshot_date,),
         )
         return cur.fetchone() is not None
@@ -708,10 +721,8 @@ class SqliteDb:
         cur = self.conn.cursor()
 
         try:
-            cur.execute("BEGIN")
-
             cur.execute(
-                "SELECT 1 FROM snapshot_runs WHERE snapshot_date = ? LIMIT 1",
+                "SELECT 1 FROM snapshot_runs WHERE snapshot_date = %s LIMIT 1",
                 (snapshot_date,),
             )
             if cur.fetchone() is not None:
@@ -743,9 +754,10 @@ class SqliteDb:
                 )
 
             if rows:
-                cur.executemany(
+                psycopg2.extras.execute_batch(
+                    cur,
                     """
-                    INSERT OR IGNORE INTO daily_activity_samples (
+                    INSERT INTO daily_activity_samples (
                         snapshot_date,
                         service_key,
                         service_id,
@@ -756,9 +768,11 @@ class SqliteDb:
                         window_hours,
                         created_at
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (snapshot_date, service_key, activity_code) DO NOTHING
                     """,
                     rows,
+                    page_size=1000,
                 )
 
             cur.execute(
@@ -768,7 +782,8 @@ class SqliteDb:
                     rows_count,
                     created_at
                 )
-                VALUES (?, ?, ?)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (snapshot_date) DO NOTHING
                 """,
                 (snapshot_date, len(rows), now_str),
             )
@@ -784,10 +799,8 @@ class SqliteDb:
         cur = self.conn.cursor()
 
         try:
-            cur.execute("BEGIN")
-
             cur.execute(
-                "DELETE FROM daily_unaccounted WHERE snapshot_date = ?",
+                "DELETE FROM daily_unaccounted WHERE snapshot_date = %s",
                 (snapshot_date,),
             )
 
@@ -820,7 +833,8 @@ class SqliteDb:
                     )
 
             if rows:
-                cur.executemany(
+                psycopg2.extras.execute_batch(
+                    cur,
                     """
                     INSERT INTO daily_unaccounted (
                         snapshot_date,
@@ -836,9 +850,10 @@ class SqliteDb:
                         detail,
                         created_at
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                     rows,
+                    page_size=1000,
                 )
 
             self.conn.commit()
@@ -863,7 +878,7 @@ class SqliteDb:
                 reason,
                 detail
             FROM daily_unaccounted
-            WHERE snapshot_date = ?
+            WHERE snapshot_date = %s
             ORDER BY stage, reason, team, service_id, metric
             """,
             (snapshot_date,),
@@ -910,7 +925,7 @@ class SqliteDb:
                     samples_value,
                     window_hours
                 FROM daily_activity_samples
-                WHERE snapshot_date >= ?
+                WHERE snapshot_date >= %s
                 """,
                 (start_date,),
             )
@@ -1088,7 +1103,17 @@ def main():
         log.error("VM_URL не задан")
         sys.exit(1)
 
-    db = SqliteDb(SQLITE_DB_FILE)
+    if not PG_HOST:
+        log.error("PG_HOST не задан")
+        sys.exit(1)
+    if not PG_DB:
+        log.error("PG_DB не задан")
+        sys.exit(1)
+    if not PG_USER:
+        log.error("PG_USER не задан")
+        sys.exit(1)
+
+    db = PostgresDb()
     try:
         db.init_schema()
 
@@ -1100,7 +1125,11 @@ def main():
             "BAN_SERVICE_IDS=%s", sorted(ban_service_set) if ban_service_set else "[]"
         )
         log.info("ACTIVITY_FILE=%s", ACTIVITY_FILE)
-        log.info("SQLITE_DB_FILE=%s", SQLITE_DB_FILE)
+        log.info("PG_HOST=%s", PG_HOST)
+        log.info("PG_PORT=%s", PG_PORT)
+        log.info("PG_DB=%s", PG_DB)
+        log.info("PG_USER=%s", PG_USER)
+        log.info("PG_SCHEMA=%s", PG_SCHEMA)
         log.info("SNAPSHOT_LOOKBACK_DAYS=%s", SNAPSHOT_LOOKBACK_DAYS)
 
         activity_df = read_activity_map(ACTIVITY_FILE)
